@@ -1,0 +1,29 @@
+  def caveats
+    <<~EOS
+      permitlayer is installed. To get started:
+
+          agentsso setup gmail
+
+      To run the daemon as a Homebrew-managed background service:
+
+          brew services start agentsso
+
+      Or start it yourself:
+
+          agentsso start
+
+      Enable login-autostart instead (separate from brew services):
+
+          agentsso autostart enable
+
+      Docs: https://github.com/permitlayer/permitlayer
+    EOS
+  end
+
+  service do
+    run [opt_bin/"agentsso", "start"]
+    keep_alive true
+    log_path var/"log/agentsso.log"
+    error_log_path var/"log/agentsso.log"
+    working_dir HOMEBREW_PREFIX
+  end

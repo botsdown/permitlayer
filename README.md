@@ -19,10 +19,34 @@ normal OAuth client. The tokens never touch the agent.
 
 ## Install
 
-> **Pre-release.** No binary release has been cut yet, so the
-> `install/install.sh` curl-pipe-to-sh flow is not yet live. Build
-> from source for now. The first signed release will flip the
-> recommended path to the installer script.
+> **Pre-release.** Binaries are signed (ed25519 / minisign) and
+> published to [GitHub Releases](https://github.com/permitlayer/permitlayer/releases),
+> but the first stable tag is still pending. The Homebrew and curl
+> paths below work once a release is cut.
+
+### macOS — Homebrew (recommended)
+
+```sh
+brew tap permitlayer/tap
+brew install permitlayer/tap/agentsso
+agentsso setup gmail
+```
+
+To run the daemon under a Homebrew-managed `launchd` service:
+
+```sh
+brew services start agentsso
+```
+
+See [docs/user-guide/install.md](docs/user-guide/install.md) for the
+full Homebrew lifecycle (`brew upgrade`, `brew uninstall`, how it
+coexists with `agentsso autostart enable`).
+
+### macOS / Linux — curl | sh
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.sh | sh
+```
 
 ### Build from source
 
@@ -31,7 +55,7 @@ The one-time bootstrap script installs the toolchain, nextest, and
 lld; see [Development setup](#development-setup) below.
 
 ```sh
-git clone https://github.com/botsdown/permitlayer.git
+git clone https://github.com/permitlayer/permitlayer.git
 cd permitlayer
 cargo build --release -p permitlayer-daemon
 cp target/release/agentsso /usr/local/bin/agentsso   # or anywhere on PATH

@@ -8,6 +8,7 @@ This directory holds the load-bearing design decisions for permitlayer. Each ADR
 | 0002 | *(unused — reserved during Story 3.2 planning, published as 0001)* | — | — | — |
 | [0003](0003-agent-identity-token-lookup.md) | Agent-identity token lookup | Accepted | 2026-04-12 | 4.4 |
 | [0004](0004-multiple-versions-policy.md) | `cargo deny check bans` — `multiple-versions = "warn"` policy | Accepted | 2026-04-19 | 8.0 |
+| [0005](0005-release-automation-identity.md) | Release automation identity — `HOMEBREW_TAP_TOKEN` PAT ownership | Accepted | 2026-04-22 | 7.1 |
 
 ## Conventions
 

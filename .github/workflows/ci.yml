@@ -123,6 +123,12 @@ jobs:
           sudo apt-get install -y shellcheck minisign
       - name: Shellcheck install script
         run: shellcheck install/install.sh
+      - name: Shellcheck Homebrew patch scripts (Story 7.1)
+        run: |
+          shellcheck scripts/patch-homebrew-formula.sh
+          shellcheck scripts/test-patch-homebrew-formula.sh
+      - name: Test Homebrew patch script
+        run: ./scripts/test-patch-homebrew-formula.sh
       - name: Run install script tests
         run: ./install/test-install.sh
 

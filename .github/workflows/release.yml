@@ -15,6 +15,10 @@ name: Release
 
 permissions:
   contents: write
+  # homebrew-publish opens an automated PR against main to refresh
+  # install/Formula/agentsso.rb (the reference copy of the latest
+  # released formula — tap is the source of truth).
+  pull-requests: write
 
 on:
   push:
@@ -253,6 +257,15 @@ jobs:
         with:
           name: artifacts-dist-manifest
           path: dist-manifest.json
+      - name: Upload generated Homebrew formula
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-homebrew-formula
+          # dist emits target/distrib/agentsso.rb when [dist] installers
+          # includes "homebrew". The homebrew-publish job downloads this
+          # artifact and patches it before pushing to the tap repo.
+          path: target/distrib/agentsso.rb
+          if-no-files-found: error
       - name: Download signature artifacts
         uses: actions/download-artifact@v4
         with:
@@ -270,3 +283,170 @@ jobs:
           else
             echo "::warning::No .minisig files found to upload"
           fi
+
+  # --- Homebrew publish: patch formula, push to tap, PR reference copy --
+  # Story 7.1: After `publish` uploads the dist-generated formula to a
+  # GitHub Release and produces it as an Actions artifact, this job:
+  #   1. Patches the formula (adds `service do` + `caveats` blocks — dist
+  #      0.31's Homebrew template emits neither).
+  #   2. Runs `brew audit --strict` + `brew style` on the patched output
+  #      (AC #5). Job fails loudly if the formula stops parsing.
+  #   3. Pushes the patched formula to permitlayer/homebrew-tap
+  #      (direct-push, Homebrew tap convention) via HOMEBREW_TAP_TOKEN.
+  #   4. Opens an automated PR against main to refresh the reference copy
+  #      at install/Formula/agentsso.rb (AC #7) — PR uses default
+  #      GITHUB_TOKEN; auto-merge is off, human reviews.
+  #   5. Smoke-tests `brew tap && brew install && agentsso --version` on
+  #      the runner (AC #1). Job fails if install or version check fails.
+  #
+  # Pre-release gate: tags matching `v*-rc.*` / `v*-alpha.*` / `v*-beta.*`
+  # skip the tap push unless the HOMEBREW_PUBLISH_PRERELEASES repo
+  # variable is set to "1" (see Story 7.1 Task 5.1 for the rationale of
+  # gating at the job level rather than via dist's publish-prereleases).
+  homebrew-publish:
+    needs: [plan, build, build-global, sign, publish]
+    if: ${{ always() && needs.publish.result == 'success' }}
+    runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      PUBLISH_PRERELEASES: ${{ vars.HOMEBREW_PUBLISH_PRERELEASES }}
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether this tag is a pre-release
+        id: gate
+        shell: bash
+        run: |
+          # Semver pre-release tags contain a hyphen in the version part.
+          # e.g. v0.2.0-rc.1 is a pre-release; v0.2.0 is not.
+          if [[ "$TAG" == *-* ]]; then
+            IS_PRERELEASE=1
+          else
+            IS_PRERELEASE=0
+          fi
+          if [ "$IS_PRERELEASE" = "1" ] && [ "${PUBLISH_PRERELEASES:-}" != "1" ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tag $TAG is a pre-release and HOMEBREW_PUBLISH_PRERELEASES != 1; skipping tap push"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Early exit for gated pre-release
+        if: ${{ steps.gate.outputs.skip == '1' }}
+        run: exit 0
+
+      - name: Verify HOMEBREW_TAP_TOKEN is configured
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        run: |
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN secret is not set. Configure per adr/0005-release-automation-identity.md."
+            exit 1
+          fi
+          echo "Token length: ${#TAP_TOKEN}"
+
+      - name: Download dist-generated formula
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-homebrew-formula
+          path: dist-formula
+
+      - name: Patch formula (inject service + caveats)
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        run: |
+          mkdir -p Formula
+          scripts/patch-homebrew-formula.sh \
+              dist-formula/agentsso.rb \
+              Formula/agentsso.rb
+          echo "--- Patched formula ---"
+          cat Formula/agentsso.rb
+
+      - name: brew audit + brew style
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        run: |
+          # macos-14 ships brew preinstalled. Audit/style the patched
+          # formula as a standalone file first; the full audit path
+          # exercises a tapped formula, so we also do that after push.
+          brew style Formula/agentsso.rb
+          brew audit --strict --formula Formula/agentsso.rb
+
+      - name: Push formula to permitlayer/homebrew-tap
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        run: |
+          TAP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TAP_DIR"' EXIT
+          git clone "https://oauth2:${TAP_TOKEN}@github.com/permitlayer/homebrew-tap.git" "$TAP_DIR"
+          cp Formula/agentsso.rb "$TAP_DIR/Formula/agentsso.rb"
+          cd "$TAP_DIR"
+          git config user.name "permitlayer release bot"
+          git config user.email "release-bot@permitlayer.dev"
+          if git diff --quiet -- Formula/agentsso.rb; then
+            echo "::notice::Formula unchanged vs tap; nothing to push"
+            exit 0
+          fi
+          git add Formula/agentsso.rb
+          git commit -m "agentsso ${TAG}"
+          git push origin main
+
+      - name: Smoke test — brew tap && brew install && agentsso --version
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        run: |
+          brew tap permitlayer/tap
+          brew install permitlayer/tap/agentsso
+          INSTALLED_VERSION="$(agentsso --version)"
+          echo "Installed: $INSTALLED_VERSION"
+          # Tag 'v0.2.0-rc.1' → formula version '0.2.0-rc.1' → agentsso
+          # --version is expected to contain '0.2.0-rc.1' or similar.
+          EXPECTED_VERSION="${TAG#v}"
+          if ! printf '%s\n' "$INSTALLED_VERSION" | grep -q "$EXPECTED_VERSION"; then
+            echo "::error::agentsso --version ($INSTALLED_VERSION) did not contain expected tag ($EXPECTED_VERSION)"
+            exit 1
+          fi
+
+      - name: Open automated PR to refresh install/Formula/agentsso.rb
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="automated/homebrew-formula-${TAG}"
+          git config user.name "permitlayer release bot"
+          git config user.email "release-bot@permitlayer.dev"
+          # Avoid collision if the branch already exists (re-run case).
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::notice::Branch $BRANCH already exists upstream; skipping PR creation"
+            exit 0
+          fi
+          git checkout -b "$BRANCH"
+          mkdir -p install/Formula
+          cp Formula/agentsso.rb install/Formula/agentsso.rb
+          if git diff --quiet -- install/Formula/agentsso.rb; then
+            echo "::notice::Reference formula unchanged; no PR needed"
+            exit 0
+          fi
+          git add install/Formula/agentsso.rb
+          git commit -m "chore(release): refresh install/Formula/agentsso.rb for ${TAG}"
+          git push --set-upstream origin "$BRANCH"
+          gh pr create \
+            --title "chore(release): refresh install/Formula/agentsso.rb for ${TAG}" \
+            --body "Automated PR from the release pipeline ($TAG). This copies the latest released Homebrew formula into install/Formula/ as a reference — the tap repo (permitlayer/homebrew-tap) is the source-of-truth served to brew users. Review and merge at your convenience; this is not a release blocker." \
+            --label automated-release \
+            --base main \
+            --head "$BRANCH"
+
+      - name: Partial-failure issue on error
+        if: ${{ failure() && steps.gate.outputs.skip == '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The tap push may have succeeded before a later step failed;
+          # surface that possibility on the created issue so a human can
+          # confirm or roll back manually.
+          gh issue create \
+            --title "Release ${TAG}: Homebrew publish partial failure" \
+            --body "The homebrew-publish job for tag \`${TAG}\` failed. If the tap push step ran before the failure, \`permitlayer/homebrew-tap\`'s Formula/agentsso.rb may be out of sync with the main repo. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --label release-issue

@@ -7,12 +7,28 @@ members = ["cargo:crates/permitlayer-daemon"]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
-# No built-in installers — we use our custom install/install.sh instead
-installers = []
-# Target platforms: macOS ARM64 only for MVP (Epic 7 adds Linux/Windows)
-targets = ["aarch64-apple-darwin"]
+# Homebrew installer drives generation of the tap formula (Story 7.1).
+# The curl|sh path (install/install.sh) remains the default for non-macOS.
+installers = ["homebrew"]
+# Target platforms:
+# - macOS ARM64 (aarch64-apple-darwin): original MVP target (Story 1.12).
+# - macOS x86_64 (x86_64-apple-darwin): added in Story 7.1 so the Homebrew
+#   formula has both-arch URLs (Hardware::CPU.arm? / .intel? branches).
+# Linux / Windows land in Story 7.7 (cross-platform CI matrix).
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 # Extra files to include in each release artifact
 include = ["LICENSE", "README.md", "install/install.sh"]
+# Homebrew tap configuration (Story 7.1): dist emits Formula/agentsso.rb
+# targeting this tap. Our homebrew-publish job in release.yml patches the
+# generated formula (adds service + caveats blocks — dist's template
+# omits both) and pushes to the tap repo using HOMEBREW_TAP_TOKEN.
+tap = "permitlayer/homebrew-tap"
+formula = "agentsso"
+# Pre-release tags (e.g. v0.2.0-rc.1) do NOT auto-update the tap by default.
+# Override via the HOMEBREW_PUBLISH_PRERELEASES repo variable in the
+# release.yml job guard when exercising the pipeline end-to-end.
+publish-prereleases = false
 # Allow our custom release.yml to differ from dist's generated version
-# (we add minisign signing steps that dist doesn't know about)
+# (we add minisign signing steps + a homebrew-publish job that dist doesn't
+# know about).
 allow-dirty = ["ci"]
