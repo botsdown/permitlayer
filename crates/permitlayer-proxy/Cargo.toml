@@ -18,12 +18,12 @@ name = "integration"
 path = "tests/integration/mod.rs"
 
 [dependencies]
-permitlayer-core = { path = "../permitlayer-core", version = "0.1.0" }
-permitlayer-vault = { path = "../permitlayer-vault", version = "0.1.0" }
-permitlayer-credential = { path = "../permitlayer-credential", version = "0.1.0" }
-permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.1.0" }
-permitlayer-plugins = { path = "../permitlayer-plugins", version = "0.1.0" }
-permitlayer-connectors = { path = "../permitlayer-connectors", version = "0.1.0" }
+permitlayer-core = { path = "../permitlayer-core", version = "0.2.0" }
+permitlayer-vault = { path = "../permitlayer-vault", version = "0.2.0" }
+permitlayer-credential = { path = "../permitlayer-credential", version = "0.2.0" }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.0" }
+permitlayer-plugins = { path = "../permitlayer-plugins", version = "0.2.0" }
+permitlayer-connectors = { path = "../permitlayer-connectors", version = "0.2.0" }
 thiserror.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -50,8 +50,8 @@ hyper-util.workspace = true
 urlencoding.workspace = true
 
 [dev-dependencies]
-permitlayer-core = { path = "../permitlayer-core", version = "0.1.0", features = ["test-seam"] }
-permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.1.0", features = ["test-seam"] }
+permitlayer-core = { path = "../permitlayer-core", version = "0.2.0", features = ["test-seam"] }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.0", features = ["test-seam"] }
 tokio.workspace = true
 tracing-test.workspace = true
 tracing-subscriber.workspace = true
