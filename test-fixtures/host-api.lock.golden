@@ -24,6 +24,7 @@ agentsso.versionMeetsRequirement(req: string) -> boolean
 globalThis.AgentssoError : class { constructor(message: string, options?: { code?: string, retryable?: boolean }); name: string; message: string; code: string; retryable: boolean; stack: string; }
 
 ## error_codes
+http.blocked_metadata_endpoint
 http.dns_resolution_failed
 http.header_injection
 http.header_type_mismatch
