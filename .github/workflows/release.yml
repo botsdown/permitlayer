@@ -528,11 +528,15 @@ jobs:
           cd "$TAP_DIR"
           git config user.name "permitlayer release bot"
           git config user.email "release-bot@permitlayer.dev"
-          if git diff --quiet -- Formula/agentsso.rb; then
+          # Stage the file first — new files are untracked and don't
+          # appear in `git diff` until staged. `git diff --cached --quiet`
+          # after `git add` reliably detects both new files and
+          # modifications.
+          git add Formula/agentsso.rb
+          if git diff --cached --quiet -- Formula/agentsso.rb; then
             echo "::notice::Formula unchanged vs tap; nothing to push"
             exit 0
           fi
-          git add Formula/agentsso.rb
           git commit -m "agentsso ${TAG}"
           git push origin main
 
@@ -567,11 +571,14 @@ jobs:
           git checkout -b "$BRANCH"
           mkdir -p install/Formula
           cp Formula/agentsso.rb install/Formula/agentsso.rb
-          if git diff --quiet -- install/Formula/agentsso.rb; then
+          # Stage before diff — new files don't show in `git diff` until
+          # staged. `git diff --cached --quiet` catches both first-time
+          # creation and subsequent modifications.
+          git add install/Formula/agentsso.rb
+          if git diff --cached --quiet -- install/Formula/agentsso.rb; then
             echo "::notice::Reference formula unchanged; no PR needed"
             exit 0
           fi
-          git add install/Formula/agentsso.rb
           git commit -m "chore(release): refresh install/Formula/agentsso.rb for ${TAG}"
           git push --set-upstream origin "$BRANCH"
           gh pr create \
