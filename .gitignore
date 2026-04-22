@@ -61,3 +61,6 @@ id_ed25519*
 id_ecdsa*
 id_dsa*
 credentials.json
+
+# Local forensic backup of release.yml during v0.2.0 first-release shakedown
+/.github/workflows/release.yml.old.bak
