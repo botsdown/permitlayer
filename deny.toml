@@ -18,7 +18,15 @@ feature-depth = 1
 # ============================================================================
 [advisories]
 # Advisory database: default (rustsec/advisory-db)
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0097 — rand 0.8/0.9/0.10 unsound with a custom global
+    # logger that calls `rand::rng()` inside its `log` hook. permitlayer
+    # does not install a custom `log::Log` implementation; we use
+    # tracing-subscriber, which is an unrelated subscriber API. The
+    # advisory's trigger condition is absent from our graph. Revisit
+    # when upstream ships a patched rand that closes the class of bug.
+    { id = "RUSTSEC-2026-0097", reason = "custom log::Log trigger not present in our graph" },
+]
 
 # ============================================================================
 # Licenses — permissive-only, no copyleft

@@ -76,7 +76,9 @@ impl GoogleOAuthConfig {
         if contents.len() as u64 > MAX_CLIENT_JSON_BYTES {
             return Err(OAuthError::ClientJsonInvalid {
                 path: path.to_owned(),
-                reason: format!("file exceeds maximum allowed size of {MAX_CLIENT_JSON_BYTES} bytes"),
+                reason: format!(
+                    "file exceeds maximum allowed size of {MAX_CLIENT_JSON_BYTES} bytes"
+                ),
             });
         }
 

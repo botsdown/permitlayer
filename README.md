@@ -168,15 +168,20 @@ and toggle **your terminal app** on. Fully quit and relaunch it after.
 See the [nextest antivirus guide](https://nexte.st/book/antivirus-gatekeeper.html)
 for background.
 
-**2. Install lld**
+**2. (Optional) Install lld**
 
-The project uses LLVM's linker for faster incremental links:
+LLVM's linker cuts incremental link times noticeably on local dev
+builds. It is **not** wired on by default because the `brew` install
+path (`/opt/homebrew/opt/lld/bin/ld64.lld`) is specific to
+Homebrew-on-Apple-Silicon and breaks CI runners. To opt in locally:
 
 ```sh
 brew install lld
 ```
 
-The linker path is already wired in `.cargo/config.toml`.
+Then uncomment the `[target.aarch64-apple-darwin]` block in
+`.cargo/config.toml` in a local-only copy (do not commit the change —
+it will break CI).
 
 ### Running tests
 

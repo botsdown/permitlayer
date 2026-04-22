@@ -1,9 +1,16 @@
 [alias]
 xtask = "run --package xtask --quiet --"
 
-[target.aarch64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/lld/bin/ld64.lld"]
+# lld linker is an opt-in local dev speedup, not a hard requirement.
+# The hardcoded /opt/homebrew path is Homebrew-on-Apple-Silicon-specific
+# and breaks GitHub macOS runners (which either lack lld or install it
+# elsewhere). Contributors who have `brew install lld` and want the
+# faster link can uncomment the block below in a local-only copy or
+# use a `.cargo/config.toml.local` equivalent.
+#
+# [target.aarch64-apple-darwin]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/lld/bin/ld64.lld"]
 
 # Story 8.8a investigated wiring scripts/xprotect-runner.sh here as
 # a macOS-only cargo runner to ad-hoc codesign test binaries. Live
