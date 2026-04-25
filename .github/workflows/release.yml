@@ -52,6 +52,17 @@ on:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
+# Serialize per-ref. A concurrent tag re-push or a `gh workflow run`
+# re-trigger on the same ref cancels the in-flight run rather than
+# letting two `dist host --steps=create` calls race on the GitHub
+# Release, or two `homebrew-publish` jobs race on the tap push. PR
+# runs are also serialized per-PR-ref. We do NOT cancel: the host
+# step is mid-upload to a real GitHub Release when this fires, and
+# cancellation could leave a half-populated release. Wait instead.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
@@ -374,8 +385,11 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
+          # Write notes from the env-passed body to a file to avoid
+          # quoting issues. Use `printf '%s'` rather than `echo` so any
+          # backslash sequences in the body (e.g. `\n`) are written
+          # literally rather than interpreted by bash's echo builtin.
+          printf '%s' "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
@@ -422,7 +436,11 @@ jobs:
       - build-global-artifacts
       - sign
       - host
-    if: ${{ always() && needs.host.result == 'success' }}
+    # Require both `host` (release artifacts uploaded) and `sign`
+    # (minisignatures present) to have succeeded — pushing an unsigned
+    # tarball reference into the tap formula would let brew users
+    # bypass the ed25519 verification chain.
+    if: ${{ always() && needs.host.result == 'success' && needs.sign.result == 'success' }}
     runs-on: macos-14
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -439,9 +457,13 @@ jobs:
         id: gate
         shell: bash
         run: |
-          # Semver pre-release tags contain a hyphen in the version part.
-          # e.g. v0.2.0-rc.1 is a pre-release; v0.2.0 is not.
-          if [[ "$TAG" == *-* ]]; then
+          # Semver pre-release tags contain a hyphen in the version
+          # part (e.g. v0.2.0-rc.1). Build-metadata tags use `+`
+          # (e.g. v0.2.0+gpu); we treat those as untrusted too — dist
+          # behaviour with `+meta` is unverified, so route them through
+          # the same gate as pre-releases until someone exercises that
+          # path explicitly.
+          if [[ "$TAG" == *-* || "$TAG" == *+* ]]; then
             IS_PRERELEASE=1
           else
             IS_PRERELEASE=0
@@ -523,9 +545,17 @@ jobs:
         run: |
           TAP_DIR="$(mktemp -d)"
           trap 'rm -rf "$TAP_DIR"' EXIT
-          git clone "https://oauth2:${TAP_TOKEN}@github.com/permitlayer/homebrew-tap.git" "$TAP_DIR"
+          # Authenticate via the bearer-header form rather than embedding
+          # the PAT in the remote URL — the URL-form persists the secret
+          # in $TAP_DIR/.git/config and would leak if the dir were ever
+          # uploaded as an artifact or inspected in a downstream step.
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${TAP_TOKEN}" \
+              clone "https://github.com/permitlayer/homebrew-tap.git" "$TAP_DIR"
           cp Formula/agentsso.rb "$TAP_DIR/Formula/agentsso.rb"
           cd "$TAP_DIR"
+          # Persist the bearer header on this clone for the push below
+          # (without writing it into the URL).
+          git config "http.https://github.com/.extraheader" "AUTHORIZATION: bearer ${TAP_TOKEN}"
           git config user.name "permitlayer release bot"
           git config user.email "release-bot@permitlayer.dev"
           # Stage the file first — new files are untracked and don't
@@ -538,7 +568,41 @@ jobs:
             exit 0
           fi
           git commit -m "agentsso ${TAG}"
+          # Rebase onto remote main before pushing — defends against
+          # concurrent pushes (manual or another in-flight release run).
+          # If rebase fails (real conflict), the step exits non-zero and
+          # the partial-failure issue fires.
+          git pull --rebase origin main
           git push origin main
+          # Capture the SHA we just pushed so the smoke-test step can
+          # confirm GitHub's git replicas have converged to it before
+          # invoking `brew tap`. Without this, the smoke test races a
+          # ~sub-second eventual-consistency window where `brew tap`
+          # could clone a replica that hasn't seen the push yet and
+          # install the previous formula version.
+          PUSHED_SHA="$(git rev-parse HEAD)"
+          echo "pushed_sha=${PUSHED_SHA}" >> "$GITHUB_OUTPUT"
+        id: tap_push
+
+      - name: Wait for tap replica convergence
+        if: ${{ steps.gate.outputs.skip == '0' && steps.tap_push.outputs.pushed_sha != '' }}
+        env:
+          PUSHED_SHA: ${{ steps.tap_push.outputs.pushed_sha }}
+        run: |
+          # Poll `git ls-remote` against the tap until the remote HEAD
+          # matches the SHA we just pushed. Bounded retry so a real
+          # outage fails the step rather than spinning forever.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            REMOTE_SHA="$(git ls-remote https://github.com/permitlayer/homebrew-tap.git HEAD | awk '{print $1}')"
+            if [ "$REMOTE_SHA" = "$PUSHED_SHA" ]; then
+              echo "Tap replica converged on $PUSHED_SHA after attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i: tap remote HEAD=$REMOTE_SHA, expected $PUSHED_SHA — sleeping 2s"
+            sleep 2
+          done
+          echo "::error::Tap remote HEAD did not converge to $PUSHED_SHA after 10 attempts"
+          exit 1
 
       - name: Smoke test — brew tap && brew install && agentsso --version
         if: ${{ steps.gate.outputs.skip == '0' }}
@@ -547,11 +611,14 @@ jobs:
           brew install permitlayer/tap/agentsso
           INSTALLED_VERSION="$(agentsso --version)"
           echo "Installed: $INSTALLED_VERSION"
-          # Tag 'v0.2.0-rc.1' → formula version '0.2.0-rc.1' → agentsso
-          # --version is expected to contain '0.2.0-rc.1' or similar.
+          # clap renders `--version` as the literal `agentsso <semver>`.
+          # Match exactly — substring grep would let `0.2.1` falsely
+          # pass against a cached `0.2.10`, and the unanchored regex
+          # would let `.` match any character.
           EXPECTED_VERSION="${TAG#v}"
-          if ! printf '%s\n' "$INSTALLED_VERSION" | grep -q "$EXPECTED_VERSION"; then
-            echo "::error::agentsso --version ($INSTALLED_VERSION) did not contain expected tag ($EXPECTED_VERSION)"
+          EXPECTED_LINE="agentsso ${EXPECTED_VERSION}"
+          if [ "$INSTALLED_VERSION" != "$EXPECTED_LINE" ]; then
+            echo "::error::agentsso --version mismatch — expected '$EXPECTED_LINE', got '$INSTALLED_VERSION'"
             exit 1
           fi
 
@@ -600,13 +667,19 @@ jobs:
           # The `release-issue` label is created as a one-off admin step
           # via `gh label create release-issue --repo permitlayer/permitlayer
           # --color FF6B6B --description "Release pipeline partial
-          # failure — needs triage"`. `gh issue create --label` fails
-          # hard if the label is missing, so we use `|| true` as a
-          # safety net and still create the issue without the label.
-          gh issue create \
-            --title "Release ${TAG}: Homebrew publish partial failure" \
-            --body "The homebrew-publish job for tag \`${TAG}\` failed. If the tap push step ran before the failure, \`permitlayer/homebrew-tap\`'s Formula/agentsso.rb may be out of sync with the main repo. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --label release-issue \
-            || gh issue create \
-              --title "Release ${TAG}: Homebrew publish partial failure" \
-              --body "The homebrew-publish job for tag \`${TAG}\` failed. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # failure — needs triage"`.
+          TITLE="Release ${TAG}: Homebrew publish partial failure"
+          BODY="The homebrew-publish job for tag \`${TAG}\` failed. If the tap push step ran before the failure, \`permitlayer/homebrew-tap\`'s Formula/agentsso.rb may be out of sync with the main repo. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Idempotency: if an open issue with this exact title already
+          # exists for this tag, do not duplicate. A re-run of the same
+          # failing pipeline would otherwise spam new issues.
+          EXISTING="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::Existing partial-failure issue #$EXISTING already open; not duplicating"
+            exit 0
+          fi
+          # Try with the `release-issue` label first; if the label is
+          # genuinely missing (one-time setup miss), fall back to an
+          # unlabeled issue so the operator still sees the failure.
+          gh issue create --title "$TITLE" --body "$BODY" --label release-issue \
+            || gh issue create --title "$TITLE" --body "$BODY"

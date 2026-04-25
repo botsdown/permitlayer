@@ -125,9 +125,8 @@ on the correct syntax:
    `KeepAlive: { Crashed: true }` — restart only on signal-killed
    termination.
 
-Captured in story 7.1 Dev Agent Record + the v0.2.1 plan file at
-`/Users/austinlowry/.claude/plans/let-s-regenerate-release-yml-from-cuddly-clarke.md`
-for posterity.
+Captured in story 7.1 Dev Agent Record + the v0.2.1 hotfix commit
+(`5928eb6`) for posterity.
 
 ### Pending real-machine validation (post-merge of PR #2)
 

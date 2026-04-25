@@ -31,6 +31,20 @@ authors = ["permitlayer contributors"]
 # automatically while `Cargo.lock` still pins exact versions for
 # reproducibility and `cargo audit`/`cargo deny` gate on the locked set.
 
+# Internal path-deps. Centralized here so a workspace version bump is
+# a one-line change in `[workspace.package].version` rather than
+# hand-editing every consuming crate. Per-crate features (e.g. the
+# `test-seam` extension on permitlayer-core in proxy's dev-deps) use
+# `{ workspace = true, features = [...] }` at the call site.
+permitlayer-credential = { path = "crates/permitlayer-credential", version = "0.2.1" }
+permitlayer-keystore   = { path = "crates/permitlayer-keystore",   version = "0.2.1" }
+permitlayer-vault      = { path = "crates/permitlayer-vault",      version = "0.2.1" }
+permitlayer-core       = { path = "crates/permitlayer-core",       version = "0.2.1" }
+permitlayer-oauth      = { path = "crates/permitlayer-oauth",      version = "0.2.1" }
+permitlayer-proxy      = { path = "crates/permitlayer-proxy",      version = "0.2.1" }
+permitlayer-plugins    = { path = "crates/permitlayer-plugins",    version = "0.2.1" }
+permitlayer-connectors = { path = "crates/permitlayer-connectors", version = "0.2.1" }
+
 # Credential type discipline
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 thiserror = "2.0"

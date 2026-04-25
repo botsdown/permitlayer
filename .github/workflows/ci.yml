@@ -127,10 +127,25 @@ jobs:
         run: |
           shellcheck scripts/patch-homebrew-formula.sh
           shellcheck scripts/test-patch-homebrew-formula.sh
-      - name: Test Homebrew patch script
+      - name: Test Homebrew patch script (no brew — style portion skipped)
         run: ./scripts/test-patch-homebrew-formula.sh
       - name: Run install script tests
         run: ./install/test-install.sh
+
+  # Re-runs the Homebrew patch-script test on macos-14 with brew
+  # installed, so the rubocop/brew-style portion of the test (which
+  # the Ubuntu shellcheck job skips) actually executes. Catches
+  # rubocop-version drift between the committed `expected-output.rb`
+  # fixture and what `brew style --fix` produces on the live runner.
+  # If this fails after a rubocop update, regenerate the fixture per
+  # the header comment of `scripts/test-patch-homebrew-formula.sh`.
+  homebrew-style:
+    name: Homebrew style guard (macos-14)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test Homebrew patch script (brew style enforced)
+        run: ./scripts/test-patch-homebrew-formula.sh
 
   security:
     name: Security audit + deny

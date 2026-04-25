@@ -18,12 +18,12 @@ name = "integration"
 path = "tests/integration/mod.rs"
 
 [dependencies]
-permitlayer-core = { path = "../permitlayer-core", version = "0.2.1" }
-permitlayer-vault = { path = "../permitlayer-vault", version = "0.2.1" }
-permitlayer-credential = { path = "../permitlayer-credential", version = "0.2.1" }
-permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.1" }
-permitlayer-plugins = { path = "../permitlayer-plugins", version = "0.2.1" }
-permitlayer-connectors = { path = "../permitlayer-connectors", version = "0.2.1" }
+permitlayer-core.workspace = true
+permitlayer-vault.workspace = true
+permitlayer-credential.workspace = true
+permitlayer-oauth.workspace = true
+permitlayer-plugins.workspace = true
+permitlayer-connectors.workspace = true
 thiserror.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -50,8 +50,8 @@ hyper-util.workspace = true
 urlencoding.workspace = true
 
 [dev-dependencies]
-permitlayer-core = { path = "../permitlayer-core", version = "0.2.1", features = ["test-seam"] }
-permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.1", features = ["test-seam"] }
+permitlayer-core = { workspace = true, features = ["test-seam"] }
+permitlayer-oauth = { workspace = true, features = ["test-seam"] }
 tokio.workspace = true
 tracing-test.workspace = true
 tracing-subscriber.workspace = true

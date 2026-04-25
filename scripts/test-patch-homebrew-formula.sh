@@ -58,8 +58,37 @@ if [ ! -f "$EXPECTED" ]; then
     exit 1
 fi
 
+# Guard: CLASS_DOC_COMMENT must contain no backslashes. awk's `-v`
+# arg interprets backslash escapes (and BSD vs GNU awk diverge on
+# the exact set), so a backslash in the comment would silently
+# produce different output across platforms. Today the comment is
+# plain ASCII; this assertion locks that in.
+CLASS_DOC_LINE="$(grep '^CLASS_DOC_COMMENT=' "$PATCH_SCRIPT" | head -1)"
+case "$CLASS_DOC_LINE" in
+    *\\*)
+        echo "FAIL: CLASS_DOC_COMMENT in $PATCH_SCRIPT contains a backslash;" >&2
+        echo "      awk -v interprets backslash escapes and BSD/GNU diverge." >&2
+        echo "      Either restrict the comment to plain ASCII, or pipe the" >&2
+        echo "      comment via stdin to awk instead of via -v." >&2
+        echo "      Offending line: $CLASS_DOC_LINE" >&2
+        exit 1
+        ;;
+esac
+
+# Single cleanup function registered once. Each tempfile is added to
+# TMPFILES as it's created so any failure between trap installations
+# still cleans up everything that exists. Repeated `trap '...'`
+# replacement (the previous pattern) leaked the most recent tempfile
+# on failures between two trap calls.
+TMPFILES=""
+cleanup() {
+    # shellcheck disable=SC2086
+    [ -n "$TMPFILES" ] && rm -f $TMPFILES
+}
+trap cleanup EXIT INT HUP TERM
+
 ACTUAL="$(mktemp)"
-trap 'rm -f "$ACTUAL"' EXIT
+TMPFILES="$TMPFILES $ACTUAL"
 
 "$PATCH_SCRIPT" "$INPUT" "$ACTUAL"
 
@@ -73,7 +102,7 @@ fi
 # Idempotence check: re-running the patch script on already-patched
 # output must not inject a second copy of the snippet.
 REPATCHED="$(mktemp)"
-trap 'rm -f "$ACTUAL" "$REPATCHED"' EXIT
+TMPFILES="$TMPFILES $REPATCHED"
 "$PATCH_SCRIPT" "$ACTUAL" "$REPATCHED"
 if ! diff -q "$ACTUAL" "$REPATCHED" >/dev/null; then
     # Note: the patch script is NOT strictly idempotent — it injects
@@ -112,7 +141,7 @@ if ! command -v brew >/dev/null 2>&1; then
     echo "      the release pipeline still enforces this check on macos-14" >&2
 else
     STYLE_PROBE="$(mktemp)"
-    trap 'rm -f "$ACTUAL" "$REPATCHED" "$STYLE_PROBE"' EXIT
+    TMPFILES="$TMPFILES $STYLE_PROBE"
     cp "$EXPECTED" "$STYLE_PROBE"
 
     # Step 1: run brew style --fix (autocorrects whatever it can).
@@ -130,7 +159,7 @@ else
 
     # Step 3: idempotence of brew style --fix.
     STYLE_REAPPLY="$(mktemp)"
-    trap 'rm -f "$ACTUAL" "$REPATCHED" "$STYLE_PROBE" "$STYLE_REAPPLY"' EXIT
+    TMPFILES="$TMPFILES $STYLE_REAPPLY"
     cp "$STYLE_PROBE" "$STYLE_REAPPLY"
     brew style --fix "$STYLE_REAPPLY" >/dev/null 2>&1 || true
     if ! diff -q "$STYLE_PROBE" "$STYLE_REAPPLY" >/dev/null; then

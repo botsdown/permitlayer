@@ -27,8 +27,13 @@ brew services start agentsso
 ```
 
 This generates `~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist`
-and starts the daemon. The service restarts if it crashes
-(`keep_alive true`) and survives logout/login.
+and starts the daemon. The service restarts only on real crashes
+(`keep_alive crashed: true` — signal-killed exits like SIGSEGV,
+SIGABRT, OOM-kill) and survives logout/login. Deliberate non-zero
+exits — e.g. `agentsso start`'s exit-3 when another instance is
+already bound to the port — are NOT respawned, so a configuration
+conflict with a manually-started daemon shows up as a single
+`error 78` row in `brew services list` rather than a respawn loop.
 
 Check status with `brew services list` or `agentsso status`.
 

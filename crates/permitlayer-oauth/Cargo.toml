@@ -25,8 +25,8 @@ name = "integration"
 path = "tests/integration/mod.rs"
 
 [dependencies]
-permitlayer-credential = { path = "../permitlayer-credential", version = "0.2.1" }
-permitlayer-vault = { path = "../permitlayer-vault", version = "0.2.1" }
+permitlayer-credential.workspace = true
+permitlayer-vault.workspace = true
 oauth2.workspace = true
 reqwest.workspace = true
 tokio.workspace = true

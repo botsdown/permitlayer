@@ -83,16 +83,41 @@ if ! grep -q '^end$' "$INPUT"; then
     exit 2
 fi
 
+# Write to a temp file, then atomically move into place — guarantees
+# $OUTPUT is either the previous content or the fully-patched new
+# content. A bare `awk … > "$OUTPUT"` would leave a half-written file
+# behind on awk's `END { exit 2 }` failure path, which the next
+# pipeline step (`brew style --fix`) would happily consume.
+TMP_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/patch-homebrew-formula.XXXXXX")"
+# Best-effort cleanup of the temp file. The trap is replaced if a
+# previous trap exists, but this script doesn't set any earlier traps.
+trap 'rm -f "$TMP_OUTPUT"' EXIT INT HUP TERM
+
 # Single-pass awk: prepend class-doc comment before the class line,
 # append service+caveats snippet before the class-closing `end`.
 awk -v snippet_path="$SNIPPET_PATH" -v class_doc="$CLASS_DOC_COMMENT" '
 BEGIN {
-    # Read the snippet into memory once.
+    # Read the snippet into memory once. `getline … < file` returns
+    # 1 on success, 0 on EOF, -1 on read error — distinguish the two
+    # error modes so a missing/unreadable snippet fails loudly rather
+    # than producing a formula with an empty service block.
     snippet = ""
-    while ((getline line < snippet_path) > 0) {
+    saw_line = 0
+    while (1) {
+        rc = (getline line < snippet_path)
+        if (rc < 0) {
+            print "error: cannot read snippet at " snippet_path > "/dev/stderr"
+            exit 3
+        }
+        if (rc == 0) break
         snippet = snippet line "\n"
+        saw_line = 1
     }
     close(snippet_path)
+    if (!saw_line || length(snippet) == 0) {
+        print "error: snippet at " snippet_path " is empty" > "/dev/stderr"
+        exit 3
+    }
     doc_emitted = 0
     snippet_emitted = 0
 }
@@ -119,4 +144,11 @@ END {
         exit 2
     }
 }
-' "$INPUT" > "$OUTPUT"
+' "$INPUT" > "$TMP_OUTPUT"
+
+# awk succeeded — promote temp → output atomically.
+if [ "$OUTPUT" = "/dev/stdout" ]; then
+    cat "$TMP_OUTPUT"
+else
+    mv "$TMP_OUTPUT" "$OUTPUT"
+fi
