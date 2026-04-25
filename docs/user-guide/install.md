@@ -125,3 +125,48 @@ agentsso autostart enable
 agentsso autostart disable
 brew services start agentsso
 ```
+
+### Third collision case: manual `agentsso start` + `brew services start`
+
+There's also a third way to collide that the table above doesn't cover:
+running the daemon **manually in a terminal** (`agentsso start`) and then
+trying to take it over with `brew services`.
+
+**Symptom:** `brew services start agentsso` reports "Successfully started"
+but `brew services list` shows the agentsso row in `error` state with exit
+code 78. Nothing seems to work; `agentsso status` shows the daemon is
+running but you can't manage it via brew.
+
+**Why it happens:** The manual `agentsso` already has port 3820 bound. When
+launchd tries to start a second instance via `brew services`, the daemon
+detects the conflict via its PID-file check and exits with code 3 — a
+deliberate "won't start, can't take over" signal. v0.2.1+ formulas
+respect this and don't respawn-loop, but the launchd job still records
+the error.
+
+**Recovery:**
+
+```sh
+# Verify nothing is hung:
+agentsso status                           # may show running
+
+# Stop the manual instance:
+agentsso stop                             # graceful SIGTERM, blocks <10s
+
+# Now brew services can take over cleanly:
+brew services start agentsso
+
+# Always verify after a start:
+brew services list | grep agentsso        # expect: started (not error)
+```
+
+**Diagnostic when in doubt:** the daemon's startup error message lands in
+`/opt/homebrew/var/log/agentsso.log` (Apple Silicon) or
+`/usr/local/var/log/agentsso.log` (Intel). `tail -n 20 <path>` after a
+failed `brew services start` shows exactly which conflict was detected.
+
+The general rule: **`brew services list | grep agentsso` is the
+authoritative status check.** `brew services start`'s "Successfully
+started" message means launchd accepted the request, not that the
+daemon is actually running under brew's management. Verify after every
+start.

@@ -14,7 +14,7 @@ description = "Core traits and types for permitlayer: policy, scrubbing, audit, 
 autotests = false
 
 [dependencies]
-permitlayer-credential = { path = "../permitlayer-credential", version = "0.2.0" }
+permitlayer-credential = { path = "../permitlayer-credential", version = "0.2.1" }
 thiserror.workspace = true
 async-trait.workspace = true
 # Trimmed tokio feature set: only rt + sync + macros. core does not need

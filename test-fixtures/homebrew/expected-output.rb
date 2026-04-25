@@ -2,13 +2,13 @@
 class Agentsso < Formula
   desc "agentsso binary: axum server, CLI, lifecycle management"
   homepage "https://github.com/permitlayer/permitlayer"
-  version "0.2.0"
+  version "0.2.1"
   if OS.mac?
     if Hardware::CPU.arm?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.0/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.1/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.0/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.1/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
     end
   end
   license "MIT"
@@ -62,6 +62,11 @@ class Agentsso < Formula
 
           brew services start agentsso
 
+      If `agentsso` is already running (you started it manually with
+      `agentsso start`), stop it first with `agentsso stop` — `brew
+      services start` cannot take over a port already bound by another
+      process. Always verify the result with `brew services list`.
+
       Or start it yourself:
 
           agentsso start
@@ -76,7 +81,13 @@ class Agentsso < Formula
 
   service do
     run [opt_bin/"agentsso", "start"]
-    keep_alive true
+    # Restart only on real crashes (signal-killed: SIGSEGV, SIGABRT,
+    # OOM-kill, etc.). Don't respawn on deliberate non-zero exits like
+    # `agentsso start`'s exit-3 when it detects an already-running
+    # daemon — that's a configuration conflict, not a crash, and
+    # respawn-looping it just produces noisy launchd `error 78` rows
+    # in `brew services list` without resolving the conflict.
+    keep_alive crashed: true
     log_path var/"log/agentsso.log"
     error_log_path var/"log/agentsso.log"
     working_dir HOMEBREW_PREFIX

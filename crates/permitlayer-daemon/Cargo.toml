@@ -23,21 +23,21 @@ name = "integration"
 path = "tests/integration/mod.rs"
 
 [dependencies]
-permitlayer-proxy = { path = "../permitlayer-proxy", version = "0.2.0" }
-permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.0" }
-permitlayer-vault = { path = "../permitlayer-vault", version = "0.2.0" }
+permitlayer-proxy = { path = "../permitlayer-proxy", version = "0.2.1" }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.1" }
+permitlayer-vault = { path = "../permitlayer-vault", version = "0.2.1" }
 # `test-seam` enables `PassphraseKeyStore::from_passphrase` as a `pub`
 # constructor so the debug-assertion-gated `AGENTSSO_TEST_PASSPHRASE`
 # env var in `cli/start.rs::ensure_master_key_bootstrapped` can use it
 # to route integration tests through the real `bootstrap_from_keystore`
 # path. The feature is a no-op in release builds because the only
 # caller lives behind `#[cfg(debug_assertions)]` and compiles out.
-permitlayer-keystore = { path = "../permitlayer-keystore", version = "0.2.0", features = [
+permitlayer-keystore = { path = "../permitlayer-keystore", version = "0.2.1", features = [
     "test-seam",
 ] }
-permitlayer-core = { path = "../permitlayer-core", version = "0.2.0" }
-permitlayer-credential = { path = "../permitlayer-credential", version = "0.2.0" }
-permitlayer-plugins = { path = "../permitlayer-plugins", version = "0.2.0" }
+permitlayer-core = { path = "../permitlayer-core", version = "0.2.1" }
+permitlayer-credential = { path = "../permitlayer-credential", version = "0.2.1" }
+permitlayer-plugins = { path = "../permitlayer-plugins", version = "0.2.1" }
 # Story 6.2 AD2: the debug-only `/v1/debug/plugin-echo` handler
 # drives JS-side Promise resolution via `Promise::finish`. Already
 # compiled transitively via permitlayer-plugins, so adding it as

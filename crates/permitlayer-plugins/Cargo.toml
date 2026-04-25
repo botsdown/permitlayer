@@ -18,10 +18,10 @@ name = "integration"
 path = "tests/integration/mod.rs"
 
 [dependencies]
-permitlayer-core = { path = "../permitlayer-core", version = "0.2.0" }
-permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.0" }
+permitlayer-core = { path = "../permitlayer-core", version = "0.2.1" }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.2.1" }
 # Story 6.3: loader reads embedded built-in JS sources from this crate.
-permitlayer-connectors = { path = "../permitlayer-connectors", version = "0.2.0" }
+permitlayer-connectors = { path = "../permitlayer-connectors", version = "0.2.1" }
 thiserror.workspace = true
 rquickjs.workspace = true
 tokio.workspace = true
