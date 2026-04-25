@@ -2,15 +2,15 @@
 class Agentsso < Formula
   desc "Binary: axum server, CLI, lifecycle management"
   homepage "https://github.com/permitlayer/permitlayer"
-  version "0.2.0"
+  version "0.2.1"
   if OS.mac?
     if Hardware::CPU.arm?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.0/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
-      sha256 "d1ebcb78ceabfc38da4353705417afc10deb1634b07a1ea134d7d7e5d18d8f81"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.1/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
+      sha256 "72b7400c5dd0bf925d55b71dce60eda04d3cc54392b5a3f18e65af189f41107e"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.0/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
-      sha256 "f85e5cc917e84d868a3defb4013e54ff257eadd863000eff0d6d5b001b82705f"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.1/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
+      sha256 "4ffd432ea95106fe6fab25ea10bcc04316cabcdbd02252546a6f42d6df9890ae"
     end
   end
   license "MIT"
@@ -60,6 +60,11 @@ class Agentsso < Formula
 
           brew services start agentsso
 
+      If `agentsso` is already running (you started it manually with
+      `agentsso start`), stop it first with `agentsso stop` — `brew
+      services start` cannot take over a port already bound by another
+      process. Always verify the result with `brew services list`.
+
       Or start it yourself:
 
           agentsso start
@@ -74,7 +79,13 @@ class Agentsso < Formula
 
   service do
     run [opt_bin/"agentsso", "start"]
-    keep_alive true
+    # Restart only on real crashes (signal-killed: SIGSEGV, SIGABRT,
+    # OOM-kill, etc.). Don't respawn on deliberate non-zero exits like
+    # `agentsso start`'s exit-3 when it detects an already-running
+    # daemon — that's a configuration conflict, not a crash, and
+    # respawn-looping it just produces noisy launchd `error 78` rows
+    # in `brew services list` without resolving the conflict.
+    keep_alive crashed: true
     log_path var/"log/agentsso.log"
     error_log_path var/"log/agentsso.log"
     working_dir HOMEBREW_PREFIX
