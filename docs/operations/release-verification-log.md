@@ -142,3 +142,55 @@ Captured in story 7.1 Dev Agent Record + the v0.2.1 hotfix commit
 
 These complete Story 7.1's manual AC closure. Story moves to `review`
 on 2026-04-25; `code-review` workflow next.
+
+---
+
+## TBD — `v0.3.0-rc.1` — Story 7.2 (Windows installer + ClawHub skill)
+
+**First Windows release.** Adds `x86_64-pc-windows-msvc` to dist's targets,
+ships `install/install.ps1` (PowerShell installer mirroring install.sh's
+UX-DR9 ProgressSteps + sha256-sidecar verification), wires
+`windows-publish-smoke` job into release.yml, and adds the
+`agentsso-gateway` ClawHub skill folder. No Authenticode signing yet —
+sha256 sidecar verification only.
+
+**This entry is a placeholder.** Task 8 of Story 7.2 will fill in the actual
+shakedown results after pushing the rc tag. Expected drift (modeled on Story
+7.1's first-release shakedown which found 12 latent bugs):
+
+- dist 0.31's Windows runner image may need PowerShell version pinning.
+- `install.ps1`'s `Resolve-Version` uses GitHub API which may rate-limit
+  during CI runs (Story 7.1 didn't hit this; install.sh has the same code
+  path). Fix: pass `$env:AGENTSSO_VERSION` explicitly in CI to skip the
+  API call, which `windows-publish-smoke` already does.
+- `Expand-Archive` on PS 5.1 may fail with long-paths if the runner
+  doesn't have `core.longpaths` enabled. release.yml line 135 already has
+  `git config --global core.longpaths true` for the build step but not
+  the smoke step — may need to add.
+- ANSI escape rendering on `windows-latest` conhost may be off by default
+  in some PS versions; install.ps1's color block falls back to no-color
+  when output is redirected (CI logs are redirected), so this should be
+  invisible in CI but worth confirming.
+
+### Pre-shakedown smoke (run from author's macOS box, 2026-04-25)
+
+- `dist plan` confirms Windows artifact name `permitlayer-daemon-x86_64-pc-windows-msvc.zip` + `.sha256` sidecar.
+- `actionlint .github/workflows/release.yml` clean on the new `windows-publish-smoke` job.
+- `actionlint .github/workflows/ci.yml` clean on the new `windows-installer-test` job.
+- `install/clawhub/agentsso-gateway/SKILL.md` YAML frontmatter parses.
+- Local `cross`-build verification skipped per user-confirmed Path A — CI is the source of truth.
+
+### Manual VM smoke pending (Task 6 of Story 7.2)
+
+Austin to spin up a Windows 10/11 VM (Docker available; could be Parallels,
+UTM, or cloud-VM), run `irm <release-url>/install.ps1 | iex` against the
+v0.3.0-rc.1 release, confirm:
+
+- Daemon starts, binds 127.0.0.1:3820.
+- `agentsso status` reports running.
+- `agentsso setup gmail` (if user wants to go that far) seals tokens to
+  Windows Credential Manager (DPAPI).
+- `-Autostart` shortcut creates `agentsso.lnk` in Startup folder.
+- `irm | iex` flow works without `Set-ExecutionPolicy` mutation.
+
+Document drift in this entry after the run.

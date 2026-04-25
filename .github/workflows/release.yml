@@ -683,3 +683,112 @@ jobs:
           # unlabeled issue so the operator still sees the failure.
           gh issue create --title "$TITLE" --body "$BODY" --label release-issue \
             || gh issue create --title "$TITLE" --body "$BODY"
+
+  # permitlayer-custom (Story 7.2): Windows installer smoke test.
+  #
+  # After `host` uploads the dist-built Windows artifact
+  # (permitlayer-daemon-x86_64-pc-windows-msvc.zip + .sha256 sidecar) to the
+  # GitHub Release, this job runs install/install.ps1 (from the just-pushed
+  # tag's checkout, NOT a release-hosted copy) against the published zip
+  # and asserts agentsso.exe --version matches the tag.
+  #
+  # Why test the LOCAL install.ps1 against the PUBLISHED zip:
+  #   - Tests the script we're about to ship vs the binary we just shipped.
+  #   - Using the previous release's install.ps1 would test stale code.
+  #   - Using a release-hosted install.ps1 doesn't exist yet (releases don't
+  #     host install.ps1 — the script lives in the repo at install/install.ps1
+  #     and is fetched via a raw.githubusercontent.com URL by users; our
+  #     smoke test bypasses that hop).
+  #
+  # Pre-release gate: unlike homebrew-publish, this job runs on EVERY tag
+  # including pre-releases. Pre-release tags are exactly when we want the
+  # smoke test to run — that's the point of the rc shakedown. No gate var.
+  #
+  # No PR-creation step (unlike homebrew-publish): there's no equivalent of
+  # the Formula/agentsso.rb reference copy. install.ps1 is the source of
+  # truth and lives at install/install.ps1 in this repo.
+  windows-publish-smoke:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+      - sign
+      - host
+    if: ${{ always() && needs.host.result == 'success' && needs.sign.result == 'success' }}
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify install.ps1 ships in this commit
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'install/install.ps1')) {
+            Write-Error 'install/install.ps1 not found in checkout — Story 7.2 deliverable missing'
+            exit 1
+          }
+          Write-Host "install.ps1 size: $((Get-Item install/install.ps1).Length) bytes"
+
+      - name: Smoke test — install.ps1 against published Windows zip
+        shell: pwsh
+        env:
+          # Strip the leading 'v' to match install.ps1's expected version
+          # format (mirrors install.sh behaviour at line ~167).
+          AGENTSSO_VERSION: ${{ needs.plan.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Install to a sandbox dir under RUNNER_TEMP so the runner's
+          # actual user PATH is not polluted (the -NoModifyPath flag ALSO
+          # skips PATH mutation; belt + suspenders).
+          $sandbox = Join-Path $env:RUNNER_TEMP 'agentsso-smoke'
+          New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
+          $env:AGENTSSO_INSTALL_DIR = $sandbox
+
+          # Strip 'v' prefix — install.ps1 expects bare semver matching
+          # install.sh convention. dist's tag format is `vX.Y.Z`.
+          $env:AGENTSSO_VERSION = $env:AGENTSSO_VERSION -replace '^v', ''
+
+          Write-Host "Running install.ps1 with AGENTSSO_VERSION=$env:AGENTSSO_VERSION INSTALL_DIR=$sandbox"
+          & ./install/install.ps1 -NoModifyPath
+
+          $exe = Join-Path $sandbox 'agentsso.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Error "Expected agentsso.exe at $exe but not found after install"
+            exit 1
+          }
+
+          # clap renders --version as the literal `agentsso <semver>`.
+          # Match exactly (no substring grep — `0.2.1` would match `0.2.10`).
+          $installed = & $exe --version
+          $expected = "agentsso $env:AGENTSSO_VERSION"
+          Write-Host "Installed: $installed"
+          Write-Host "Expected:  $expected"
+          if ($installed -ne $expected) {
+            Write-Error "agentsso --version mismatch — expected '$expected', got '$installed'"
+            exit 1
+          }
+          Write-Host "Windows installer smoke test PASSED"
+
+      - name: Partial-failure issue on error
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Mirrors homebrew-publish's partial-failure issue pattern:
+          # idempotent (don't dup if same tag already has an open issue),
+          # falls back to unlabeled if release-issue label missing.
+          TITLE="Release ${TAG}: Windows installer smoke failed"
+          BODY="The windows-publish-smoke job for tag \`${TAG}\` failed. The Windows zip may have been published to the GitHub Release but install/install.ps1 did not install it cleanly. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          EXISTING="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "$EXISTING" ]; then
+            echo "::notice::Existing partial-failure issue #$EXISTING already open; not duplicating"
+            exit 0
+          fi
+          gh issue create --title "$TITLE" --body "$BODY" --label release-issue \
+            || gh issue create --title "$TITLE" --body "$BODY"

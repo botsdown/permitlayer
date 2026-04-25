@@ -1,7 +1,7 @@
 # Install
 
-permitlayer ships the `agentsso` binary for macOS (ARM64 and x86_64).
-Linux and Windows land in Story 7.2 / 7.7.
+permitlayer ships the `agentsso` binary for macOS (ARM64 and x86_64) and
+Windows (x86_64). Linux lands in Story 7.7.
 
 ## macOS — Homebrew (recommended)
 
@@ -90,6 +90,116 @@ curl -fsSL https://raw.githubusercontent.com/permitlayer/permitlayer/main/instal
 ```
 
 See `install/install.sh` for the full flag set.
+
+## Windows — PowerShell
+
+The `install/install.ps1` script is the Windows equivalent of `install.sh`.
+Requires Windows 10 v2004 or later (PowerShell 5.1+; PowerShell 7+ also
+supported and recommended).
+
+```powershell
+iwr https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.ps1 -UseBasicParsing | iex
+```
+
+This downloads the architecture-matched zip from GitHub Releases, verifies
+its sha256 sidecar (the `.zip.sha256` file dist 0.31 publishes alongside
+each release artifact), extracts `agentsso.exe`, and copies it to:
+
+- **Default:** `%LOCALAPPDATA%\Programs\agentsso\agentsso.exe`
+- **Override:** set `$env:AGENTSSO_INSTALL_DIR` before running
+
+The script also prepends the install dir to your user `PATH` (registry
+`HKCU\Environment\Path`, `REG_EXPAND_SZ`) and broadcasts `WM_SETTINGCHANGE`
+so newly-spawned terminals see the new PATH without logout.
+
+### With opt-in autostart
+
+Pass `-Autostart` to also drop a `.lnk` shortcut into your Startup folder
+(`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk`) so
+the daemon launches at login. The shortcut runs `agentsso.exe start`.
+
+```powershell
+& ([scriptblock]::Create((iwr https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.ps1 -UseBasicParsing).Content)) -Autostart
+```
+
+(The `& ([scriptblock]::Create(...))` invocation is the canonical PowerShell
+idiom for piping flags through `iex` — `iex` itself can't accept positional
+arguments, so we wrap the script body in a scriptblock and invoke it with
+the flag.)
+
+### Other flags
+
+```powershell
+# Pin to a specific version
+$env:AGENTSSO_VERSION = '0.3.0'
+iwr https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.ps1 -UseBasicParsing | iex
+
+# Skip PATH mutation
+& ([scriptblock]::Create((iwr ...).Content)) -NoModifyPath
+```
+
+### Code signing — currently NOT done
+
+`agentsso.exe` and `install.ps1` are **not** Authenticode-signed. Trust chain
+is HTTPS to GitHub Releases plus the sha256 sidecar that `install.ps1`
+verifies. If you want to verify the binary out-of-band:
+
+```powershell
+$expected = (iwr "https://github.com/permitlayer/permitlayer/releases/download/vVERSION/permitlayer-daemon-x86_64-pc-windows-msvc.zip.sha256" -UseBasicParsing).Content.Trim().Split()[0]
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath path\to\downloaded.zip).Hash.ToLowerInvariant()
+$expected -eq $actual
+```
+
+You will see a Microsoft Defender SmartScreen warning the first few times
+you run `agentsso.exe`. This is expected for unsigned binaries — SmartScreen
+builds reputation per-binary based on download volume. Click "More info" →
+"Run anyway" to proceed. Authenticode signing (which removes the SmartScreen
+warning) requires an EV code-signing certificate (~$400-700/year, HSM-backed
+per the 2023 CA/Browser Forum baseline). It is on the roadmap for Story 7.7
+or post-MVP funding; until then, sha256 verification is the supported trust
+mechanism.
+
+### Autostart — Story 7.3 will replace this
+
+The `-Autostart` flag's Startup-folder `.lnk` is the install-time minimum.
+Story 7.3 will ship `agentsso autostart enable` with proper Task Scheduler
+integration (matches the macOS LaunchAgent + Linux systemd-user pattern).
+When 7.3 lands:
+
+- `agentsso autostart enable` will detect the `agentsso.lnk` shortcut and
+  either replace it with a Scheduled Task or warn you about the duplicate.
+- `agentsso autostart disable` will remove both mechanisms.
+
+For now, if you want to remove the autostart shortcut manually:
+
+```powershell
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk"
+```
+
+### Uninstall — Story 7.4 will own this
+
+There is currently no `agentsso uninstall` command. To remove cleanly:
+
+```powershell
+# Stop the daemon (if running)
+agentsso stop
+
+# Remove the binary
+Remove-Item "$env:LOCALAPPDATA\Programs\agentsso" -Recurse
+
+# Remove autostart shortcut (if you used -Autostart)
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk" -ErrorAction SilentlyContinue
+
+# Remove user data (vault, audit log, policies). This deletes encrypted
+# credentials and the vault master key — only do this if you want a full
+# clean re-install.
+Remove-Item "$env:APPDATA\agentsso" -Recurse -ErrorAction SilentlyContinue
+
+# Remove from user PATH (manual): open System Properties → Environment
+# Variables → User → Path, and delete the agentsso entry.
+```
+
+Story 7.4 will replace all of the above with `agentsso uninstall`.
 
 ## Build from source
 

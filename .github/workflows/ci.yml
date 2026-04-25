@@ -147,6 +147,23 @@ jobs:
       - name: Test Homebrew patch script (brew style enforced)
         run: ./scripts/test-patch-homebrew-formula.sh
 
+  # Story 7.2: smoke test the Windows PowerShell installer on the
+  # canonical windows-latest runner. Story 7.7 will extend this to a
+  # full cross-platform matrix with KeyStore conformance + integration
+  # tests; for now we just exercise install.ps1's pure logic (arch
+  # detection, sha256 verification, idempotent PATH mutation, version
+  # parsing) without actually downloading a release artifact. The
+  # release-time end-to-end test (download + install + version assert)
+  # lives in release.yml's windows-publish-smoke job.
+  windows-installer-test:
+    name: Windows install.ps1 unit tests (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run install.ps1 unit tests
+        shell: pwsh
+        run: pwsh ./scripts/test-install-ps1.ps1
+
   security:
     name: Security audit + deny
     runs-on: ubuntu-latest
