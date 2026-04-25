@@ -57,9 +57,10 @@ strategy changed). Both macOS architectures (ARM64 + x86_64) ship.
 
 ### Pending AC coverage (Story 7.1 Task 8)
 
-- AC #3: `brew services start/stop agentsso` lifecycle on real macOS
-  (both arches).
-- AC #9: timed `brew install` on broadband (target <30s).
+- AC #9: timed `brew install` on broadband — **closed by 2026-04-25**
+  (see v0.2.1 entry below). Austin's M-series Mac measured 14.8s
+  end-to-end (within 30s budget; mostly Homebrew's auto-update
+  overhead, real install ~3-4s).
 - AC #5 strict: dist-generated formula passes `brew audit --strict`.
   Current behavior: formula passes `brew style --fix` + `brew style`
   (zero offenses), which covers the rubocop-style subset of
@@ -74,3 +75,71 @@ strategy changed). Both macOS architectures (ARM64 + x86_64) ship.
 - Users who already manually copied `/usr/local/bin/agentsso` before
   v0.2.0 tap-install should `sudo rm` it first — `brew install`
   will not overwrite a file it didn't create.
+
+---
+
+## 2026-04-25 — `v0.2.1` — Story 7.1 hotfix
+
+**Hotfix release.** Single-purpose: fix the `keep_alive true` →
+silent-launchd-respawn-loop bug that surfaced during @angie's AC #3
+verification on her Intel Mac. Bumped workspace 0.2.0 → 0.2.1, changed
+formula's `service do` block to `keep_alive crashed: true`, expanded
+caveats to cover the manual-`agentsso start` + `brew services start`
+collision case. No Rust changes; daemon-side behavior was already
+correct.
+
+### Pipeline verification
+
+- Run `24934994291` — **green first try**. All 7 jobs (`plan` →
+  `build-local-artifacts` ×2 → `build-global-artifacts` → `sign` →
+  `host` → `announce` + `homebrew-publish`) succeeded without retry.
+- 12 GitHub Release assets published (same shape as v0.2.0).
+- Tap commit `466d84cf agentsso v0.2.1` landed in
+  `permitlayer/homebrew-tap`.
+- Auto-PR #2 opened against main for `install/Formula/agentsso.rb`
+  refresh (awaiting human review).
+- CI smoke test (`brew tap && brew install && agentsso --version` on
+  `macos-14`) reported `0.2.1`.
+
+### Manual ACs covered by v0.2.1's existence
+
+- **AC #4 (upgrade path)** unblocked. Any Mac with v0.2.0 already
+  installed can now `brew upgrade agentsso` to validate the upgrade
+  path naturally. Pending real-machine verification: <30s upgrade,
+  formula refreshes, agentsso --version reports 0.2.1.
+
+### Forensic note on the DSL form
+
+The fix went through three iterations during planning before landing
+on the correct syntax:
+
+1. `keep_alive { successful_exit: false, crashed: true }` (planned)
+   — silently drops keys per Homebrew's elsif chain at
+   `service.rb:437–444`.
+2. `keep_alive { crashed: true }` (briefly committed in fixture
+   regen) — Ruby parses `{` as a block delimiter, not a hash literal,
+   after a method name. `brew style` flagged it as a Lint/Syntax
+   error.
+3. `keep_alive crashed: true` (final, shipped) — implicit-paren
+   method call with a hash arg. Maps to launchd's
+   `KeepAlive: { Crashed: true }` — restart only on signal-killed
+   termination.
+
+Captured in story 7.1 Dev Agent Record + the v0.2.1 plan file at
+`/Users/austinlowry/.claude/plans/let-s-regenerate-release-yml-from-cuddly-clarke.md`
+for posterity.
+
+### Pending real-machine validation (post-merge of PR #2)
+
+- AC #3 lifecycle re-test on @angie's Intel: install v0.2.1 (or
+  `brew upgrade agentsso` from v0.2.0), trigger the conflict scenario
+  (manual `agentsso start` + `brew services start agentsso`), confirm
+  no silent respawn loop. `brew services list | grep agentsso`
+  should NOT show `error 78` after the conflict — should report
+  `none` or `stopped` cleanly.
+- AC #4 upgrade-path validation on @austin's M-series:
+  `brew upgrade agentsso` should pick up v0.2.1, replace the formula,
+  preserve any running daemon's state.
+
+These complete Story 7.1's manual AC closure. Story moves to `review`
+on 2026-04-25; `code-review` workflow next.
