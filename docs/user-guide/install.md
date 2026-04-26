@@ -145,7 +145,9 @@ is HTTPS to GitHub Releases plus the sha256 sidecar that `install.ps1`
 verifies. If you want to verify the binary out-of-band:
 
 ```powershell
-$expected = (iwr "https://github.com/permitlayer/permitlayer/releases/download/vVERSION/permitlayer-daemon-x86_64-pc-windows-msvc.zip.sha256" -UseBasicParsing).Content.Trim().Split()[0]
+# Replace <VERSION> with the actual release version (e.g. 0.3.0).
+$VERSION = '0.3.0'
+$expected = (iwr "https://github.com/permitlayer/permitlayer/releases/download/v$VERSION/permitlayer-daemon-x86_64-pc-windows-msvc.zip.sha256" -UseBasicParsing).Content.Trim().Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath path\to\downloaded.zip).Hash.ToLowerInvariant()
 $expected -eq $actual
 ```

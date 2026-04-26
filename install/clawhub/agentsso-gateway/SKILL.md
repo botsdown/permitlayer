@@ -10,7 +10,16 @@ metadata:
       - kind: brew
         formula: permitlayer/tap/agentsso
         bins: [agentsso]
-    os: [macos, linux, windows]
+    # Restricted to macos at MVP because the only `install` block above is
+    # `kind: brew` (Story 7.1's tap), and Homebrew is macos-only in
+    # practice. Linux + Windows users CAN install agentsso via install.sh
+    # and install.ps1 respectively, but ClawHub's `install` schema only
+    # supports kind: brew | node | go | uv — none of which fit a Rust
+    # binary served via curl|sh or PowerShell|iex. Expand `os` to
+    # [macos, linux, windows] only when ClawHub's install spec adds a
+    # url/exec kind, or when this skill grows additional install blocks
+    # (e.g. winget, scoop, apt) for the other platforms.
+    os: [macos]
     homepage: https://github.com/permitlayer/permitlayer
     emoji: "🛡️"
 ---

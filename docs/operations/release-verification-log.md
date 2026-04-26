@@ -182,15 +182,6 @@ one had **zero**. The macOS-side review caught everything.
 
 Story 7.2's scope is install correctness (binary builds + zip downloads + sha256 verifies + agentsso --version reports right). All of that is now empirically green. Runtime-side parity (DPAPI keystore round-trip, daemon-binds-127.0.0.1:3820, OAuth flow on Windows) is Story 7.7's domain per the cross-story fence in `_bmad-output/implementation-artifacts/7-2-windows-installer.md` Dev Notes §"Cross-story fences".
 
-### Hypotheses that did NOT materialize
-
-The 4 expected-drift items I listed in this section's pre-merge placeholder:
-
-- ❌ "dist 0.31's Windows runner image may need PowerShell version pinning" — dist used `windows-latest` with PowerShell 7.4 cleanly, no pin needed.
-- ❌ "install.ps1's Resolve-Version may rate-limit on GitHub API" — `windows-publish-smoke` set `$env:AGENTSSO_VERSION` explicitly so the API call was skipped (as designed).
-- ❌ "Expand-Archive long-path failure on PS 5.1" — runner used PS 7.4, no long-path issue. Even if PS 5.1 had been used, install dir is `D:\a\_temp\agentsso-smoke\agentsso.exe` (well under MAX_PATH).
-- ❌ "ANSI escapes mis-render in conhost" — `[Console]::IsOutputRedirected` returned true in CI (job logs are piped), so install.ps1 disabled colors automatically. No rendering issues.
-
 ### Workspace version reverted
 
 After the rc shakedown was clean, workspace.package.version reverted 0.3.0-rc.1 → 0.2.1 (no actual stable bump pending in Story 7.2; the v0.3.0 stable cut is a separate event after Story 7.2 lands review). The published `v0.3.0-rc.1` GitHub Release stays as-is for posterity + as a downloadable proof of the install path.

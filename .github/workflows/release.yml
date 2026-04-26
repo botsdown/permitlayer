@@ -79,6 +79,44 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      # P27 (Story 7.2 review): gate plan job on Cargo.toml workspace
+      # version matching the pushed tag. Story 7.1 hit this footgun (push
+      # tag without bumping Cargo.toml → smoke test catches it later, but
+      # a half-published broken release lands first). Fail at plan-time
+      # instead so the rest of the pipeline never runs.
+      #
+      # Only fires on tag pushes (not PRs); PRs use `dist plan` against
+      # whatever the workspace happens to be at.
+      - name: Verify Cargo.toml version matches tag
+        if: ${{ !github.event.pull_request }}
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Strip leading 'v' to compare against the bare semver in Cargo.toml.
+          EXPECTED="${TAG#v}"
+          # Extract the workspace.package version. Use a tight regex so a
+          # later [dependencies] block with a `version = "X.Y.Z"` line can't
+          # falsely match — we anchor on the [workspace.package] heading.
+          ACTUAL="$(awk '
+            /^\[workspace\.package\]/ { in_block = 1; next }
+            /^\[/ { in_block = 0 }
+            in_block && /^version[[:space:]]*=/ {
+              gsub(/[" ]/, "", $0)
+              sub(/^version=/, "", $0)
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          if [ -z "$ACTUAL" ]; then
+            echo "::error::Could not extract workspace.package version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Tag/version drift: tag $TAG implies workspace version '$EXPECTED', but Cargo.toml has '$ACTUAL'."
+            echo "::error::Bump [workspace.package].version in Cargo.toml + path-dep version refs to '$EXPECTED' before pushing the tag, OR delete the tag and re-push after the bump."
+            exit 1
+          fi
+          echo "Tag/version check OK: $TAG matches Cargo.toml workspace version $ACTUAL"
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -773,6 +811,58 @@ jobs:
             exit 1
           }
           Write-Host "Windows installer smoke test PASSED"
+
+      # P30 (Story 7.2 review): second invocation with -Autostart, asserts
+      # the Startup-folder shortcut is created. Closes AC #5's E2E gap —
+      # the unit test only verifies Register-StartupShortcut in isolation.
+      # Sandboxed install dir (different from the first smoke) so the
+      # daemon-running file-lock check in Install-AgentSso doesn't trip
+      # on the previous step's leftover.
+      - name: Smoke test — install.ps1 -Autostart
+        shell: pwsh
+        env:
+          AGENTSSO_VERSION: ${{ needs.plan.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sandbox = Join-Path $env:RUNNER_TEMP 'agentsso-smoke-autostart'
+          New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
+          $env:AGENTSSO_INSTALL_DIR = $sandbox
+          $env:AGENTSSO_VERSION = $env:AGENTSSO_VERSION -replace '^v', ''
+
+          # Pre-clean: remove any leftover agentsso.lnk from a previous
+          # run on the same self-hosted-style runner (paranoia — hosted
+          # runners are ephemeral).
+          $lnkPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'agentsso.lnk'
+          if (Test-Path $lnkPath) { Remove-Item -Force $lnkPath }
+
+          Write-Host "Running install.ps1 -Autostart -NoModifyPath against $sandbox"
+          & ./install/install.ps1 -Autostart -NoModifyPath
+
+          if (-not (Test-Path $lnkPath)) {
+            Write-Error "Expected $lnkPath to exist after -Autostart but it does not"
+            exit 1
+          }
+          Write-Host "Startup shortcut created at $lnkPath"
+
+          # Verify the shortcut points at the installed exe with `start`
+          # arguments (per Story 7.2 AC #5 + Story 7.3 fence).
+          $wsh = New-Object -ComObject WScript.Shell
+          $sc = $wsh.CreateShortcut($lnkPath)
+          $expectedTarget = Join-Path $sandbox 'agentsso.exe'
+          if ($sc.TargetPath -ne $expectedTarget) {
+            Write-Error "Shortcut TargetPath mismatch — expected '$expectedTarget', got '$($sc.TargetPath)'"
+            exit 1
+          }
+          if ($sc.Arguments -ne 'start') {
+            Write-Error "Shortcut Arguments mismatch — expected 'start', got '$($sc.Arguments)'"
+            exit 1
+          }
+          Write-Host "Shortcut TargetPath + Arguments verified"
+
+          # Clean up the shortcut so we don't leave runner state behind
+          # if anything later in the job runs.
+          Remove-Item -Force $lnkPath
+          Write-Host "Windows -Autostart smoke test PASSED"
 
       - name: Partial-failure issue on error
         if: ${{ failure() }}
