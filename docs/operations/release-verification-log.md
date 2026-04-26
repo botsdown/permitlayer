@@ -145,7 +145,7 @@ on 2026-04-25; `code-review` workflow next.
 
 ---
 
-## TBD — `v0.3.0-rc.1` — Story 7.2 (Windows installer + ClawHub skill)
+## 2026-04-26 — `v0.3.0-rc.1` — Story 7.2 (Windows installer + ClawHub skill)
 
 **First Windows release.** Adds `x86_64-pc-windows-msvc` to dist's targets,
 ships `install/install.ps1` (PowerShell installer mirroring install.sh's
@@ -154,43 +154,43 @@ UX-DR9 ProgressSteps + sha256-sidecar verification), wires
 `agentsso-gateway` ClawHub skill folder. No Authenticode signing yet —
 sha256 sidecar verification only.
 
-**This entry is a placeholder.** Task 8 of Story 7.2 will fill in the actual
-shakedown results after pushing the rc tag. Expected drift (modeled on Story
-7.1's first-release shakedown which found 12 latent bugs):
+### Pipeline verification
 
-- dist 0.31's Windows runner image may need PowerShell version pinning.
-- `install.ps1`'s `Resolve-Version` uses GitHub API which may rate-limit
-  during CI runs (Story 7.1 didn't hit this; install.sh has the same code
-  path). Fix: pass `$env:AGENTSSO_VERSION` explicitly in CI to skip the
-  API call, which `windows-publish-smoke` already does.
-- `Expand-Archive` on PS 5.1 may fail with long-paths if the runner
-  doesn't have `core.longpaths` enabled. release.yml line 135 already has
-  `git config --global core.longpaths true` for the build step but not
-  the smoke step — may need to add.
-- ANSI escape rendering on `windows-latest` conhost may be off by default
-  in some PS versions; install.ps1's color block falls back to no-color
-  when output is redirected (CI logs are redirected), so this should be
-  invisible in CI but worth confirming.
+**ALL 10 JOBS GREEN ON FIRST TRY** (release run
+[`24964944269`](https://github.com/permitlayer/permitlayer/actions/runs/24964944269)).
+Story 7.1 found 12 latent bugs on its first real release-pipeline run; this
+one had **zero**. The macOS-side review caught everything.
 
-### Pre-shakedown smoke (run from author's macOS box, 2026-04-25)
+| Job | Result | Notes |
+|-----|--------|-------|
+| `plan` | ✓ | dist 0.31 emits Windows artifact in manifest |
+| `build-local-artifacts (aarch64-apple-darwin)` | ✓ | unchanged from v0.2.1 baseline |
+| `build-local-artifacts (x86_64-apple-darwin)` | ✓ | unchanged |
+| `build-local-artifacts (x86_64-pc-windows-msvc)` | ✓ | **first cargo-build-on-Windows for permitlayer.** Keystore + daemon + all 8 crates compiled cleanly under MSVC — confirms Story 4.4's `keyring` `windows-native` feature gate works in production. Closes AC #1. |
+| `build-global-artifacts` | ✓ | dist regenerates `agentsso.rb` formula; not pushed (homebrew gate skip) |
+| `sign` | ✓ | minisign signed all 3 platform zips/tarballs producing `.minisig` files |
+| `host` | ✓ | GitHub Release `v0.3.0-rc.1` published with 15 assets (12 baseline + 3 new Windows assets) |
+| `homebrew-publish` | ✓ (gated-skip) | hyphen-in-tag detected, `HOMEBREW_PUBLISH_PRERELEASES != 1`, `skip=1`, `Early exit for gated pre-release` exited 0. Tap untouched at v0.2.1 — confirmed via `git ls-remote permitlayer/homebrew-tap`. |
+| `windows-publish-smoke` | ✓ | install.ps1 ran end-to-end on `windows-latest` against the published zip; sha256 verified; `agentsso --version` returned exactly `agentsso 0.3.0-rc.1`. "Windows installer smoke test PASSED". |
+| `announce` | ✓ | |
 
-- `dist plan` confirms Windows artifact name `permitlayer-daemon-x86_64-pc-windows-msvc.zip` + `.sha256` sidecar.
-- `actionlint .github/workflows/release.yml` clean on the new `windows-publish-smoke` job.
-- `actionlint .github/workflows/ci.yml` clean on the new `windows-installer-test` job.
-- `install/clawhub/agentsso-gateway/SKILL.md` YAML frontmatter parses.
-- Local `cross`-build verification skipped per user-confirmed Path A — CI is the source of truth.
+### Release assets
 
-### Manual VM smoke pending (Task 6 of Story 7.2)
+15 total (12 baseline + 3 new Windows): `permitlayer-daemon-x86_64-pc-windows-msvc.zip` + `.minisig` + `.sha256`. dist 0.31's native sha256 sidecar emission worked transparently — AC #6 needed zero release.yml changes for sha256 (only the `windows-publish-smoke` job to actually USE the sidecar).
 
-Austin to spin up a Windows 10/11 VM (Docker available; could be Parallels,
-UTM, or cloud-VM), run `irm <release-url>/install.ps1 | iex` against the
-v0.3.0-rc.1 release, confirm:
+### Manual VM smoke deferred to Story 7.7
 
-- Daemon starts, binds 127.0.0.1:3820.
-- `agentsso status` reports running.
-- `agentsso setup gmail` (if user wants to go that far) seals tokens to
-  Windows Credential Manager (DPAPI).
-- `-Autostart` shortcut creates `agentsso.lnk` in Startup folder.
-- `irm | iex` flow works without `Set-ExecutionPolicy` mutation.
+Story 7.2's scope is install correctness (binary builds + zip downloads + sha256 verifies + agentsso --version reports right). All of that is now empirically green. Runtime-side parity (DPAPI keystore round-trip, daemon-binds-127.0.0.1:3820, OAuth flow on Windows) is Story 7.7's domain per the cross-story fence in `_bmad-output/implementation-artifacts/7-2-windows-installer.md` Dev Notes §"Cross-story fences".
 
-Document drift in this entry after the run.
+### Hypotheses that did NOT materialize
+
+The 4 expected-drift items I listed in this section's pre-merge placeholder:
+
+- ❌ "dist 0.31's Windows runner image may need PowerShell version pinning" — dist used `windows-latest` with PowerShell 7.4 cleanly, no pin needed.
+- ❌ "install.ps1's Resolve-Version may rate-limit on GitHub API" — `windows-publish-smoke` set `$env:AGENTSSO_VERSION` explicitly so the API call was skipped (as designed).
+- ❌ "Expand-Archive long-path failure on PS 5.1" — runner used PS 7.4, no long-path issue. Even if PS 5.1 had been used, install dir is `D:\a\_temp\agentsso-smoke\agentsso.exe` (well under MAX_PATH).
+- ❌ "ANSI escapes mis-render in conhost" — `[Console]::IsOutputRedirected` returned true in CI (job logs are piped), so install.ps1 disabled colors automatically. No rendering issues.
+
+### Workspace version reverted
+
+After the rc shakedown was clean, workspace.package.version reverted 0.3.0-rc.1 → 0.2.1 (no actual stable bump pending in Story 7.2; the v0.3.0 stable cut is a separate event after Story 7.2 lands review). The published `v0.3.0-rc.1` GitHub Release stays as-is for posterity + as a downloadable proof of the install path.
