@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use permitlayer_core::store::CredentialStore;
 use permitlayer_core::store::fs::credential_fs::{CredentialFsIo, CredentialFsStore};
-use permitlayer_credential::{SEALED_CREDENTIAL_VERSION, SealedCredential};
+use permitlayer_credential::{KeyId, SEALED_CREDENTIAL_VERSION, SealedCredential};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -51,14 +51,26 @@ fn fixture_a() -> SealedCredential {
     let aad = [b"permitlayer-vault-v1:", b"gmail" as &[u8]].concat();
     let ciphertext = vec![0xAAu8; 48];
     let nonce = [0x11u8; 12];
-    SealedCredential::from_trusted_bytes(ciphertext, nonce, aad, SEALED_CREDENTIAL_VERSION)
+    SealedCredential::from_trusted_bytes(
+        ciphertext,
+        nonce,
+        aad,
+        SEALED_CREDENTIAL_VERSION,
+        KeyId::ZERO,
+    )
 }
 
 fn fixture_b() -> SealedCredential {
     let aad = [b"permitlayer-vault-v1:", b"gmail" as &[u8]].concat();
     let ciphertext = vec![0xBBu8; 48];
     let nonce = [0x22u8; 12];
-    SealedCredential::from_trusted_bytes(ciphertext, nonce, aad, SEALED_CREDENTIAL_VERSION)
+    SealedCredential::from_trusted_bytes(
+        ciphertext,
+        nonce,
+        aad,
+        SEALED_CREDENTIAL_VERSION,
+        KeyId::ZERO,
+    )
 }
 
 #[allow(clippy::enum_variant_names)] // "Before" prefix is load-bearing: each variant names a real pre-syscall checkpoint

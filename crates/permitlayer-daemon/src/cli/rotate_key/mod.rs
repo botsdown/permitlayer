@@ -148,40 +148,81 @@ pub struct RotateKeyArgs {
 // ── Entry point ────────────────────────────────────────────────────
 
 /// Run the `rotate-key` subcommand.
+///
+/// **Story 7.6a dormancy fence (Task 9).** The CLI surface ships
+/// dormant in v0.4: invocation refuses with `RotateKeyExitCode4` and
+/// a forward-pin to v0.5 / Story 7.6b. The dispatcher in `main.rs`
+/// still wires `Commands::RotateKey` so the binary's `--help`
+/// continues to list the subcommand (operators can see what's
+/// coming), but actually running it is not user-supported until
+/// 7.6b lands.
+///
+/// Why dormant rather than removed: Story 7.6 (commit `9f089f9`)
+/// stays in main as a reference implementation that 7.6b commits
+/// will replace piecewise. Removing the surface would force
+/// re-creating it; refusing at the entry point keeps the existing
+/// modules (`master_key`, `rotation::reseal`, `state`, the
+/// `RotateKeyExitCode3/4/5` typed markers) in tree where 7.6b
+/// expects them.
+///
+/// Story 7.6b's first commit will REMOVE this refusal and rebuild
+/// the rotate-key flow on top of `VaultLock` + `key_id`-aware
+/// envelope-by-envelope reseal.
+#[allow(unused_variables)] // `args` is consumed only by 7.6b's body.
 pub async fn run(args: RotateKeyArgs) -> Result<()> {
     use anyhow::Context as _;
 
-    // ── Pre-flight 1: brew-services double-bind detection (macOS) ──
-    //
-    // P19 (Story 7.4 review): pre-flights run BEFORE `init_tracing`
-    // so we don't pay the tracing-subscriber setup cost (or risk
-    // creating ~/.agentsso/logs/ that step 4 would have to delete)
-    // when rotate-key is going to refuse anyway.
-    #[cfg(target_os = "macos")]
-    if brew_services_managing_agentsso().await {
-        eprint!(
-            "{}",
-            render::error_block(
-                "rotate_key_managed_externally",
-                "agentsso is managed by Homebrew (brew services); rotating the master \
+    // ── Story 7.6a Task 9: hard refusal until 7.6b ─────────────────
+    eprint!(
+        "{}",
+        render::error_block(
+            "rotate_key_dormant",
+            "agentsso rotate-key is being upgraded for v0.4 and is temporarily \
+             disabled. Please wait for the next release.",
+            "see release notes — Story 7.6 → 7.6a → 7.6b transition",
+            None,
+        )
+    );
+    return Err(exit4());
+
+    // The remainder of this function is dead code under the dormancy
+    // fence. 7.6b will delete the early `return Err(exit4())` above
+    // and resume normal flow on the new primitives. We retain the
+    // body so existing test fixtures + integration coverage do not
+    // bit-rot before 7.6b restores them.
+    #[allow(unreachable_code)]
+    {
+        // ── Pre-flight 1: brew-services double-bind detection (macOS) ──
+        //
+        // P19 (Story 7.4 review): pre-flights run BEFORE `init_tracing`
+        // so we don't pay the tracing-subscriber setup cost (or risk
+        // creating ~/.agentsso/logs/ that step 4 would have to delete)
+        // when rotate-key is going to refuse anyway.
+        #[cfg(target_os = "macos")]
+        if brew_services_managing_agentsso().await {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "rotate_key_managed_externally",
+                    "agentsso is managed by Homebrew (brew services); rotating the master \
                  key would desync brew's view of the daemon and may leave it pointing at \
                  stale credentials.",
-                "brew services stop agentsso && agentsso rotate-key",
-                None,
-            )
-        );
-        return Err(exit3());
-    }
+                    "brew services stop agentsso && agentsso rotate-key",
+                    None,
+                )
+            );
+            return Err(exit3());
+        }
 
-    // ── Pre-flight 2: daemon-running guard (AC #5) ─────────────────
-    //
-    // Q1 default A: refuse if daemon up. Rotating while the daemon
-    // holds an in-memory copy of the OLD master key opens the same
-    // race surface that Story 1.15's HIGH patch closed (AuthLayer /
-    // ScopedTokenIssuer desync). Stop first; we don't try to be
-    // clever.
-    let home = super::agentsso_home()?;
-    let daemon_running = crate::lifecycle::pid::PidFile::is_daemon_running(&home)
+        // ── Pre-flight 2: daemon-running guard (AC #5) ─────────────────
+        //
+        // Q1 default A: refuse if daemon up. Rotating while the daemon
+        // holds an in-memory copy of the OLD master key opens the same
+        // race surface that Story 1.15's HIGH patch closed (AuthLayer /
+        // ScopedTokenIssuer desync). Stop first; we don't try to be
+        // clever.
+        let home = super::agentsso_home()?;
+        let daemon_running = crate::lifecycle::pid::PidFile::is_daemon_running(&home)
         .unwrap_or_else(|e| {
             // PID-file-read failure during pre-flight: don't refuse,
             // don't proceed silently. Log + treat as "running" (safer
@@ -190,119 +231,120 @@ pub async fn run(args: RotateKeyArgs) -> Result<()> {
             tracing::warn!(error = %e, "PID-file probe failed; treating daemon as running for safety");
             true
         });
-    if daemon_running {
-        eprint!(
-            "{}",
-            render::error_block(
-                "rotate_key_daemon_running",
-                "agentsso daemon is running; rotate-key requires the daemon to be \
-                 stopped to avoid in-memory key desync.",
-                "agentsso stop && agentsso rotate-key",
-                None,
-            )
-        );
-        return Err(exit3());
-    }
-
-    // Now safe to init tracing.
-    let _guards =
-        crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
-
-    // ── Pre-flight 3: tty / non-interactive guard (AC #7) ──────────
-    let stdout_is_tty = console::Term::stdout().is_term();
-    let interactive = !args.non_interactive && stdout_is_tty;
-    if !args.yes && !interactive {
-        eprint!(
-            "{}",
-            render::error_block(
-                "rotate_key_requires_confirmation",
-                "rotate-key is destructive (replaces the master key in your OS keychain) \
-                 and requires interactive confirmation OR an explicit `--yes` flag.",
-                "agentsso rotate-key --yes",
-                None,
-            )
-        );
-        return Err(silent_cli_error("non-interactive rotate-key without --yes"));
-    }
-
-    // ── Pre-flight 4: keystore-adapter detection (AC #6) ───────────
-    //
-    // Q2 default A: passphrase adapters cannot be rotated by minting
-    // a new key — they rotate by changing the passphrase. Refuse
-    // cleanly with a forward-pin to a future `agentsso change-passphrase`
-    // command. Do this BEFORE reading the master key so we don't
-    // prompt for a passphrase we're about to refuse to use.
-    let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
-    let keystore = match default_keystore(&keystore_config) {
-        Ok(ks) => ks,
-        Err(e) => {
+        if daemon_running {
             eprint!(
                 "{}",
                 render::error_block(
-                    "rotate_key_keystore_unavailable",
-                    &format!("keystore initialization failed: {e}"),
-                    "verify your OS keychain is available; on Linux this typically \
+                    "rotate_key_daemon_running",
+                    "agentsso daemon is running; rotate-key requires the daemon to be \
+                 stopped to avoid in-memory key desync.",
+                    "agentsso stop && agentsso rotate-key",
+                    None,
+                )
+            );
+            return Err(exit3());
+        }
+
+        // Now safe to init tracing.
+        let _guards =
+            crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
+
+        // ── Pre-flight 3: tty / non-interactive guard (AC #7) ──────────
+        let stdout_is_tty = console::Term::stdout().is_term();
+        let interactive = !args.non_interactive && stdout_is_tty;
+        if !args.yes && !interactive {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "rotate_key_requires_confirmation",
+                    "rotate-key is destructive (replaces the master key in your OS keychain) \
+                 and requires interactive confirmation OR an explicit `--yes` flag.",
+                    "agentsso rotate-key --yes",
+                    None,
+                )
+            );
+            return Err(silent_cli_error("non-interactive rotate-key without --yes"));
+        }
+
+        // ── Pre-flight 4: keystore-adapter detection (AC #6) ───────────
+        //
+        // Q2 default A: passphrase adapters cannot be rotated by minting
+        // a new key — they rotate by changing the passphrase. Refuse
+        // cleanly with a forward-pin to a future `agentsso change-passphrase`
+        // command. Do this BEFORE reading the master key so we don't
+        // prompt for a passphrase we're about to refuse to use.
+        let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
+        let keystore = match default_keystore(&keystore_config) {
+            Ok(ks) => ks,
+            Err(e) => {
+                eprint!(
+                    "{}",
+                    render::error_block(
+                        "rotate_key_keystore_unavailable",
+                        &format!("keystore initialization failed: {e}"),
+                        "verify your OS keychain is available; on Linux this typically \
                      requires libsecret + a running secret-storage daemon (gnome-keyring \
                      / kwallet)",
+                        None,
+                    )
+                );
+                return Err(exit4());
+            }
+        };
+        if keystore.kind() == KeyStoreKind::Passphrase {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "rotate_key_passphrase_adapter",
+                    "the passphrase keystore rotates by changing the passphrase, not by \
+                 minting a new master key. A dedicated `agentsso change-passphrase` \
+                 command will be added in a future story; for now, the passphrase-mode \
+                 rotation path is unavailable.",
+                    "(future) agentsso change-passphrase — not yet implemented",
                     None,
                 )
             );
             return Err(exit4());
         }
-    };
-    if keystore.kind() == KeyStoreKind::Passphrase {
-        eprint!(
-            "{}",
-            render::error_block(
-                "rotate_key_passphrase_adapter",
-                "the passphrase keystore rotates by changing the passphrase, not by \
-                 minting a new master key. A dedicated `agentsso change-passphrase` \
-                 command will be added in a future story; for now, the passphrase-mode \
-                 rotation path is unavailable.",
-                "(future) agentsso change-passphrase — not yet implemented",
-                None,
-            )
-        );
-        return Err(exit4());
-    }
 
-    // ── Pre-flight 5: crash-resume detection (AC #4) ───────────────
-    //
-    // If a previous rotate-key attempt crashed between Phase C
-    // (keystore swap) and Phase F (cleanup), there is a
-    // `.rotation.in-progress` marker on disk. Detect it and route to
-    // the resume path — DO NOT prompt for confirmation again, and DO
-    // NOT mint a new key (the keystore already has the new one).
-    let marker_path = home.join("vault").join(ROTATION_MARKER_FILENAME);
-    if marker_path.exists() {
-        tracing::info!(
-            marker = %marker_path.display(),
-            "detected in-flight rotation; entering resume path"
-        );
-        return resume::run_resume(&home, keystore.as_ref()).await;
-    }
-
-    // ── Confirm prompt ─────────────────────────────────────────────
-    if !args.yes {
-        let manifest = build_prompt_manifest(&home);
-        println!("{manifest}");
-
-        let join = tokio::task::spawn_blocking(|| {
-            dialoguer::Confirm::new().with_prompt("Continue?").default(false).interact()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("rotate-key confirm join failed: {e}"))?;
-        // `dialoguer::Error` (Ctrl-C, stdin closed) → treat as cancel.
-        let confirmed: bool = join.unwrap_or_default();
-        if !confirmed {
-            println!("rotate-key cancelled");
-            return Ok(());
+        // ── Pre-flight 5: crash-resume detection (AC #4) ───────────────
+        //
+        // If a previous rotate-key attempt crashed between Phase C
+        // (keystore swap) and Phase F (cleanup), there is a
+        // `.rotation.in-progress` marker on disk. Detect it and route to
+        // the resume path — DO NOT prompt for confirmation again, and DO
+        // NOT mint a new key (the keystore already has the new one).
+        let marker_path = home.join("vault").join(ROTATION_MARKER_FILENAME);
+        if marker_path.exists() {
+            tracing::info!(
+                marker = %marker_path.display(),
+                "detected in-flight rotation; entering resume path"
+            );
+            return resume::run_resume(&home, keystore.as_ref()).await;
         }
-    }
 
-    // ── Run the rotation ───────────────────────────────────────────
-    let started = Instant::now();
-    run_rotation(&home, keystore.as_ref(), started).await
+        // ── Confirm prompt ─────────────────────────────────────────────
+        if !args.yes {
+            let manifest = build_prompt_manifest(&home);
+            println!("{manifest}");
+
+            let join = tokio::task::spawn_blocking(|| {
+                dialoguer::Confirm::new().with_prompt("Continue?").default(false).interact()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("rotate-key confirm join failed: {e}"))?;
+            // `dialoguer::Error` (Ctrl-C, stdin closed) → treat as cancel.
+            let confirmed: bool = join.unwrap_or_default();
+            if !confirmed {
+                println!("rotate-key cancelled");
+                return Ok(());
+            }
+        }
+
+        // ── Run the rotation ───────────────────────────────────────────
+        let started = Instant::now();
+        run_rotation(&home, keystore.as_ref(), started).await
+    } // end of unreachable dead-code block (Story 7.6a Task 9)
 }
 
 /// Build the manifest block printed before the confirmation prompt
@@ -354,4 +396,29 @@ async fn brew_services_managing_agentsso() -> bool {
         return false;
     }
     crate::lifecycle::autostart::macos::parse_brew_services_active(&output.stdout)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// Story 7.6a Task 9: the dormancy fence rejects every invocation
+    /// regardless of args. The error chain carries
+    /// `RotateKeyExitCode4` so `main.rs::rotate_key_to_exit_code`
+    /// returns exit code 4.
+    #[tokio::test]
+    async fn run_refuses_with_dormancy_fence() {
+        let err = run(RotateKeyArgs::default()).await.unwrap_err();
+        // Walk the anyhow chain looking for the typed marker.
+        let has_marker = err.chain().any(|e| e.is::<RotateKeyExitCode4>());
+        assert!(has_marker, "expected RotateKeyExitCode4 in error chain: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn run_refuses_even_with_yes_flag() {
+        let err = run(RotateKeyArgs { yes: true, non_interactive: true }).await.unwrap_err();
+        let has_marker = err.chain().any(|e| e.is::<RotateKeyExitCode4>());
+        assert!(has_marker, "expected RotateKeyExitCode4 in error chain: {err:?}");
+    }
 }

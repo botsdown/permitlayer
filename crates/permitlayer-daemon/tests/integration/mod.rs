@@ -42,6 +42,7 @@ mod connectors_new_e2e;
 mod connectors_test_e2e;
 mod credentials_status;
 mod daemon_lifecycle;
+mod envelope_v1_to_v2_e2e;
 mod kill_resume_e2e;
 mod kill_switch_e2e;
 mod logs_audit_isolation_e2e;

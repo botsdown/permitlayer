@@ -396,11 +396,129 @@ async fn debug_plugin_echo_handler(
 /// so that the control-plane router and `KillSwitchLayer` can share the
 /// same `Arc<dyn AuditStore>` with `ProxyService` — a single audit file,
 /// a single writer lock, one process-wide audit stream.
+/// Walk the vault directory and return `max(envelope.key_id)` over every
+/// `.sealed` file. Defaults to `0` for an empty / absent vault (Story 7.6a
+/// AC #12).
+///
+/// This reads only the envelope HEADER (first 4 bytes for v2: version +
+/// nonce_len + key_id) — no AEAD unseal, no plaintext exposure. Per-file
+/// errors (truncation, unreadable, non-regular file) are logged-and-skipped
+/// per Story 7.3 P63 + Story 7.6 `list_services` precedent. Failure to
+/// compute does NOT block boot — falls back to `0` so the daemon serves on
+/// the bootstrap key.
+pub(crate) fn compute_active_key_id(vault_dir: &std::path::Path) -> u8 {
+    let read_dir = match std::fs::read_dir(vault_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %vault_dir.display(), "vault dir read failed; defaulting active_key_id to 0");
+            return 0;
+        }
+    };
+    let mut max_key_id: u8 = 0;
+    // Track per-directory totals so we can distinguish "every entry
+    // was unreadable" (potentially corrupted vault — surface a warn)
+    // from "no .sealed entries to consider" (fresh / empty vault —
+    // silent zero is correct).
+    let mut considered = 0usize;
+    let mut unreadable = 0usize;
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping unreadable vault entry while computing active_key_id");
+                unreadable += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if !file_name.ends_with(".sealed")
+            || file_name.starts_with('.')
+            || file_name.contains(".tmp.")
+            || file_name.contains(".sealed.new")
+        {
+            continue;
+        }
+        considered += 1;
+        // Reject symlinks per Story 7.3 P63 precedent.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        if !meta.file_type().is_file() {
+            unreadable += 1;
+            continue;
+        }
+        // Read just the first 4 bytes for v2 (or first 3 for v1: same
+        // first 2 bytes encode the version, so the 3rd byte is
+        // nonce_len in both schemas; the 4th is key_id only in v2).
+        let mut handle = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let mut header = [0u8; 4];
+        use std::io::Read as _;
+        if handle.read_exact(&mut header).is_err() {
+            // Truncated file (< 4 bytes) — skip; the credential is
+            // unreadable but that's not this function's concern.
+            unreadable += 1;
+            continue;
+        }
+        let version = u16::from_le_bytes([header[0], header[1]]);
+        match version {
+            // v1 envelopes have no key_id byte; treat as 0.
+            1 => {}
+            2 => {
+                let key_id = header[3];
+                if key_id > max_key_id {
+                    max_key_id = key_id;
+                }
+            }
+            _ => {
+                // Unknown version on disk — almost always a downgrade
+                // scenario (operator booted an older binary that only
+                // knows v ≤ N against a vault rewritten to v > N) or
+                // corruption. Surface at warn-level; the proxy will
+                // surface a hard structured error at decode time.
+                tracing::warn!(
+                    file = %path.display(),
+                    version,
+                    "envelope of unknown version while computing active_key_id (downgrade or corruption?)"
+                );
+            }
+        }
+    }
+    // If we considered some `.sealed` entries but every one was
+    // unreadable, surface an error-level warn. Returning 0 here would
+    // mask a corrupted vault — the daemon would write fresh seals
+    // with `key_id = 0`, breaking rotation tracking. The boot path
+    // continues (we don't refuse-to-boot — that's a heavier policy
+    // change owned by 7.6b) but the operator sees the signal in logs.
+    if considered > 0 && unreadable == considered {
+        tracing::error!(
+            dir = %vault_dir.display(),
+            considered,
+            unreadable,
+            "every .sealed entry was unreadable while computing active_key_id; \
+             rotation tracking may be corrupt — investigate vault permissions / contents"
+        );
+    }
+    max_key_id
+}
+
 async fn try_build_proxy_service(
     config: &DaemonConfig,
     scrub_engine: Option<&Arc<permitlayer_core::scrub::ScrubEngine>>,
     audit_store: Option<&Arc<dyn permitlayer_core::store::AuditStore>>,
     master_key: &zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>,
+    active_key_id: u8,
 ) -> Option<Arc<permitlayer_proxy::ProxyService>> {
     use hkdf::Hkdf;
     use permitlayer_core::store::fs::CredentialFsStore;
@@ -418,9 +536,52 @@ async fn try_build_proxy_service(
     let audit_store = audit_store?;
 
     let vault_dir = config.paths.home.join("vault");
-    if !vault_dir.exists() {
+    // Story 7.6a: the vault directory is now created at boot by
+    // `VaultLock::try_acquire` (so the lock file has somewhere to
+    // live). "Directory exists" is therefore no longer a useful
+    // proxy for "setup has been run." Walk the directory and look
+    // for any `.sealed` file — if none exist, the proxy still
+    // serves 501 and the operator's next step is `agentsso setup`.
+    //
+    // Distinguish three outcomes:
+    //   1. read_dir succeeds, no `.sealed` entry → fresh install, log
+    //      the "run setup" hint and serve 501.
+    //   2. read_dir succeeds, ≥ 1 `.sealed` entry that is a regular
+    //      file → real credentials, build the proxy.
+    //   3. read_dir fails with anything other than NotFound (perm
+    //      denied, I/O error) → log at error and refuse to build the
+    //      proxy. Silently treating an I/O error as "no credentials"
+    //      would surface a misleading "run setup" hint when the real
+    //      issue is a vault that exists but is unreadable.
+    let vault_has_credentials = match std::fs::read_dir(&vault_dir) {
+        Ok(rd) => rd.filter_map(Result::ok).any(|entry| {
+            // Story 7.3 P63: reject non-regular files in the walk.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            if !meta.file_type().is_file() {
+                return false;
+            }
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".sealed") && !n.contains(".sealed.tmp."))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                dir = %vault_dir.display(),
+                "vault directory unreadable — refusing to build proxy service \
+                 (operator: check vault permissions)"
+            );
+            return None;
+        }
+    };
+    if !vault_has_credentials {
         tracing::warn!(
-            "vault directory does not exist — run `agentsso setup <service>` to connect credentials"
+            "vault contains no credentials — run `agentsso setup <service>` to connect credentials"
         );
         return None;
     }
@@ -449,7 +610,13 @@ async fn try_build_proxy_service(
     // are zeroized on drop.
     let mut vault_key = Zeroizing::new([0u8; permitlayer_keystore::MASTER_KEY_LEN]);
     vault_key.copy_from_slice(master_key.as_slice());
-    let vault = Arc::new(Vault::new(vault_key));
+    // Story 7.6a AC #12: `key_id` for the live proxy Vault is the
+    // active key_id walked from the vault on boot
+    // (`max(envelope.key_id)`, defaulting to 0 on empty vault). Every
+    // refresh-rotation seal stamps this value on the new envelope.
+    // Story 7.6b will increment per rotation; for 7.6a it's `0` until
+    // a rotation event happens.
+    let vault = Arc::new(Vault::new(vault_key, active_key_id));
     let token_issuer = Arc::new(ScopedTokenIssuer::new(signing_key));
 
     let upstream_client = match UpstreamClient::new() {
@@ -953,16 +1120,31 @@ async fn try_build_agent_runtime(
 ///    scattered across `run()` with no single map of "which errors
 ///    produce which code." The `StartError` variants are the map.
 ///
-/// Exit code semantics (preserved from the ad-hoc pattern this
-/// replaces):
+/// Exit code semantics (Story 7.6a round-1 review patch — split the
+/// previous lump-into-3 mapping so CI scripts and automation can
+/// distinguish the three remediation classes):
+///
 /// - **Exit 2** — configuration or bootstrap failure. Recoverable
 ///   by fixing the config file, unlocking the keychain, or running
 ///   `agentsso setup`. Matches the prior `exit(2)` sites: config
 ///   load, policies dir, policy compile, master key bootstrap,
 ///   HKDF expansion.
-/// - **Exit 3** — runtime resource conflict. Another process holds
-///   the PID file, or the bind address is already in use. Matches
-///   the prior `exit(3)` sites: PID file + TCP listener.
+/// - **Exit 3** — another process holds a coordination resource.
+///   Operator remediation: wait for the holder to finish, or
+///   identify and stop it. Variants:
+///   - `DaemonAlreadyRunning` (PID file held by a live daemon),
+///   - `PidFileAcquire` (PID file held but the holder is unclear),
+///   - `DaemonStartVaultBusy` (vault advisory lock held — typically
+///     `agentsso rotate-key` mid-flight in another terminal).
+/// - **Exit 4** — filesystem-level failure on a coordination
+///   resource. Operator remediation: fix permissions, fix the
+///   filesystem, investigate. Variants:
+///   - `VaultLockIo` (lock-file open/lock-syscall failed for a
+///     non-busy reason: permission denied, ENOENT, disk full).
+/// - **Exit 5** — bind failure. Operator remediation: fix the port
+///   conflict (free the port, change the bind address). Variants:
+///   - `BindFailed` (TCP listener could not bind the configured
+///     address).
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StartError {
     /// Daemon configuration could not be loaded. Error message already
@@ -1016,6 +1198,33 @@ pub(crate) enum StartError {
     /// running" (filesystem permissions, IO error).
     #[error("failed to acquire PID file: {0}")]
     PidFileAcquire(String),
+
+    /// Story 7.6a AC #3: vault-level advisory lock is held by another
+    /// process — typically `agentsso rotate-key` mid-flight, an
+    /// `agentsso setup` in progress, or a stale daemon that survived
+    /// PID-file cleanup but not vault-lock release. The PID file says
+    /// nobody holds it, but the vault lock says otherwise.
+    #[error("vault is busy (held by pid={holder_pid:?} command={holder_command:?})")]
+    DaemonStartVaultBusy {
+        /// The lock-holder's PID, if the lock-file metadata read
+        /// succeeded.
+        holder_pid: Option<u32>,
+        /// The lock-holder's argv[0], if the lock-file metadata read
+        /// succeeded.
+        holder_command: Option<String>,
+    },
+
+    /// Story 7.6a AC #3: vault lock could not be acquired due to a
+    /// non-busy I/O failure (permission denied, lock file is a
+    /// symlink, disk full while creating the file, …). Distinct from
+    /// `DaemonStartVaultBusy` because the operator's remediation is
+    /// different: a busy lock means "wait for the other process to
+    /// finish"; an I/O failure means "fix the filesystem".
+    #[error("vault lock acquisition failed: {source}")]
+    VaultLockIo {
+        #[source]
+        source: std::io::Error,
+    },
 
     /// TCP listener could not bind the configured address.
     #[error("failed to bind TCP listener on {addr}: {source}")]
@@ -1081,10 +1290,17 @@ impl StartError {
             | Self::TelemetryInit { .. }
             | Self::PluginRuntimeInit { .. }
             | Self::PluginLoadFailed { .. } => 2,
-            // Exit 3 — runtime resource conflict.
+            // Exit 3 — another process holds a coordination resource.
             Self::DaemonAlreadyRunning { .. }
             | Self::PidFileAcquire(_)
-            | Self::BindFailed { .. } => 3,
+            | Self::DaemonStartVaultBusy { .. } => 3,
+            // Exit 4 — filesystem-level failure on a coordination
+            // resource (Story 7.6a round-1 review patch).
+            Self::VaultLockIo { .. } => 4,
+            // Exit 5 — TCP bind failure (Story 7.6a round-1 review
+            // patch — distinct remediation from "another process
+            // holds it" and from "filesystem failure").
+            Self::BindFailed { .. } => 5,
         }
     }
 
@@ -1152,6 +1368,31 @@ impl StartError {
                 format!("error: daemon is already running (pid {pid})\n")
             }
             Self::PidFileAcquire(msg) => format!("error: failed to acquire PID file: {msg}\n"),
+            Self::DaemonStartVaultBusy { holder_pid, holder_command } => {
+                let holder_text = match (holder_pid, holder_command.as_deref()) {
+                    (Some(pid), Some(cmd)) => format!("pid {pid} ({cmd})"),
+                    (Some(pid), None) => format!("pid {pid}"),
+                    (None, Some(cmd)) => cmd.to_owned(),
+                    (None, None) => "another process".to_owned(),
+                };
+                format!(
+                    "error: cannot start agentsso — the vault lock at \
+                     ~/.agentsso/vault/.lock is held by {holder_text}.\n\
+                     \n\
+                     remediation:\n\
+                     - if you are running `agentsso rotate-key`, `agentsso setup`,\n\
+                       or `agentsso update --apply`, wait for it to finish.\n\
+                     - if no other agentsso process is actually running, the\n\
+                       lock file may be stale; remove ~/.agentsso/vault/.lock\n\
+                       and retry.\n"
+                )
+            }
+            Self::VaultLockIo { source } => format!(
+                "error: failed to acquire the vault advisory lock at \
+                 ~/.agentsso/vault/.lock: {source}\n\
+                 \n\
+                 check filesystem permissions on ~/.agentsso/vault/.\n"
+            ),
             Self::BindFailed { addr, source } => {
                 format!("error: failed to bind TCP listener on {addr}: {source}\n")
             }
@@ -1477,12 +1718,84 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     let log_cfg = config.log.clone().validated();
     let log_retention_was_clamped = log_cfg.retention_days != log_cfg_raw_retention;
 
-    // 3. Initialize tracing subscriber (stdout + daily-rotating file
+    // 3. Acquire PID file.
+    //
+    // **Story 7.4 P19/P23 + 7.6a review:** PidFile + VaultLock
+    // refusals run BEFORE `init_tracing` so a refused-to-start
+    // attempt does NOT create `~/.agentsso/logs/`, rotate operator
+    // logs, or churn the tracing subscriber. The structured banner
+    // is rendered from `main()` regardless; the in-handler
+    // `tracing::error!` calls below fall back to the default
+    // subscriber (which routes to stderr) without instantiating the
+    // file appender.
+    //
+    // Story 1.15 review: `pid_file` is a local binding — any error
+    // path after this point that returns via `?` runs `PidFile::drop`
+    // naturally, cleaning up `~/.agentsso/pid`. Bubbling errors to
+    // `main()` replaces the scattered `drop(pid_file); exit(N);`
+    // pattern with a single stack-unwind that respects every `Drop`.
+    let pid_file = match PidFile::acquire(&config.paths.home) {
+        Ok(p) => p,
+        Err(crate::lifecycle::pid::PidFileError::DaemonAlreadyRunning { pid }) => {
+            tracing::error!(pid, "daemon is already running");
+            return Err(StartError::DaemonAlreadyRunning { pid });
+        }
+        Err(e) => {
+            tracing::error!("failed to acquire PID file: {e}");
+            return Err(StartError::PidFileAcquire(e.to_string()));
+        }
+    };
+
+    // 3a. Acquire the vault-level advisory lock (Story 7.6a AC #3).
+    //
+    // Precedence: PidFile guards "the daemon is running"; VaultLock
+    // guards "vault writes are exclusive across all processes". They
+    // serve different purposes and the daemon needs both. The lock is
+    // bound to the local `_vault_lock` guard; any `?` after this point
+    // unwinds through Drop and releases the kernel-side lock cleanly,
+    // mirroring the PidFile discipline.
+    //
+    // We use `try_acquire` (not blocking) so a stuck holder produces
+    // a structured error instead of stranding `agentsso start` on the
+    // command line. The most common cause of `Busy` is `agentsso
+    // rotate-key` mid-flight from a different terminal — operator
+    // remediation lives in the rendered banner.
+    let _vault_lock = match permitlayer_core::VaultLock::try_acquire(&config.paths.home) {
+        Ok(g) => g,
+        Err(permitlayer_core::VaultLockError::Busy { holder_pid, holder_command }) => {
+            tracing::error!(
+                holder_pid = ?holder_pid,
+                holder_command = ?holder_command,
+                "daemon refusing to start: vault lock is busy"
+            );
+            return Err(StartError::DaemonStartVaultBusy { holder_pid, holder_command });
+        }
+        Err(permitlayer_core::VaultLockError::Io(source)) => {
+            tracing::error!(error = %source, "vault lock acquisition failed");
+            return Err(StartError::VaultLockIo { source });
+        }
+        // `VaultLockError` is `#[non_exhaustive]`. Future variants land
+        // here; until they exist, treat any unknown error as an I/O
+        // failure with a synthesized message so the operator still
+        // gets exit-code 3 and a banner.
+        Err(other) => {
+            let synth = std::io::Error::other(format!("unrecognized vault lock error: {other}"));
+            tracing::error!(error = %other, "vault lock acquisition failed (unknown variant)");
+            return Err(StartError::VaultLockIo { source: synth });
+        }
+    };
+
+    // 4. Initialize tracing subscriber (stdout + daily-rotating file
     // appender). The returned `WorkerGuard`s MUST live until process
     // exit — dropping them flushes buffered log lines through the
     // non-blocking appender and shuts the worker thread down. Binding
     // as `_guards` keeps the vector alive across the serve loop; the
     // final drop runs during stack unwind at `main()` return.
+    //
+    // Runs AFTER PidFile + VaultLock acquisition (Story 7.4 P19/P23 +
+    // 7.6a review patch): a refused-to-start attempt must not create
+    // `logs/`. The `pid_file` and `_vault_lock` bindings are local —
+    // their `Drop`s run cleanly on the early-return paths above.
     let log_dir = log_cfg.path.clone().unwrap_or_else(|| config.paths.home.join("logs"));
     let _guards =
         telemetry::init_tracing(&config.log.level, Some(&log_dir), log_cfg.retention_days)
@@ -1501,7 +1814,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         );
     }
 
-    // 3a. Sweep rotated operational log files older than retention.
+    // 4a. Sweep rotated operational log files older than retention.
     // Non-fatal: a sweep failure must never block boot (observability
     // degradation, not a correctness issue).
     match telemetry::sweep_rotated_logs(&log_dir, log_cfg.retention_days) {
@@ -1515,25 +1828,6 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "log retention sweep failed (non-fatal)"),
     }
-
-    // 4. Acquire PID file.
-    //
-    // Story 1.15 review: `pid_file` is a local binding — any error
-    // path after this point that returns via `?` runs `PidFile::drop`
-    // naturally, cleaning up `~/.agentsso/pid`. Bubbling errors to
-    // `main()` replaces the scattered `drop(pid_file); exit(N);`
-    // pattern with a single stack-unwind that respects every `Drop`.
-    let pid_file = match PidFile::acquire(&config.paths.home) {
-        Ok(p) => p,
-        Err(crate::lifecycle::pid::PidFileError::DaemonAlreadyRunning { pid }) => {
-            tracing::error!(pid, "daemon is already running");
-            return Err(StartError::DaemonAlreadyRunning { pid });
-        }
-        Err(e) => {
-            tracing::error!("failed to acquire PID file: {e}");
-            return Err(StartError::PidFileAcquire(e.to_string()));
-        }
-    };
 
     // 5. Bind TCP listener.
     let bind_addr = config.http.bind_addr;
@@ -1641,6 +1935,17 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         tracing::error!(error = %e, "master key bootstrap failed — refusing to boot");
     })?;
 
+    // Story 7.6a AC #12: walk the vault and compute the active
+    // `key_id` as `max(envelope.key_id over all .sealed files)`,
+    // defaulting to `0` for an empty vault. The proxy service's
+    // `Vault` is constructed with this `key_id`; new seals (refresh
+    // rotation, future setup-driven writes) stamp it on the
+    // resulting envelope. Story 7.6b's rotate-key-v2 increments per
+    // rotation; for 7.6a the result is always `0` because there has
+    // been no rotation event yet.
+    let active_key_id = compute_active_key_id(&config.paths.home.join("vault"));
+    tracing::info!(active_key_id, "vault bootstrap: discovered active key_id");
+
     // 7b'. Build the agent identity store + registry + HMAC lookup
     // subkey (Story 4.4). Always gets a real master-key-derived
     // subkey now that Story 1.15 has provisioned the master key
@@ -1697,9 +2002,14 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // determines whether the stub branch will be wired into the axum
     // router below. All downstream consumers of `proxy_service`
     // (AppState construction, router wiring) are unchanged.
-    let proxy_service =
-        try_build_proxy_service(&config, scrub_engine.as_ref(), audit_store.as_ref(), &master_key)
-            .await;
+    let proxy_service = try_build_proxy_service(
+        &config,
+        scrub_engine.as_ref(),
+        audit_store.as_ref(),
+        &master_key,
+        active_key_id,
+    )
+    .await;
     let proxy_stub_branch_active =
         Arc::new(std::sync::atomic::AtomicBool::new(proxy_service.is_none()));
     let vault_dir_for_reload = config.paths.home.join("vault");
@@ -2334,6 +2644,92 @@ mod tests {
     use permitlayer_keystore::{DeleteOutcome, KeyStore, KeyStoreError, MASTER_KEY_LEN};
     use std::sync::Mutex;
     use zeroize::Zeroizing;
+
+    // ── Story 7.6a AC #12: compute_active_key_id tests ───────────────
+
+    use permitlayer_core::store::fs::credential_fs::encode_envelope;
+    use permitlayer_credential::{KeyId, SealedCredential};
+
+    fn fake_sealed_v2(key_id: u8) -> Vec<u8> {
+        let sealed = SealedCredential::from_trusted_bytes(
+            vec![0xAB; 48],
+            [0x11u8; 12],
+            b"permitlayer-vault-v1:gmail".to_vec(),
+            permitlayer_credential::SEALED_CREDENTIAL_VERSION,
+            KeyId::new(key_id),
+        );
+        encode_envelope(&sealed)
+    }
+
+    #[test]
+    fn compute_active_key_id_returns_zero_when_vault_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        // Directory does NOT exist — this is the fresh-install case.
+        assert_eq!(compute_active_key_id(&vault_dir), 0);
+    }
+
+    #[test]
+    fn compute_active_key_id_returns_zero_for_empty_vault() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        assert_eq!(compute_active_key_id(&vault_dir), 0);
+    }
+
+    #[test]
+    fn compute_active_key_id_returns_max_across_envelopes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        std::fs::write(vault_dir.join("a.sealed"), fake_sealed_v2(0)).unwrap();
+        std::fs::write(vault_dir.join("b.sealed"), fake_sealed_v2(2)).unwrap();
+        std::fs::write(vault_dir.join("c.sealed"), fake_sealed_v2(1)).unwrap();
+        assert_eq!(compute_active_key_id(&vault_dir), 2);
+    }
+
+    #[test]
+    fn compute_active_key_id_treats_v1_as_zero() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        // Write a v1 envelope manually (23-byte header, no key_id).
+        let mut v1: Vec<u8> = Vec::new();
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        v1.push(12);
+        v1.extend_from_slice(&[0x22u8; 12]);
+        v1.extend_from_slice(&0u32.to_le_bytes()); // aad_len = 0
+        v1.extend_from_slice(&0u32.to_le_bytes()); // ct_len = 0
+        std::fs::write(vault_dir.join("a.sealed"), v1).unwrap();
+        // Mixed v1 + v2(key_id=5).
+        std::fs::write(vault_dir.join("b.sealed"), fake_sealed_v2(5)).unwrap();
+        assert_eq!(compute_active_key_id(&vault_dir), 5);
+    }
+
+    #[test]
+    fn compute_active_key_id_skips_dotfiles_and_tempfiles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        // Only the non-noisy file should count toward max.
+        std::fs::write(vault_dir.join("a.sealed"), fake_sealed_v2(3)).unwrap();
+        std::fs::write(vault_dir.join(".lock"), b"junk").unwrap();
+        std::fs::write(vault_dir.join("a.sealed.tmp.999.0.aaaa"), fake_sealed_v2(99)).unwrap();
+        std::fs::write(vault_dir.join("a.sealed.new"), fake_sealed_v2(99)).unwrap();
+        assert_eq!(compute_active_key_id(&vault_dir), 3);
+    }
+
+    #[test]
+    fn compute_active_key_id_skips_truncated_envelopes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        std::fs::write(vault_dir.join("good.sealed"), fake_sealed_v2(7)).unwrap();
+        // 3-byte file: < 4 bytes, the read_exact for header fails,
+        // the entry is skipped.
+        std::fs::write(vault_dir.join("bad.sealed"), [0x02, 0x00, 0x0c]).unwrap();
+        assert_eq!(compute_active_key_id(&vault_dir), 7);
+    }
 
     // Story 8.7 AC #3: clamp helper unit test. Pure function —
     // no daemon spin-up, no fixtures.

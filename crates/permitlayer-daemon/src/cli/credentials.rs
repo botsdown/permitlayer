@@ -542,7 +542,13 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
             std::process::exit(cli_exit::BUG);
         }
     };
-    let vault = Arc::new(Vault::new(master_key));
+    // Story 7.6a: read the vault's active key_id rather than
+    // hardcoding 0. In single-key worlds this is still 0; once 7.6b
+    // ships rotation, CLI-side seal sites must stamp the same key_id
+    // the daemon writes with, otherwise re-sealed credentials would
+    // silently downgrade rotation tracking.
+    let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
+    let vault = Arc::new(Vault::new(master_key, active_key_id));
 
     // Flush any buffered stderr before proceeding so the warning is
     // visible even if the refresh itself panics (it won't, but

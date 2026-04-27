@@ -1087,7 +1087,7 @@ mod tests {
         async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
             match self.services.get(service) {
                 Some(token_bytes) => {
-                    let vault = Vault::new(Zeroizing::new(self.master_key));
+                    let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                     let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
                     match vault.seal(service, &token) {
                         Ok(sealed) => Ok(Some(sealed)),
@@ -1127,7 +1127,7 @@ mod tests {
     const TEST_MASTER_KEY: [u8; 32] = [0x42; 32];
 
     fn test_vault() -> Vault {
-        Vault::new(Zeroizing::new(TEST_MASTER_KEY))
+        Vault::new(Zeroizing::new(TEST_MASTER_KEY), 0)
     }
 
     fn test_token_issuer() -> ScopedTokenIssuer {
@@ -1253,7 +1253,7 @@ mod tests {
         let mut cred_store = MockCredentialStore::new([0x42; 32]);
         cred_store.add_service("gmail", b"fake-token");
 
-        let unseal_vault = Arc::new(Vault::new(Zeroizing::new([0x99; 32])));
+        let unseal_vault = Arc::new(Vault::new(Zeroizing::new([0x99; 32]), 0));
 
         let credential_store: Arc<dyn CredentialStore> = Arc::new(cred_store);
         let token_issuer = Arc::new(test_token_issuer());

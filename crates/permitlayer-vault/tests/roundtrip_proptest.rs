@@ -34,7 +34,7 @@ proptest! {
         plaintext in prop::collection::vec(any::<u8>(), 0..16384),
         service in "[a-z][a-z0-9-]{1,30}[a-z0-9]",
     ) {
-        let vault = Vault::new(Zeroizing::new(TEST_MASTER_KEY));
+        let vault = Vault::new(Zeroizing::new(TEST_MASTER_KEY), 0);
         let token = OAuthToken::from_trusted_bytes(plaintext.clone());
         let sealed = match vault.seal(&service, &token) {
             Ok(s) => s,

@@ -115,6 +115,12 @@ pub enum StoreError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+    /// Vault-level advisory lock could not be acquired (Story 7.6a).
+    /// Returned by `CredentialFsStore::put` when the lock is busy or
+    /// the lock-file I/O failed. Wraps the underlying
+    /// `permitlayer_core::vault::lock::VaultLockError`.
+    #[error("vault lock acquisition failed")]
+    VaultLockFailed(#[source] crate::vault::lock::VaultLockError),
 }
 
 /// Structural parse failures for the on-disk sealed-credential envelope.

@@ -37,7 +37,7 @@ fn test_scrub_engine() -> Arc<ScrubEngine> {
 }
 
 fn test_vault() -> Vault {
-    Vault::new(Zeroizing::new(TEST_MASTER_KEY))
+    Vault::new(Zeroizing::new(TEST_MASTER_KEY), 0)
 }
 
 fn test_token_issuer() -> ScopedTokenIssuer {
@@ -69,7 +69,7 @@ impl CredentialStore for MockCredentialStore {
     async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
         match self.services.get(service) {
             Some(token_bytes) => {
-                let vault = Vault::new(Zeroizing::new(self.master_key));
+                let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                 let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
                 match vault.seal(service, &token) {
                     Ok(sealed) => Ok(Some(sealed)),

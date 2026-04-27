@@ -26,4 +26,4 @@ pub mod sealed;
 pub use agent_bearer::AgentBearerToken;
 pub use error::CryptoError;
 pub use oauth_token::{OAuthRefreshToken, OAuthToken};
-pub use sealed::{MAX_PLAINTEXT_LEN, SEALED_CREDENTIAL_VERSION, SealedCredential};
+pub use sealed::{KeyId, MAX_PLAINTEXT_LEN, SEALED_CREDENTIAL_VERSION, SealedCredential};

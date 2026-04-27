@@ -46,8 +46,21 @@ pub(crate) async fn run_rotation(
     let new_key = MasterKey::generate();
     let old_keyid = MasterKey::fingerprint_bytes(&old_key_bytes);
     let new_keyid = new_key.fingerprint();
-    let old_vault = Vault::new(Zeroizing::new(*old_key_bytes));
-    let new_vault = Vault::new(Zeroizing::new(*new_key.as_bytes()));
+    // Story 7.6a (review patch): this rotate-key surface is dormant
+    // per Task 9 — the dispatcher refuses invocation until 7.6b
+    // lands. Even so, we wire the call sites to `compute_active_key_id`
+    // + (active + 1) so that flipping the dormancy fence in 7.6b
+    // does NOT silently downgrade rotation tracking to `key_id = 0`.
+    // The original review found this as a single-line-removal
+    // footgun: `Vault::new(.., 0)` everywhere meant a future
+    // de-dormant-ification would corrupt the monotonic key_id
+    // invariant on first run. Stamping the correct values here means
+    // the worst case in 7.6b is "we overwrite this code path
+    // entirely" rather than "we ship a broken rotation."
+    let active_key_id = super::super::start::compute_active_key_id(&vault_dir);
+    let new_key_id = active_key_id.saturating_add(1);
+    let old_vault = Vault::new(Zeroizing::new(*old_key_bytes), active_key_id);
+    let new_vault = Vault::new(Zeroizing::new(*new_key.as_bytes()), new_key_id);
 
     tracing::info!(
         old_keyid = %old_keyid,
@@ -493,7 +506,7 @@ mod tests {
         let vault_dir = tmp.path().join("vault");
         std::fs::create_dir_all(&vault_dir).unwrap();
 
-        let vault = Vault::new(Zeroizing::new([0xAB; 32]));
+        let vault = Vault::new(Zeroizing::new([0xAB; 32]), 0);
         let token = OAuthToken::from_trusted_bytes(b"hello-rotation".to_vec());
         let sealed = vault.seal("gmail", &token).unwrap();
 
@@ -503,8 +516,9 @@ mod tests {
         // File exists with the encoded envelope; can be decoded back.
         assert!(target.exists());
         let bytes = std::fs::read(&target).unwrap();
-        // Envelope starts with version (u16 LE = 0x0001).
-        assert_eq!(&bytes[..2], &[1u8, 0u8]);
+        // Story 7.6a bumped envelope schema 1 → 2; encode_envelope
+        // always writes v2. The version u16 little-endian is 0x0002.
+        assert_eq!(&bytes[..2], &[2u8, 0u8]);
 
         // Tempfile cleaned up.
         let leftovers: Vec<_> = std::fs::read_dir(&vault_dir)

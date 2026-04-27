@@ -50,6 +50,22 @@ use crate::seal::Vault;
 /// and AAD binding. Passing a different service name will fail closed
 /// at unseal time with `VaultError::UnsealFailed` (AAD mismatch).
 ///
+/// **Story 7.6a:** the resulting envelope's `key_id` comes from
+/// `new.key_id()` (the value the caller passed at `Vault::new`
+/// construction). Resealing the same envelope under the same `new`
+/// vault is idempotent at the schema level — the bytes change (fresh
+/// nonce + ciphertext) but the `key_id` does not.
+///
+/// **Caller invariant for rotation flows:** `new.key_id() > old.key_id()`.
+/// The whole point of bumping `key_id` is to provide a monotonic
+/// fingerprint of which key sealed which envelope; reusing or
+/// regressing the value would defeat `compute_active_key_id`'s
+/// `max(key_id)` boot-time scan. A `debug_assertions` check below
+/// catches obvious mistakes (same value, regression) in tests; in
+/// release builds the assertion compiles out and the ordering
+/// invariant becomes a documentation contract that callers
+/// (Story 7.6b's rotate-key v2) MUST honor.
+///
 /// # Plaintext exposure
 ///
 /// The plaintext lives as a `Zeroizing<Vec<u8>>` for the duration of
@@ -61,6 +77,17 @@ pub fn reseal(
     sealed: &SealedCredential,
     service: &str,
 ) -> Result<SealedCredential, VaultRotationError> {
+    // Story 7.6a (review patch): debug-only invariant. In release
+    // builds this compiles out; in tests it catches callers that
+    // build `new` with a non-monotonic `key_id` (which would
+    // silently corrupt the daemon's max(key_id) boot scan).
+    debug_assert!(
+        new.key_id() > old.key_id(),
+        "reseal: new.key_id() ({}) must exceed old.key_id() ({}); the monotonic invariant is what \
+         lets compute_active_key_id detect rotation completion at boot",
+        new.key_id(),
+        old.key_id()
+    );
     // Unseal with the OLD vault — this produces plaintext bytes.
     let plaintext_vec = old.unseal_bytes(service, sealed).map_err(|source| {
         VaultRotationError::UnsealOldFailed { service: service.to_owned(), source }
@@ -68,9 +95,10 @@ pub fn reseal(
     // Wrap in Zeroizing so the buffer is wiped when this scope exits,
     // even if the seal step below panics.
     let plaintext: Zeroizing<Vec<u8>> = Zeroizing::new(plaintext_vec);
-    // Seal under the NEW vault, returning the new envelope. The
-    // plaintext buffer drops + zeroes when this expression's scope
-    // ends regardless of success or failure.
+    // Seal under the NEW vault — `seal_bytes` stamps `new.key_id()` on
+    // the resulting envelope. The plaintext buffer drops + zeroes
+    // when this expression's scope ends regardless of success or
+    // failure.
     new.seal_bytes(service, &plaintext)
         .map_err(|source| VaultRotationError::SealNewFailed { service: service.to_owned(), source })
 }
@@ -120,14 +148,17 @@ mod tests {
     use crate::Vault;
     use crate::master_key::MasterKey;
 
-    fn vault_for(bytes: [u8; 32]) -> Vault {
-        Vault::new(Zeroizing::new(bytes))
+    /// Build a vault with a specific `key_id`. Rotation tests must
+    /// pass `new_kid > old_kid` to honor the monotonic invariant that
+    /// `reseal`'s debug-assert checks.
+    fn vault_with(bytes: [u8; 32], key_id: u8) -> Vault {
+        Vault::new(Zeroizing::new(bytes), key_id)
     }
 
     #[test]
     fn reseal_round_trips_plaintext() {
-        let old = vault_for([0x11; 32]);
-        let new = vault_for([0x22; 32]);
+        let old = vault_with([0x11; 32], 0);
+        let new = vault_with([0x22; 32], 1);
         let plaintext = b"ya29.fake-access-token-bytes";
         let token = OAuthToken::from_trusted_bytes(plaintext.to_vec());
         let sealed_old = old.seal("gmail", &token).unwrap();
@@ -141,8 +172,8 @@ mod tests {
 
     #[test]
     fn resealed_envelope_does_not_unseal_under_old_key() {
-        let old = vault_for([0x33; 32]);
-        let new = vault_for([0x44; 32]);
+        let old = vault_with([0x33; 32], 0);
+        let new = vault_with([0x44; 32], 1);
         let token = OAuthToken::from_trusted_bytes(b"secret".to_vec());
         let sealed_old = old.seal("calendar", &token).unwrap();
 
@@ -155,8 +186,8 @@ mod tests {
 
     #[test]
     fn reseal_fails_on_service_mismatch() {
-        let old = vault_for([0x55; 32]);
-        let new = vault_for([0x66; 32]);
+        let old = vault_with([0x55; 32], 0);
+        let new = vault_with([0x66; 32], 1);
         let token = OAuthToken::from_trusted_bytes(b"x".to_vec());
         let sealed_old = old.seal("gmail", &token).unwrap();
 
@@ -174,9 +205,9 @@ mod tests {
 
     #[test]
     fn reseal_fails_on_wrong_old_key() {
-        let actual_old = vault_for([0x77; 32]);
-        let claimed_old = vault_for([0x88; 32]);
-        let new = vault_for([0x99; 32]);
+        let actual_old = vault_with([0x77; 32], 0);
+        let claimed_old = vault_with([0x88; 32], 0);
+        let new = vault_with([0x99; 32], 1);
         let token = OAuthToken::from_trusted_bytes(b"y".to_vec());
         let sealed = actual_old.seal("drive", &token).unwrap();
 
@@ -189,6 +220,21 @@ mod tests {
         }
     }
 
+    /// Story 7.6a (review patch): the monotonic-key_id debug-assert
+    /// catches non-monotonic callers in tests. Build a deliberately
+    /// non-monotonic pair and assert the panic. Skipped in release
+    /// builds (debug_assertions off → assertion compiles out).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "monotonic invariant")]
+    fn reseal_debug_asserts_monotonic_key_id() {
+        let old = vault_with([0xCC; 32], 5);
+        let new = vault_with([0xDD; 32], 5); // SAME key_id — must panic.
+        let token = OAuthToken::from_trusted_bytes(b"z".to_vec());
+        let sealed = old.seal("svc", &token).unwrap();
+        let _ = reseal(&old, &new, &sealed, "svc");
+    }
+
     #[test]
     fn reseal_with_master_key_helper_round_trips_refresh_token() {
         // Exercise the full MasterKey + reseal workflow the way the
@@ -198,8 +244,8 @@ mod tests {
 
         let old_key = MasterKey::from_bytes([0xAA; 32]);
         let new_key = MasterKey::from_bytes([0xBB; 32]);
-        let old_vault = Vault::new(Zeroizing::new(*old_key.as_bytes()));
-        let new_vault = Vault::new(Zeroizing::new(*new_key.as_bytes()));
+        let old_vault = Vault::new(Zeroizing::new(*old_key.as_bytes()), 0);
+        let new_vault = Vault::new(Zeroizing::new(*new_key.as_bytes()), 1);
 
         let refresh = OAuthRefreshToken::from_trusted_bytes(b"refresh-token-bytes".to_vec());
         let sealed = old_vault.seal_refresh("gmail-refresh", &refresh).unwrap();

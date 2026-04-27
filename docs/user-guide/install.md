@@ -576,6 +576,23 @@ key are never touched.
 - The autostart artifact at login (artifact path is auto-corrected
   if the binary moved)
 
+### v0.4 vault-format migration
+
+v0.4 introduces a vault-format upgrade. Running `agentsso update
+--apply` on a v0.3 install will atomically migrate the vault to
+the new format and create a backup at
+`~/.agentsso/vault.pre-v2-backup/` that is **removed on success**.
+If the migration fails, the backup is preserved and the update rolls
+back; you can recover by `mv ~/.agentsso/vault.pre-v2-backup
+~/.agentsso/vault` after investigating the failure.
+
+The new format adds a per-envelope `key_id` byte that future
+rotate-key versions use to track which master key sealed each
+credential. v0.3 binaries cannot read v0.4 envelopes — this is a
+forward-only migration. Reversibility is via binary rollback +
+manual backup restore (the same posture as the broader update
+framework's "binary rollback, not data rollback" stance).
+
 ### Rollback on failure
 
 If anything between staging and post-restart-verification fails —

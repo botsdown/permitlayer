@@ -36,8 +36,8 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
 use permitlayer_credential::{
-    CryptoError, MAX_PLAINTEXT_LEN, OAuthRefreshToken, OAuthToken, SEALED_CREDENTIAL_VERSION,
-    SealedCredential,
+    CryptoError, KeyId, MAX_PLAINTEXT_LEN, OAuthRefreshToken, OAuthToken,
+    SEALED_CREDENTIAL_VERSION, SealedCredential,
 };
 use permitlayer_keystore::MASTER_KEY_LEN;
 use rand::RngCore;
@@ -79,14 +79,32 @@ const GCM_TAG_LEN: usize = 16;
 /// at the cryptographic layer.
 pub struct Vault {
     master_key: Zeroizing<[u8; MASTER_KEY_LEN]>,
+    /// Story 7.6a: which master key this vault represents. Stamped on
+    /// every `SealedCredential` produced by `seal` / `seal_refresh`.
+    /// `0` is the bootstrap (single-key, never-rotated) sentinel.
+    key_id: u8,
 }
 
 impl Vault {
     /// Construct a vault from a master key. Ownership of the key moves
     /// into the vault; the caller's `Zeroizing` buffer is consumed.
+    ///
+    /// **Story 7.6a:** the `key_id` parameter records which master
+    /// key this vault represents — it gets stamped on every envelope
+    /// produced by `seal` / `seal_refresh`. Pass `0` in single-key
+    /// worlds. Future rotation (Story 7.6b) increments per rotation.
     #[must_use = "a Vault that is immediately dropped wastes the master key derivation"]
-    pub fn new(master_key: Zeroizing<[u8; MASTER_KEY_LEN]>) -> Self {
-        Self { master_key }
+    pub fn new(master_key: Zeroizing<[u8; MASTER_KEY_LEN]>, key_id: u8) -> Self {
+        Self { master_key, key_id }
+    }
+
+    /// The `key_id` this vault stamps on sealed envelopes. Available
+    /// to callers (notably `permitlayer-vault::rotation::reseal`) that
+    /// need to compute the post-rotation `key_id` without
+    /// re-deriving it from elsewhere.
+    #[must_use]
+    pub fn key_id(&self) -> u8 {
+        self.key_id
     }
 
     /// Seal an OAuth token for a service. Produces a `SealedCredential`
@@ -194,7 +212,13 @@ impl Vault {
                 source: CryptoError::AeadEncryptFailed,
             })?;
 
-        Ok(SealedCredential::from_trusted_bytes(ciphertext, nonce, aad, SEALED_CREDENTIAL_VERSION))
+        Ok(SealedCredential::from_trusted_bytes(
+            ciphertext,
+            nonce,
+            aad,
+            SEALED_CREDENTIAL_VERSION,
+            KeyId::new(self.key_id),
+        ))
     }
 
     /// Shared unseal implementation returning raw bytes. Both `unseal()` and
@@ -285,7 +309,8 @@ mod tests {
     const TEST_PLAINTEXT: &[u8] = b"test_plaintext_oauth_token_bytes_v1_sentinel";
 
     fn test_vault() -> Vault {
-        Vault::new(Zeroizing::new(TEST_MASTER_KEY))
+        // Story 7.6a: `key_id = 0` for the single-key test world.
+        Vault::new(Zeroizing::new(TEST_MASTER_KEY), 0)
     }
 
     // `OAuthToken` and `SealedCredential` are deliberately non-`Debug`
@@ -412,6 +437,7 @@ mod tests {
                 *sealed.nonce(),
                 sealed.aad().to_vec(),
                 sealed.version(),
+                KeyId::new(sealed.key_id()),
             );
             let err = unseal_err(&vault, "gmail", &mutated_sealed);
             assert!(matches!(
@@ -434,6 +460,7 @@ mod tests {
                 mutated_nonce,
                 sealed.aad().to_vec(),
                 sealed.version(),
+                KeyId::new(sealed.key_id()),
             );
             let err = unseal_err(&vault, "gmail", &mutated);
             assert!(matches!(
@@ -457,6 +484,7 @@ mod tests {
                 *sealed.nonce(),
                 mutated_aad,
                 sealed.version(),
+                KeyId::new(sealed.key_id()),
             );
             let err = unseal_err(&vault, "gmail", &mutated);
             assert!(matches!(
@@ -515,6 +543,7 @@ mod tests {
             *sealed.nonce(),
             sealed.aad().to_vec(),
             SEALED_CREDENTIAL_VERSION + 1,
+            KeyId::new(sealed.key_id()),
         );
         let err = unseal_err(&vault, "gmail", &forged);
         assert!(matches!(err, VaultError::UnsupportedVersion { got, expected }
@@ -580,6 +609,37 @@ mod tests {
         let sealed = must_seal(&vault, &max_service, &token);
         let unsealed = must_unseal(&vault, &max_service, &sealed);
         assert_eq!(unsealed.reveal(), TEST_PLAINTEXT);
+    }
+
+    /// Story 7.6a AC #8: `Vault::new(key, key_id)` produces envelopes
+    /// stamped with the supplied `key_id`. This is the load-bearing
+    /// invariant that makes the vault self-describing — every envelope
+    /// records which master key sealed it.
+    #[test]
+    fn vault_seals_with_constructed_key_id() {
+        let vault = Vault::new(Zeroizing::new(TEST_MASTER_KEY), 7);
+        let token = OAuthToken::from_trusted_bytes(TEST_PLAINTEXT.to_vec());
+        let sealed = must_seal(&vault, "gmail", &token);
+        assert_eq!(sealed.key_id(), 7);
+    }
+
+    /// Story 7.6a AC #8: `seal_refresh` stamps `key_id` the same way
+    /// `seal` does (both delegate to `seal_bytes`).
+    #[test]
+    fn vault_seals_refresh_with_constructed_key_id() {
+        use permitlayer_credential::OAuthRefreshToken;
+        let vault = Vault::new(Zeroizing::new(TEST_MASTER_KEY), 13);
+        let refresh = OAuthRefreshToken::from_trusted_bytes(b"refresh-token".to_vec());
+        let sealed = vault.seal_refresh("gmail-refresh", &refresh).unwrap();
+        assert_eq!(sealed.key_id(), 13);
+    }
+
+    /// Story 7.6a AC #8: `Vault::key_id` exposes the stamped value to
+    /// downstream callers (notably `rotation::reseal`).
+    #[test]
+    fn vault_exposes_its_key_id() {
+        let vault = Vault::new(Zeroizing::new(TEST_MASTER_KEY), 99);
+        assert_eq!(vault.key_id(), 99);
     }
 
     fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {

@@ -4,7 +4,7 @@
 //! violation).
 
 use permitlayer_core::store::CredentialStore;
-use permitlayer_credential::{SEALED_CREDENTIAL_VERSION, SealedCredential};
+use permitlayer_credential::{KeyId, SEALED_CREDENTIAL_VERSION, SealedCredential};
 
 #[allow(dead_code)]
 async fn store_accepts_sealed<S: CredentialStore>(store: &S) {
@@ -13,6 +13,7 @@ async fn store_accepts_sealed<S: CredentialStore>(store: &S) {
         [0u8; 12],
         vec![0u8; 21],
         SEALED_CREDENTIAL_VERSION,
+        KeyId::ZERO,
     );
     let _ = store.put("gmail", sealed).await;
     let _ = store.get("gmail").await;

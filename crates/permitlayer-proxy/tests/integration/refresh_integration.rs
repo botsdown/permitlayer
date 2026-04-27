@@ -70,7 +70,7 @@ fn test_scrub_engine() -> Arc<ScrubEngine> {
 }
 
 fn test_vault() -> Vault {
-    Vault::new(Zeroizing::new(TEST_MASTER_KEY))
+    Vault::new(Zeroizing::new(TEST_MASTER_KEY), 0)
 }
 
 fn test_token_issuer() -> ScopedTokenIssuer {
@@ -135,7 +135,7 @@ impl CredentialStore for PersistentMockCredentialStore {
         // here instead of silently "working" via fallback — which was
         // the mock's prior behavior and masked exactly that class of
         // bug.
-        let vault = Vault::new(Zeroizing::new(self.master_key));
+        let vault = Vault::new(Zeroizing::new(self.master_key), 0);
         let bytes = if service.ends_with("-refresh") {
             vault
                 .unseal_refresh(service, &sealed)
@@ -171,7 +171,7 @@ impl CredentialStore for PersistentMockCredentialStore {
             Some(b) => b,
             None => return Ok(None),
         };
-        let vault = Vault::new(Zeroizing::new(self.master_key));
+        let vault = Vault::new(Zeroizing::new(self.master_key), 0);
         // Same access-vs-refresh heuristic as in put: try the access
         // variant first, fall back to refresh. The service-name suffix
         // `-refresh` tells us which sealing function to use at call

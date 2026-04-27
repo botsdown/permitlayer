@@ -38,6 +38,12 @@ argon2.workspace = true
 # See docs/adrs/0003-agent-identity-token-lookup.md for the full rationale.
 hmac.workspace = true
 sha2.workspace = true
+# Story 7.6a: vault-level advisory lock via `flock`/`LockFileEx`.
+fs4.workspace = true
+# Unix-only: O_NOFOLLOW constant for the lock-file open path
+# (closes the symlink-plant TOCTOU window in `vault::lock`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
@@ -67,6 +73,15 @@ path = "tests/integration/mod.rs"
 name = "kill9_recovery"
 path = "tests/kill9_recovery.rs"
 required-features = ["test-seam"]
+
+# Story 7.6a AC #1: cross-process conformance test for `VaultLock`.
+# The test self-spawns the test binary as a child holding the lock,
+# verifying that `flock`/`LockFileEx` provides cross-PROCESS exclusion
+# (in-thread tests in the lib only verify in-process semantics).
+# Story 7.7's CI matrix exercises Linux + Windows; macOS is local.
+[[test]]
+name = "vault_lock_conformance"
+path = "tests/vault_lock_conformance.rs"
 
 [[bench]]
 name = "scrub_bench"

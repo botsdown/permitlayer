@@ -13,5 +13,7 @@ pub mod killswitch;
 pub mod policy;
 pub mod scrub;
 pub mod store;
+pub mod vault;
 
 pub use error::CoreError;
+pub use vault::lock::{VaultLock, VaultLockError};

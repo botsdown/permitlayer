@@ -54,7 +54,7 @@ impl CredentialStore for MockCredentialStore {
     async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
         match self.services.get(service) {
             Some(token_bytes) => {
-                let vault = Vault::new(Zeroizing::new(self.master_key));
+                let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                 let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
                 match vault.seal(service, &token) {
                     Ok(sealed) => Ok(Some(sealed)),
@@ -99,7 +99,7 @@ async fn start_mcp_server(upstream_url: &str) -> (String, tokio::task::JoinHandl
 
     let proxy = Arc::new(ProxyService::new(
         Arc::new(cred_store) as Arc<dyn CredentialStore>,
-        Arc::new(Vault::new(Zeroizing::new(TEST_MASTER_KEY))),
+        Arc::new(Vault::new(Zeroizing::new(TEST_MASTER_KEY), 0)),
         Arc::new({
             let mut key = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);

@@ -333,7 +333,14 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     let keystore = default_keystore(&keystore_config)?;
     let master_key = keystore.master_key().await?;
 
-    let vault = Vault::new(master_key);
+    // Story 7.6a: read the vault's active key_id rather than
+    // hardcoding 0. Setup runs while the daemon is stopped, so the
+    // value here matches what the daemon would compute on next boot;
+    // in single-key worlds this is 0. Once 7.6b ships rotation, this
+    // ensures setup-written credentials are stamped with the active
+    // key, not the bootstrap sentinel.
+    let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
+    let vault = Vault::new(master_key, active_key_id);
 
     let client = permitlayer_oauth::OAuthClient::new(
         oauth_config.client_id().to_owned(),

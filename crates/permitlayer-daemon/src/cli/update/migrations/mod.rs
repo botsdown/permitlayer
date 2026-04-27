@@ -35,6 +35,8 @@ use std::path::Path;
 
 use thiserror::Error;
 
+mod envelope_v1_to_v2;
+
 /// A single forward migration. See module docs.
 ///
 /// # Why this framework ships empty at MVP
@@ -112,11 +114,30 @@ impl MigrationOutcome {
 #[derive(Debug, Error)]
 #[allow(dead_code)] // Only `Custom` is constructed in tests today.
 pub(crate) enum MigrationError {
-    #[error("migration {id}: {source}")]
-    Io { id: &'static str, source: std::io::Error },
+    #[error("migration {id} ({ctx}): {source}")]
+    Io {
+        id: &'static str,
+        /// Step description (e.g. `"rename vault to backup"`) so the
+        /// operator-facing message names which point in the migration
+        /// failed.
+        ctx: &'static str,
+        source: std::io::Error,
+    },
 
     #[error("migration {id}: {message}")]
     Custom { id: &'static str, message: String },
+
+    /// Verification step failed AFTER the rewrite — backup is preserved
+    /// at `backup_path`. Distinguishes "rewrite produced bad bytes" from
+    /// pre-rewrite IO/filesystem failures so forensics retains the
+    /// `io::Error` source chain.
+    #[error("migration {id}: verification failed; backup preserved at {backup_path}")]
+    Verification {
+        id: &'static str,
+        backup_path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Build the registry of migrations known to this binary.
@@ -130,7 +151,12 @@ pub(crate) enum MigrationError {
 /// the test surface flexible — tests can build their own registry
 /// via [`apply_pending_with`].
 fn registry() -> Vec<Box<dyn Migration>> {
-    Vec::new()
+    // Story 7.6a: first real migration — bump the on-disk
+    // SealedCredential envelope from v1 to v2 (adds `key_id: u8`
+    // for Story 7.6b's rotate-key v2). See
+    // `envelope_v1_to_v2.rs` module docs for the full atomicity
+    // model + recovery posture.
+    vec![Box::new(envelope_v1_to_v2::EnvelopeV1ToV2)]
 }
 
 /// Run any pending migrations.
@@ -241,9 +267,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_registry_returns_no_change() {
+    async fn empty_registry_via_test_seam_returns_no_change() {
+        // Story 7.6a: production registry is no longer empty (it
+        // ships envelope-v1-to-v2). The framework's own
+        // "empty registry → NoChange" invariant is now exercised
+        // via the `apply_pending_with` test seam.
         let home = std::env::temp_dir();
-        let outcome = apply_pending(&home, "0.3.0", "0.4.0").await.unwrap();
+        let outcome = apply_pending_with(&home, Vec::new()).await.unwrap();
         assert_eq!(outcome, MigrationOutcome::NoChange);
         assert_eq!(outcome.count(), 0);
         assert!(outcome.ids().is_empty());
@@ -325,10 +355,12 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_is_empty_at_mvp() {
-        // Lock in the "framework empty at MVP" invariant. The day a
-        // real migration ships, this assertion changes deliberately.
-        assert!(registry().is_empty());
+    fn production_registry_contains_envelope_v1_to_v2() {
+        // Story 7.6a: the first real migration ships in this story.
+        // The empty-registry invariant from MVP no longer holds.
+        let r = registry();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id(), "envelope-v1-to-v2");
     }
 
     /// Mock migration that panics inside `apply`. P2 (review F2):

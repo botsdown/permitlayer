@@ -8,28 +8,54 @@
 //!
 //! # On-disk format (binary envelope, little-endian)
 //!
+//! Story 7.6a bumped `SEALED_CREDENTIAL_VERSION` from 1 to 2 to add a
+//! `key_id: u8` field. Writes always emit v2; reads accept both v1 and
+//! v2 (v1 synthesizes `key_id = 0`). The
+//! `cli::update::migrations::envelope_v1_to_v2` migration rewrites
+//! every v1 envelope to v2 once.
+//!
+//! ## v2 (current — 24-byte fixed header)
 //! ```text
 //! offset  bytes  field
-//!   0      2     version        (u16 = SEALED_CREDENTIAL_VERSION)
+//!   0      2     version        (u16 = 2)
+//!   2      1     nonce_len      (u8 = 12)
+//!   3      1     key_id         (u8)              ← added in v2
+//!   4     12     nonce          ([u8; 12])
+//!  16      4     aad_len        (u32)
+//!  20   aad_len  aad            ([u8; aad_len])
+//!    *     4     ct_len         (u32)
+//!    *  ct_len   ciphertext     ([u8; ct_len], includes 16-byte GCM tag)
+//! ```
+//! Total size: `24 + aad_len + ct_len`.
+//!
+//! ## v1 (legacy — 23-byte fixed header, read-only)
+//! ```text
+//! offset  bytes  field
+//!   0      2     version        (u16 = 1)
 //!   2      1     nonce_len      (u8 = 12)
 //!   3     12     nonce          ([u8; 12])
 //!  15      4     aad_len        (u32)
 //!  19   aad_len  aad            ([u8; aad_len])
 //!    *     4     ct_len         (u32)
-//!    *  ct_len   ciphertext     ([u8; ct_len], includes 16-byte GCM tag)
+//!    *  ct_len   ciphertext     ([u8; ct_len])
 //! ```
+//! Total size: `23 + aad_len + ct_len`.
 //!
-//! Total size: `23 + aad_len + ct_len`. Not JSON: serde is forbidden on
-//! credential types and the fixed-size header is immune to deserialization
-//! resource-exhaustion attacks.
+//! Not JSON: serde is forbidden on credential types and the fixed-size
+//! header is immune to deserialization resource-exhaustion attacks.
 //!
 //! # Concurrency
 //!
 //! All I/O runs inside `tokio::task::spawn_blocking`, so the async
-//! runtime is never held for a syscall. The adapter does not serialize
-//! `put` calls against each other — two concurrent `put`s on the same
-//! service will race, with the last-renamer winning. That's correct:
-//! `rename` is atomic on POSIX and NTFS.
+//! runtime is never held for a syscall. Story 7.6a added a
+//! vault-level advisory lock
+//! ([`crate::vault::lock::VaultLock`]): every `put` acquires
+//! `<home>/vault/.lock` for the duration of the atomic-write sequence.
+//! Concurrent `put`s — same-service or different-service, same-
+//! process or cross-process — serialize via the kernel's `flock` /
+//! `LockFileEx`. Reads (`get`, `list_services`) do NOT acquire the
+//! lock; the worst case is observing a since-vanished service, which
+//! `list_services` already handles via skip-and-warn semantics.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -43,11 +69,18 @@ use permitlayer_credential::{MAX_PLAINTEXT_LEN, SEALED_CREDENTIAL_VERSION, Seale
 use crate::store::CredentialStore;
 use crate::store::error::{EnvelopeParseError, StoreError};
 use crate::store::validate::validate_service_name;
+use crate::vault::lock::{VaultLock, VaultLockError};
 
-/// Fixed-size prefix of the envelope: version (2) + nonce_len (1) +
-/// nonce (12) + aad_len (4) + ct_len (4).
-const FIXED_HEADER_LEN: usize = 23;
-/// Expected value of the `nonce_len` byte at version 1.
+/// Fixed-size prefix of the v1 envelope: version (2) + nonce_len (1) +
+/// nonce (12) + aad_len (4) + ct_len (4) = 23. Read-only — v1 is the
+/// pre-Story-7.6a format. NEW writes use [`FIXED_HEADER_LEN_V2`].
+const FIXED_HEADER_LEN_V1: usize = 23;
+/// Fixed-size prefix of the v2 envelope: version (2) + nonce_len (1) +
+/// key_id (1) + nonce (12) + aad_len (4) + ct_len (4) = 24. Story 7.6a
+/// inserted the `key_id: u8` field at offset 3 immediately after
+/// `nonce_len`.
+const FIXED_HEADER_LEN_V2: usize = 24;
+/// Expected value of the `nonce_len` byte (12 in both v1 and v2).
 const EXPECTED_NONCE_LEN: u8 = 12;
 /// AES-256-GCM tag overhead appended to ciphertext.
 const GCM_TAG_LEN: usize = 16;
@@ -62,6 +95,11 @@ const MAX_CIPHERTEXT_LEN: u32 = (MAX_PLAINTEXT_LEN + GCM_TAG_LEN) as u32;
 /// ensure cross-process uniqueness without nanosecond-precision names
 /// (lesson from Story 1.1 review).
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Lift a [`VaultLockError`] into [`StoreError::VaultLockFailed`].
+fn map_lock_err(e: VaultLockError) -> StoreError {
+    StoreError::VaultLockFailed(e)
+}
 
 /// Filesystem-backed `CredentialStore`.
 ///
@@ -156,6 +194,13 @@ impl CredentialStore for CredentialFsStore {
         let target = self.target_path(service);
         let tmp = self.tempfile_path(service);
         let vault_dir = self.home.join("vault");
+        // Story 7.6a AC #2: acquire the vault-level advisory lock for
+        // the duration of the atomic write. The lock and the I/O
+        // happen on the same blocking thread (acquired inside the
+        // closure) so the kernel-side `flock` is held by the same
+        // task that does the rename. Drop releases the lock when
+        // the closure returns, regardless of success/failure.
+        let lock_home = self.home.clone();
 
         #[cfg(any(test, feature = "test-seam"))]
         let io = self.io.clone();
@@ -163,6 +208,7 @@ impl CredentialStore for CredentialFsStore {
         #[cfg(any(test, feature = "test-seam"))]
         {
             tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
+                let _vault_lock = VaultLock::acquire(&lock_home).map_err(map_lock_err)?;
                 atomic_write_via_io(&*io, &tmp, &target, &vault_dir, &buffer)
             })
             .await??;
@@ -170,6 +216,7 @@ impl CredentialStore for CredentialFsStore {
         #[cfg(not(any(test, feature = "test-seam")))]
         {
             tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
+                let _vault_lock = VaultLock::acquire(&lock_home).map_err(map_lock_err)?;
                 atomic_write_real(&tmp, &target, &vault_dir, &buffer)
             })
             .await??;
@@ -277,16 +324,32 @@ impl CredentialStore for CredentialFsStore {
 
 /// Encode a `SealedCredential` to the on-disk envelope format.
 ///
-/// `pub` (not `pub(crate)`) so Story 7.6's rotate-key flow can stage
-/// re-encrypted envelopes at `<service>.sealed.new` paths using the
-/// exact same on-disk format. The CLI orchestrator builds bytes here,
-/// then writes them atomically to the staging location it manages.
+/// **Always writes v2** (24-byte fixed header with `key_id` at offset
+/// 3) — Story 7.6a. Old binaries that only know v1 will fail to parse
+/// v2 envelopes with `StoreError::UnsupportedVersion`, which is the
+/// intended forward-only behavior (downgrade is via binary rollback,
+/// not envelope rewrite).
+///
+/// `pub` (not `pub(crate)`) so Story 7.6b's rotate-key v2 flow and the
+/// envelope-v1-to-v2 migration can stage envelopes at non-store paths
+/// (`.sealed.new`, the migration's tempfile) using the exact same
+/// on-disk format. Callers that already hold the [`crate::VaultLock`]
+/// MUST NOT route through `CredentialFsStore::put` — they would
+/// deadlock on lock re-acquire — and instead build bytes here +
+/// atomic-write to disk via their own helper.
 pub fn encode_envelope(sealed: &SealedCredential) -> Vec<u8> {
     let aad = sealed.aad();
     let ct = sealed.ciphertext();
-    let mut buf = Vec::with_capacity(FIXED_HEADER_LEN + aad.len() + ct.len());
-    buf.extend_from_slice(&sealed.version().to_le_bytes());
+    // v2 always: callers may construct `SealedCredential` with
+    // `version = 1` for round-trip tests; we still emit v2 bytes.
+    // The `version` field on disk is what dictates parser dispatch,
+    // not the in-memory value, so this is the correct write-time
+    // posture (forward-only).
+    let mut buf = Vec::with_capacity(FIXED_HEADER_LEN_V2 + aad.len() + ct.len());
+    let version: u16 = SEALED_CREDENTIAL_VERSION;
+    buf.extend_from_slice(&version.to_le_bytes());
     buf.push(EXPECTED_NONCE_LEN);
+    buf.push(sealed.key_id());
     buf.extend_from_slice(sealed.nonce());
     #[allow(clippy::expect_used)] // aad_len fits in u32 by bound
     let aad_len: u32 = aad.len().try_into().expect(
@@ -306,25 +369,42 @@ pub fn encode_envelope(sealed: &SealedCredential) -> Vec<u8> {
 
 /// Parse the on-disk envelope into a `SealedCredential`.
 ///
+/// Story 7.6a — dispatches on the `version` byte:
+/// - **v1** (legacy): 23-byte fixed header, no `key_id`. Synthesized
+///   `key_id = 0` at decode time. Read-only — writers always emit v2.
+/// - **v2** (current): 24-byte fixed header, `key_id` at offset 3.
+/// - **v > 2**: rejected with `StoreError::UnsupportedVersion`.
+///
 /// Every length field is bounds-checked against the file size AND the
 /// per-version cap BEFORE any slice is taken. Untrusted bytes never
 /// produce an out-of-bounds panic.
-pub(crate) fn decode_envelope(bytes: &[u8]) -> Result<SealedCredential, StoreError> {
+pub fn decode_envelope(bytes: &[u8]) -> Result<SealedCredential, StoreError> {
     let file_size = bytes.len() as u64;
-    if bytes.len() < FIXED_HEADER_LEN {
+    if bytes.len() < 2 {
         return Err(StoreError::CorruptEnvelope {
-            source: EnvelopeParseError::Truncated {
-                offset: 0,
-                needed: FIXED_HEADER_LEN,
-                remaining: bytes.len(),
-            },
+            source: EnvelopeParseError::Truncated { offset: 0, needed: 2, remaining: bytes.len() },
         });
     }
     let version = u16::from_le_bytes([bytes[0], bytes[1]]);
-    if version != SEALED_CREDENTIAL_VERSION {
-        return Err(StoreError::UnsupportedVersion {
-            got: version,
-            expected: SEALED_CREDENTIAL_VERSION,
+    match version {
+        1 => decode_envelope_v1(bytes, file_size),
+        2 => decode_envelope_v2(bytes, file_size),
+        other => {
+            Err(StoreError::UnsupportedVersion { got: other, expected: SEALED_CREDENTIAL_VERSION })
+        }
+    }
+}
+
+/// Decode a v1 envelope (legacy, 23-byte header, no `key_id`).
+/// Synthesizes `key_id = 0` per Story 7.6a's read-fallback policy.
+fn decode_envelope_v1(bytes: &[u8], file_size: u64) -> Result<SealedCredential, StoreError> {
+    if bytes.len() < FIXED_HEADER_LEN_V1 {
+        return Err(StoreError::CorruptEnvelope {
+            source: EnvelopeParseError::Truncated {
+                offset: 0,
+                needed: FIXED_HEADER_LEN_V1,
+                remaining: bytes.len(),
+            },
         });
     }
     let nonce_len = bytes[2];
@@ -339,12 +419,71 @@ pub(crate) fn decode_envelope(bytes: &[u8]) -> Result<SealedCredential, StoreErr
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&bytes[3..15]);
     let aad_len = u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]);
+    let aad_start = 19usize;
+    let (aad, ct_start, ct_len) =
+        parse_aad_and_ct(bytes, aad_start, aad_len, file_size, FIXED_HEADER_LEN_V1)?;
+    Ok(SealedCredential::from_trusted_bytes(
+        bytes[ct_start..ct_start + ct_len as usize].to_vec(),
+        nonce,
+        aad,
+        1,
+        // v1 envelopes pre-date `key_id`; everything in a v1 vault
+        // was sealed under the bootstrap (single, never-rotated) key.
+        permitlayer_credential::KeyId::ZERO,
+    ))
+}
+
+/// Decode a v2 envelope (Story 7.6a, 24-byte header, `key_id` at offset 3).
+fn decode_envelope_v2(bytes: &[u8], file_size: u64) -> Result<SealedCredential, StoreError> {
+    if bytes.len() < FIXED_HEADER_LEN_V2 {
+        return Err(StoreError::CorruptEnvelope {
+            source: EnvelopeParseError::Truncated {
+                offset: 0,
+                needed: FIXED_HEADER_LEN_V2,
+                remaining: bytes.len(),
+            },
+        });
+    }
+    let nonce_len = bytes[2];
+    if nonce_len != EXPECTED_NONCE_LEN {
+        return Err(StoreError::CorruptEnvelope {
+            source: EnvelopeParseError::NonceLenMismatch {
+                got: nonce_len,
+                expected: EXPECTED_NONCE_LEN,
+            },
+        });
+    }
+    let key_id = bytes[3];
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&bytes[4..16]);
+    let aad_len = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let aad_start = 20usize;
+    let (aad, ct_start, ct_len) =
+        parse_aad_and_ct(bytes, aad_start, aad_len, file_size, FIXED_HEADER_LEN_V2)?;
+    Ok(SealedCredential::from_trusted_bytes(
+        bytes[ct_start..ct_start + ct_len as usize].to_vec(),
+        nonce,
+        aad,
+        2,
+        permitlayer_credential::KeyId::new(key_id),
+    ))
+}
+
+/// Shared bounds-check logic for the AAD + ciphertext sections of
+/// both v1 and v2 envelopes. `aad_start` differs (19 in v1, 20 in v2)
+/// but everything downstream is identical.
+fn parse_aad_and_ct(
+    bytes: &[u8],
+    aad_start: usize,
+    aad_len: u32,
+    file_size: u64,
+    fixed_header_len: usize,
+) -> Result<(Vec<u8>, usize, u32), StoreError> {
     if aad_len > MAX_AAD_LEN {
         return Err(StoreError::CorruptEnvelope {
             source: EnvelopeParseError::AadTooLarge { got: aad_len, max: MAX_AAD_LEN },
         });
     }
-    let aad_start = 19usize;
     let aad_end = aad_start.checked_add(aad_len as usize).ok_or(StoreError::CorruptEnvelope {
         source: EnvelopeParseError::LengthFieldExceedsFile {
             field: "aad_len",
@@ -352,7 +491,6 @@ pub(crate) fn decode_envelope(bytes: &[u8]) -> Result<SealedCredential, StoreErr
             file_size,
         },
     })?;
-    // Need aad_end + 4 bytes for ct_len field.
     let ct_len_start = aad_end.checked_add(4).ok_or(StoreError::CorruptEnvelope {
         source: EnvelopeParseError::LengthFieldExceedsFile {
             field: "ct_len_header",
@@ -398,9 +536,7 @@ pub(crate) fn decode_envelope(bytes: &[u8]) -> Result<SealedCredential, StoreErr
             },
         });
     }
-    // Strict: declared layout must consume the whole file. Trailing
-    // garbage is a corruption signal, not something to silently ignore.
-    let declared = (FIXED_HEADER_LEN as u64)
+    let declared = (fixed_header_len as u64)
         .checked_add(aad_len as u64)
         .and_then(|v| v.checked_add(ct_len as u64))
         .ok_or(StoreError::CorruptEnvelope {
@@ -415,8 +551,7 @@ pub(crate) fn decode_envelope(bytes: &[u8]) -> Result<SealedCredential, StoreErr
             source: EnvelopeParseError::SizeMismatch { declared, file_size },
         });
     }
-    let ciphertext = bytes[ct_start..ct_end].to_vec();
-    Ok(SealedCredential::from_trusted_bytes(ciphertext, nonce, aad, version))
+    Ok((aad, ct_start, ct_len))
 }
 
 /// Create the vault directory if absent, with mode `0o700` on Unix.
@@ -627,7 +762,14 @@ mod tests {
         let aad: Vec<u8> = [b"permitlayer-vault-v1:", service.as_bytes()].concat();
         let ciphertext = vec![ct_filler; 48]; // 32 bytes plaintext + 16-byte tag
         let nonce = [0x11u8; 12];
-        SealedCredential::from_trusted_bytes(ciphertext, nonce, aad, SEALED_CREDENTIAL_VERSION)
+        // Story 7.6a: `key_id = 0` for the single-key world.
+        SealedCredential::from_trusted_bytes(
+            ciphertext,
+            nonce,
+            aad,
+            SEALED_CREDENTIAL_VERSION,
+            permitlayer_credential::KeyId::ZERO,
+        )
     }
 
     fn new_store(tmp: &TempDir) -> CredentialFsStore {
@@ -803,14 +945,127 @@ mod tests {
     #[tokio::test]
     async fn oversized_aad_len_rejected() {
         let mut encoded = encode_envelope(&fake_sealed("gmail", 0x00));
-        // Overwrite aad_len with a huge value.
+        // v2 aad_len lives at offset 16..20 (after version, nonce_len,
+        // key_id, nonce). Story 7.6a renumbered this from offset 15..19.
         let oversize: u32 = MAX_AAD_LEN + 1;
-        encoded[15..19].copy_from_slice(&oversize.to_le_bytes());
+        encoded[16..20].copy_from_slice(&oversize.to_le_bytes());
         let err = decode_err(decode_envelope(&encoded));
         assert!(matches!(
             err,
             StoreError::CorruptEnvelope { source: EnvelopeParseError::AadTooLarge { .. } }
         ));
+    }
+
+    // ── Story 7.6a AC #6/#7: envelope v2 + key_id round-trip ─────────
+
+    /// Story 7.6a AC #6: every encode produces a v2 envelope (24-byte
+    /// header) regardless of the in-memory `version` field.
+    #[tokio::test]
+    async fn encode_always_writes_v2_header_byte() {
+        let sealed = SealedCredential::from_trusted_bytes(
+            vec![0xAB; 48],
+            [0x11u8; 12],
+            b"permitlayer-vault-v1:gmail".to_vec(),
+            SEALED_CREDENTIAL_VERSION,
+            permitlayer_credential::KeyId::new(0x55),
+        );
+        let encoded = encode_envelope(&sealed);
+        // Bytes 0-1 = u16 version (= 2), byte 2 = nonce_len (= 12),
+        // byte 3 = key_id (= 0x55).
+        assert_eq!(u16::from_le_bytes([encoded[0], encoded[1]]), 2);
+        assert_eq!(encoded[2], 12);
+        assert_eq!(encoded[3], 0x55);
+    }
+
+    /// Story 7.6a AC #6: v2 envelope round-trips with `key_id`
+    /// preserved.
+    #[tokio::test]
+    async fn encode_then_decode_v2_round_trips() {
+        let original = SealedCredential::from_trusted_bytes(
+            vec![0xCD; 48],
+            [0x11u8; 12],
+            b"permitlayer-vault-v1:gmail".to_vec(),
+            SEALED_CREDENTIAL_VERSION,
+            permitlayer_credential::KeyId::new(7),
+        );
+        let encoded = encode_envelope(&original);
+        let decoded = decode_ok(decode_envelope(&encoded));
+        assert_eq!(decoded.version(), 2);
+        assert_eq!(decoded.key_id(), 7);
+        assert_eq!(decoded.ciphertext(), original.ciphertext());
+        assert_eq!(decoded.aad(), original.aad());
+        assert_eq!(decoded.nonce(), original.nonce());
+    }
+
+    /// Story 7.6a AC #6: a v1 envelope (legacy 23-byte header)
+    /// decodes successfully and synthesizes `key_id = 0`.
+    #[tokio::test]
+    async fn decode_v1_envelope_returns_key_id_zero() {
+        // Build a v1 envelope manually: version=1, nonce_len=12, no
+        // key_id byte, then nonce (12), aad_len (4), aad, ct_len (4),
+        // ct.
+        let aad: Vec<u8> = b"permitlayer-vault-v1:gmail".to_vec();
+        let ct: Vec<u8> = vec![0x99; 48];
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.push(12);
+        buf.extend_from_slice(&[0x22u8; 12]);
+        buf.extend_from_slice(&u32::try_from(aad.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&aad);
+        buf.extend_from_slice(&u32::try_from(ct.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(&ct);
+
+        let decoded = decode_ok(decode_envelope(&buf));
+        assert_eq!(decoded.version(), 1);
+        assert_eq!(decoded.key_id(), 0, "v1 envelopes synthesize key_id = 0");
+        assert_eq!(decoded.aad(), aad.as_slice());
+        assert_eq!(decoded.ciphertext(), ct.as_slice());
+    }
+
+    /// Story 7.6a AC #6: a v2 envelope with non-zero `key_id`
+    /// decodes with that exact value.
+    #[tokio::test]
+    async fn decode_v2_envelope_returns_correct_key_id() {
+        let original = SealedCredential::from_trusted_bytes(
+            vec![0xCD; 48],
+            [0x11u8; 12],
+            b"permitlayer-vault-v1:gmail".to_vec(),
+            SEALED_CREDENTIAL_VERSION,
+            permitlayer_credential::KeyId::new(123),
+        );
+        let encoded = encode_envelope(&original);
+        let decoded = decode_ok(decode_envelope(&encoded));
+        assert_eq!(decoded.key_id(), 123);
+    }
+
+    /// Story 7.6a AC #6: future versions (v3+) are rejected up front
+    /// so a forward-incompatible envelope cannot reach a parser
+    /// branch with mismatched header expectations.
+    #[tokio::test]
+    async fn decode_unsupported_version_3_or_higher_rejected() {
+        let mut encoded = encode_envelope(&fake_sealed("gmail", 0x00));
+        encoded[0..2].copy_from_slice(&3u16.to_le_bytes());
+        let err = decode_err(decode_envelope(&encoded));
+        assert!(matches!(err, StoreError::UnsupportedVersion { got: 3, .. }));
+    }
+
+    /// Story 7.6a AC #7: `put` rejects a v1-shaped `SealedCredential`
+    /// constructed via `from_trusted_bytes(... version=1)`. The
+    /// existing version-mismatch guard fires once
+    /// `SEALED_CREDENTIAL_VERSION` is bumped.
+    #[tokio::test]
+    async fn put_rejects_v1_envelope_with_unsupported_version() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        let v1 = SealedCredential::from_trusted_bytes(
+            vec![0xAA; 48],
+            [0x11u8; 12],
+            b"permitlayer-vault-v1:gmail".to_vec(),
+            1,
+            permitlayer_credential::KeyId::ZERO,
+        );
+        let err = store.put("gmail", v1).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedVersion { got: 1, expected: 2 }));
     }
 
     // ── Story 7.6: list_services tests ───────────────────────────────
@@ -870,6 +1125,137 @@ mod tests {
 
         let services = store.list_services().await.unwrap();
         assert_eq!(services, vec!["gmail"]);
+    }
+
+    // ── Story 7.6a AC #2: VaultLock acquired around put ──────────────
+
+    /// Fault-injection IO that records the order in which `put`
+    /// calls reach `create_tempfile` (the first syscall AFTER
+    /// `VaultLock::acquire`). If the lock genuinely serializes the
+    /// writes, the recorded order matches the order in which
+    /// acquires completed; without serialization, the records would
+    /// interleave (both would be present before either rename).
+    ///
+    /// The first writer pauses for ~150ms between `create_tempfile`
+    /// and `rename` — long enough that a non-serializing second
+    /// writer would observably reach its own `create_tempfile`
+    /// before the first finishes its rename.
+    struct BarrierIo {
+        log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        first_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        is_first: std::sync::atomic::AtomicBool,
+    }
+
+    impl BarrierIo {
+        fn new(log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                log,
+                first_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                is_first: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl CredentialFsIo for BarrierIo {
+        fn create_tempfile(&self, tmp: &Path) -> std::io::Result<std::fs::File> {
+            // Mark which writer reached create_tempfile first.
+            // Subsequent writers see is_first = false.
+            let me_first = self.is_first.swap(false, std::sync::atomic::Ordering::SeqCst);
+            self.log.lock().unwrap().push(if me_first { "first:create" } else { "second:create" });
+            real_create_tempfile(tmp)
+        }
+        fn write_all(&self, file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+            file.write_all(bytes)
+        }
+        fn sync_all(&self, file: &std::fs::File) -> std::io::Result<()> {
+            file.sync_all()
+        }
+        fn rename(&self, tmp: &Path, target: &Path) -> std::io::Result<()> {
+            // Pause here ONLY for the first writer — long enough for
+            // a non-serializing second writer to observably enter
+            // create_tempfile before this rename completes. Under
+            // serialization the second writer is blocked in its
+            // VaultLock::acquire and CANNOT have logged "second:create"
+            // yet at the moment we record "first:rename".
+            let last = {
+                let log = self.log.lock().unwrap();
+                log.last().copied().unwrap_or("")
+            };
+            if last == "first:create" && !self.first_done.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                self.log.lock().unwrap().push("first:rename");
+                self.first_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                self.log.lock().unwrap().push("second:rename");
+            }
+            std::fs::rename(tmp, target)
+        }
+        fn sync_parent_dir(&self, parent: &Path) -> std::io::Result<()> {
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_serialize_via_vault_lock() {
+        // Two concurrent `put` calls must serialize via the
+        // `VaultLock` advisory lock acquired inside the
+        // spawn_blocking closure. The lock guarantees one writer at
+        // a time at the syscall level — kernel-enforced via flock /
+        // LockFileEx.
+        //
+        // Without the lock, the second writer would reach
+        // `create_tempfile` while the first is still paused in its
+        // rename — the recorded log would be:
+        //   ["first:create", "second:create", "first:rename", ...]
+        //
+        // With the lock, the second writer is blocked in
+        // `VaultLock::acquire` until the first writer's spawn_blocking
+        // closure returns and Drop releases — so the recorded log is:
+        //   ["first:create", "first:rename", "second:create", "second:rename"]
+        //
+        // We assert the second sequence exactly.
+        let tmp = TempDir::new().unwrap();
+        let log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let io: std::sync::Arc<dyn CredentialFsIo> =
+            std::sync::Arc::new(BarrierIo::new(std::sync::Arc::clone(&log)));
+        let store = std::sync::Arc::new(
+            CredentialFsStore::new_with_io(tmp.path().to_path_buf(), io).unwrap(),
+        );
+        let s1 = std::sync::Arc::clone(&store);
+        let s2 = std::sync::Arc::clone(&store);
+        let h1 = tokio::spawn(async move { s1.put("gmail", fake_sealed("gmail", 0xAA)).await });
+        // Stagger second writer slightly so first wins the lock race
+        // deterministically.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let h2 = tokio::spawn(async move { s2.put("gmail", fake_sealed("gmail", 0xBB)).await });
+        h1.await.unwrap().expect("first put succeeded");
+        h2.await.unwrap().expect("second put succeeded");
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["first:create", "first:rename", "second:create", "second:rename"],
+            "writes did not serialize via VaultLock — recorded order: {recorded:?}"
+        );
+        // Final state: one of the two values is on disk.
+        let got = store.get("gmail").await.unwrap().expect("present");
+        assert!(matches!(got.ciphertext()[0], 0xAA | 0xBB));
+    }
+
+    #[tokio::test]
+    async fn put_succeeds_when_lock_already_held_by_same_process_after_release() {
+        // Acquire the lock externally, release, then put: must
+        // succeed (the put acquires fresh inside the closure).
+        use crate::vault::lock::VaultLock;
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        {
+            let _guard = VaultLock::try_acquire(tmp.path()).expect("acquire");
+        }
+        // Guard dropped — put can now acquire.
+        store.put("gmail", fake_sealed("gmail", 0x42)).await.expect("put after lock release");
     }
 
     #[cfg(unix)]
