@@ -496,3 +496,159 @@ Remove-Item "$env:LOCALAPPDATA\Programs\agentsso" -Recurse -ErrorAction Silently
 # 5. Remove from user PATH manually: System Properties → Environment
 #    Variables → User → Path, delete the agentsso entry.
 ```
+
+## Update — staying current
+
+`agentsso update` checks for and applies new releases without
+disturbing your vault, audit log, policies, agent registrations, or
+the OS-keychain master key. State preservation is the entire point —
+upgrading should never cost you a re-OAuth-consent or a wiped audit
+trail.
+
+### Check what's available (no changes)
+
+```sh
+agentsso update
+```
+
+Queries the GitHub Releases API for the latest stable release and
+prints a version-delta summary:
+
+```
+→ update available  ✓ 0.3.0 → 0.4.0
+    Release v0.4.0
+    published: 2026-04-26T12:00:00Z
+
+    ## What's new
+    - Fixed credential refresh edge case
+    - Added Drive scope filtering
+
+→ run 'agentsso update --apply' to install
+```
+
+If you're already current, you'll see `✓ already on the latest
+release`. The check-only path makes no filesystem changes.
+
+### Apply the update in place
+
+```sh
+agentsso update --apply           # interactive — prompts for confirmation
+agentsso update --apply --yes     # non-interactive (CI / scripts)
+```
+
+Sequence:
+
+1. Re-runs the version check.
+2. Validates free disk space (~4× the download size, for staging +
+   backup + slack).
+3. Prompts for confirmation (skipped on `--yes`).
+4. Downloads the platform-correct release archive + minisign
+   signature.
+5. **Verifies the signature** against the embedded ed25519 public
+   key (`install/permitlayer.pub` — the same key the curl|sh and
+   PowerShell installers use). Refuses to apply on signature
+   mismatch.
+6. Extracts the archive into a tempdir, with path-traversal
+   hardening (no `..`, no absolute paths).
+7. Stages the new binary at `<install_dir>/agentsso.new`.
+8. Stops the running daemon (graceful SIGTERM, ≤10s wait).
+9. Atomic-renames `agentsso` → `agentsso.old` then `agentsso.new`
+   → `agentsso`.
+10. Runs any pending schema migrations.
+11. Re-writes the autostart artifact if the binary path drifted.
+12. Restarts the daemon and waits up to 30s for it to come up.
+13. Cleans up `agentsso.old`.
+
+State preservation is byte-exact: `~/.agentsso/{vault, audit,
+policies, agents, scrub-rules, plugins}` and the OS-keychain master
+key are never touched.
+
+### What gets preserved across updates
+
+- `~/.agentsso/vault/` — sealed credentials
+- `~/.agentsso/audit/` — append-only JSONL audit log
+- `~/.agentsso/policies/` — agent policy TOML files
+- `~/.agentsso/agents/` — registered agent identities
+- `~/.agentsso/scrub-rules/` — custom scrub rules
+- `~/.agentsso/plugins/` — third-party connector plugins
+- `~/.agentsso/keystore/` — passphrase verifier (when applicable)
+- The OS keychain master-key entry (`io.permitlayer.master-key`)
+- The autostart artifact at login (artifact path is auto-corrected
+  if the binary moved)
+
+### Rollback on failure
+
+If anything between staging and post-restart-verification fails —
+download error, signature mismatch, archive validation, swap
+failure, migration error, daemon-won't-restart — the update flow
+restores the previous binary by atomic-rename inverse and
+re-spawns the daemon on the old version. You'll see a structured
+error block + an `update-rolled-back` audit event with the failure
+step and reason.
+
+### Homebrew install — refused with redirect
+
+If you installed via `brew install permitlayer/tap/agentsso`,
+`agentsso update --apply` refuses with exit code 3 and points you
+at Homebrew's upgrade flow:
+
+```
+error: agentsso at /opt/homebrew/Cellar/agentsso/0.3.0/bin/agentsso
+       is managed by brew; use that package manager's upgrade command
+
+  remediation: brew upgrade agentsso
+```
+
+The bare `agentsso update` (check-only) still works on a Homebrew
+install — useful for spotting "is there a new release?" without
+leaving the terminal.
+
+### Linux distro packages — same posture
+
+If a future release ships as a `.deb` or `.rpm` and the running
+binary is at `/usr/bin/agentsso` with `dpkg -S` or `rpm -qf`
+returning a package owner, `--apply` refuses with the
+`apt upgrade agentsso` or `dnf upgrade agentsso` remediation.
+(MVP only ships curl|sh + brew + PowerShell installers; this is
+a forward-compat guard.)
+
+### Brew-services running
+
+If `brew services list` shows agentsso as `started` or
+`scheduled`, `--apply` refuses with exit code 3:
+
+```
+error: agentsso is being managed by `brew services`. Running
+       `agentsso update --apply` under this state would conflict
+       with Homebrew's plist.
+
+  remediation: brew services stop agentsso && agentsso update --apply
+```
+
+Same refusal pattern as `agentsso uninstall` — a different
+lifecycle owner is already in charge.
+
+### Audit events
+
+Every observable step emits an audit event you can review with
+`agentsso audit`:
+
+- `update-check-requested` — at the start of a check or apply.
+- `update-check-result` — version delta + update_available flag.
+- `update-apply-started` — confirmed apply, just before download.
+- `update-signature-verified` — minisign keyid + algorithm.
+- `update-migrations-checked` — `migrations_applied` count + ids.
+- `update-completed` — successful end-state with elapsed_ms.
+- `update-rolled-back` — failure step + reason if anything aborted.
+
+### What's NOT in MVP
+
+- **No daemon-side periodic check.** `agentsso update` is on-
+  demand only at MVP. A future story adds an opt-in
+  `agentsso update --enable-auto` that checks daily and prints a
+  "you have an update available" line on `agentsso status`.
+- **No `--allow-unsigned`.** The bootstrap installer has
+  `--allow-unsigned` for one-shot edge cases; an in-place update
+  has no equivalent excuse — refuse-and-stop is the only path.
+- **No automatic apply.** Even with the future opt-in periodic
+  check, applying still requires a manual `agentsso update --apply`.

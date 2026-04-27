@@ -54,3 +54,4 @@ mod policy_reload_e2e;
 mod scrub_explain_warnings;
 mod status_connections_e2e;
 mod uninstall_e2e;
+mod update_e2e;

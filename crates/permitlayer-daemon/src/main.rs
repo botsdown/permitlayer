@@ -62,6 +62,10 @@ enum Commands {
     /// entry, autostart, data dir, and binary (FR8). Destructive —
     /// requires interactive confirmation OR --yes.
     Uninstall(cli::uninstall::UninstallArgs),
+    /// Check for updates (default) or apply them in place
+    /// (`--apply`). Preserves vault, audit log, policies, agent
+    /// registrations, and the OS-keychain master key. FR73-76.
+    Update(cli::update::UpdateArgs),
 }
 
 /// Top-level `main` dispatcher.
@@ -110,6 +114,7 @@ async fn main() -> ExitCode {
         Some(Commands::Connectors(args)) => anyhow_to_exit_code(cli::connectors::run(args).await),
         Some(Commands::Autostart(args)) => anyhow_to_exit_code(cli::autostart::run(args).await),
         Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
+        Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),
         None => {
             use clap::CommandFactory;
             if let Err(e) = Cli::command().print_help() {
@@ -175,6 +180,42 @@ fn uninstall_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
             }
             eprintln!("error: {e:#}");
             if exit_three { ExitCode::from(3) } else { ExitCode::FAILURE }
+        }
+    }
+}
+
+/// `agentsso update`-specific dispatch: typed markers for exit codes
+/// 3 (resource conflict — package-manager-managed binary, brew-
+/// services), 4 (auth/integrity — network failure, signature
+/// verification failure, archive-unsafe, disk-space), and 5 (swap
+/// or migration failure after rollback).
+///
+/// Same shape as [`uninstall_to_exit_code`] but with three exit-code
+/// markers instead of one. Story 7.5 AC #4 + the typed-marker
+/// pattern from Story 7.4 P10+P11.
+fn update_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let exit_three = e.downcast_ref::<cli::update::UpdateExitCode3>().is_some();
+            let exit_four = e.downcast_ref::<cli::update::UpdateExitCode4>().is_some();
+            let exit_five = e.downcast_ref::<cli::update::UpdateExitCode5>().is_some();
+            let resolved_code = if exit_three {
+                3
+            } else if exit_four {
+                4
+            } else if exit_five {
+                5
+            } else {
+                1
+            };
+            if e.downcast_ref::<cli::SilentCliError>().is_some()
+                || e.chain().any(|s| s.is::<cli::SilentCliError>())
+            {
+                return ExitCode::from(resolved_code);
+            }
+            eprintln!("error: {e:#}");
+            ExitCode::from(resolved_code)
         }
     }
 }

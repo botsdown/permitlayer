@@ -78,6 +78,14 @@ pub(crate) enum BinaryResolveError {
 /// tests pass a closure returning a fixture path so package-manager
 /// detection can be unit-tested without owning a real Cellar/dpkg
 /// install.
+///
+/// **Story 7.5 — second consumer.** The `agentsso update` flow uses
+/// this same helper for "where do I install the new binary, and is
+/// the binary package-manager-managed?". When the result is
+/// [`BinaryTarget::ManagedByPackageManager`], update refuses with
+/// exit 3 and points the user at `brew upgrade` / `apt upgrade`
+/// rather than performing an in-place swap that would conflict with
+/// the package manager's bookkeeping.
 pub(crate) fn resolve_binary_target_with<F>(
     current_exe: F,
 ) -> Result<BinaryTarget, BinaryResolveError>

@@ -49,6 +49,11 @@
 .envrc
 *.pem
 *.key
+# Story 7.5: committed test-only minisign keypair for the apply-flow
+# integration test. NOT a production trust root — production
+# verification uses `install/permitlayer.pub` (a separate keypair).
+# See `test-fixtures/update/README.md` for rationale.
+!test-fixtures/update/test-seckey.key
 *.p12
 *.pfx
 *.jks

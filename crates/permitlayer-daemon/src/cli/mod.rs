@@ -19,6 +19,7 @@ pub mod start;
 pub mod status;
 pub mod stop;
 pub mod uninstall;
+pub mod update;
 
 /// Resolve the `~/.agentsso/` home directory.
 ///

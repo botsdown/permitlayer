@@ -42,7 +42,14 @@ use permitlayer_keystore::{
     DeleteOutcome, FallbackMode, KeyStoreError, KeystoreConfig, default_keystore,
 };
 
-mod binary;
+/// Binary-path resolver and `BinaryRemover` abstraction.
+///
+/// `pub(crate)` so Story 7.5's update orchestrator can re-use
+/// [`binary::resolve_binary_target`] and [`binary::BinaryTarget`]
+/// for the "where does the binary live + is it package-manager-
+/// managed?" question without re-implementing the package-manager
+/// detection logic.
+pub(crate) mod binary;
 
 use binary::BinaryRemover;
 
@@ -128,8 +135,14 @@ pub struct UninstallArgs {
 }
 
 /// Outcome of one teardown step.
+///
+/// `pub(crate)` so the Story 7.5 update orchestrator can re-use the
+/// same shape for its (different) sequence of fail-soft steps. The
+/// closing-line printer (`print_closing_line`) stays uninstall-
+/// specific — update has its own closing line — but the variants and
+/// the `print_step` helper are common.
 #[derive(Debug)]
-enum StepOutcome {
+pub(crate) enum StepOutcome {
     /// Step ran and reports success. `detail` is the operator-facing
     /// "what happened" line (e.g., "removed: /usr/local/bin/agentsso").
     Done { step: &'static str, detail: String },
@@ -158,7 +171,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     // ~/.agentsso/logs/ directory that step 4 would then have to
     // delete) when uninstall is going to refuse anyway.
     #[cfg(target_os = "macos")]
-    if brew_services_managing_agentsso() {
+    if brew_services_managing_agentsso().await {
         eprint!(
             "{}",
             render::error_block(
@@ -421,7 +434,14 @@ fn format_data_dir_size(home: &Path) -> String {
 /// 10-second wait loop. Previous version used `std::thread::sleep`
 /// inside the polling loop, which would freeze the runtime worker
 /// for up to 10s.
-async fn stop_daemon_if_running(home: &Path) -> StepOutcome {
+///
+/// **Story 7.5 — second consumer.** The `agentsso update --apply`
+/// flow stops the daemon at AC #2 step 9 before swapping the binary
+/// (Windows file-locks the running binary). Reuses this exact helper
+/// so the "graceful SIGTERM, wait ≤10s, tolerate stale PID files"
+/// invariants are shared across uninstall and update — they're the
+/// same operational concern.
+pub(crate) async fn stop_daemon_if_running(home: &Path) -> StepOutcome {
     use crate::lifecycle::pid::PidFile;
 
     // Read PID. Errors here are warn-and-continue (a corrupt PID
@@ -552,21 +572,64 @@ async fn stop_daemon_if_running(home: &Path) -> StepOutcome {
             };
         }
 
-        // Wait up to 10s for the PID file to disappear.
+        // Wait up to 10s for the PID file to disappear, then
+        // SIGKILL fallback for another 5s.
+        //
+        // **Story 7.5 review patch P23 (F29 — Auditor):** previous
+        // version returned a Warned outcome after 10s with
+        // remediation `kill -KILL {pid}`. Now we actually do SIGKILL
+        // after 10s — uninstall is destructive by design, and a
+        // stuck daemon shouldn't block the teardown. Story 7.5
+        // (update) reuses this helper; same posture (the rollback
+        // path re-spawns the daemon on the old binary regardless).
+        // The SIGKILL fallback closes the exact case where update
+        // most needs the stop to proceed (Windows file-locks the
+        // running binary; can't swap until the daemon dies).
         let pid_path = home.join("agentsso.pid");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let sigterm_deadline = Instant::now() + Duration::from_secs(10);
+        let mut tried_sigkill = false;
         loop {
             if !pid_path.exists() {
                 return StepOutcome::Done {
                     step: "stopping daemon",
-                    detail: format!("daemon stopped (was PID {pid})"),
+                    detail: if tried_sigkill {
+                        format!("daemon force-killed after SIGTERM timeout (was PID {pid})")
+                    } else {
+                        format!("daemon stopped (was PID {pid})")
+                    },
                 };
             }
-            if Instant::now() > deadline {
+            if !tried_sigkill && Instant::now() > sigterm_deadline {
+                // SIGKILL fallback. Idempotent: ESRCH means the
+                // daemon already exited.
+                tried_sigkill = true;
+                tracing::warn!(
+                    target: "uninstall",
+                    pid = raw_pid,
+                    "daemon did not respond to SIGTERM in 10s — sending SIGKILL"
+                );
+                if let Err(e) = kill(Pid::from_raw(raw_pid), Signal::SIGKILL)
+                    && e != nix::errno::Errno::ESRCH
+                {
+                    return StepOutcome::Warned {
+                        step: "stopping daemon",
+                        reason: format!("SIGTERM timed out after 10s; SIGKILL also failed: {e}"),
+                        remediation: format!("kill -KILL {raw_pid} && rm {}", pid_path.display()),
+                    };
+                }
+                // Give SIGKILL up to 5s to take effect (writing the
+                // pid-file disappearance is in the kernel's hands).
+                let kill_deadline = Instant::now() + Duration::from_secs(5);
+                while pid_path.exists() && Instant::now() < kill_deadline {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                continue;
+            }
+            if tried_sigkill && Instant::now() > sigterm_deadline + Duration::from_secs(15) {
                 return StepOutcome::Warned {
                     step: "stopping daemon",
                     reason: format!(
-                        "daemon did not shut down within 10s (PID {pid} still in PID file)"
+                        "daemon did not shut down within 15s even after SIGKILL (PID {pid} still in PID file)"
                     ),
                     remediation: format!("kill -KILL {pid} && rm {}", pid_path.display()),
                 };
@@ -946,52 +1009,33 @@ fn remove_binary_warn_on_fail(
 
 /// Probe `brew services list --json` and return `true` iff agentsso
 /// is `started` or `scheduled`. Tolerates `brew not on PATH` as
-/// "no conflict" (returns `false`). P34 (review): wrapped with a 30s
-/// timeout — Story 7.3 documents `brew` can hang on a slow tap.
+/// "no conflict" (returns `false`).
+///
+/// **Story 7.5 review patch P21 (F23 — Blind):** async +
+/// `tokio::process::Command` with `tokio::time::timeout` instead
+/// of std::Command + thread::sleep 100ms poll loop. The previous
+/// shape blocked the tokio runtime worker for up to 30s on a slow
+/// `brew services list` call. This is the symmetric fix to the
+/// `cli::update::brew_services_managing_agentsso` patch — same
+/// shell-out, same hang risk.
 #[cfg(target_os = "macos")]
-fn brew_services_managing_agentsso() -> bool {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+async fn brew_services_managing_agentsso() -> bool {
+    use std::time::Duration;
 
-    let mut child = match Command::new("brew")
+    let cmd = tokio::process::Command::new("brew")
         .args(["services", "list", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return false,
-    };
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
 
-    let timeout = Duration::from_secs(30);
-    let start = Instant::now();
-    let output = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                use std::io::Read as _;
-                let mut stdout = Vec::new();
-                if let Some(mut h) = child.stdout.take() {
-                    let _ = h.read_to_end(&mut stdout);
-                }
-                break std::process::Output { status, stdout, stderr: Vec::new() };
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => return false,
-        }
+    let output = match tokio::time::timeout(Duration::from_secs(30), cmd).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(_)) => return false, // brew not on PATH — proceed.
+        Err(_) => return false,     // brew hung past 30s — proceed.
     };
-
     if !output.status.success() {
         return false;
     }
-
     crate::lifecycle::autostart::macos::parse_brew_services_active(&output.stdout)
 }
 

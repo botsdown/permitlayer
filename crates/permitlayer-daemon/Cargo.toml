@@ -79,9 +79,20 @@ reqwest.workspace = true
 url.workspace = true
 notify.workspace = true
 csv.workspace = true
+# Story 7.5 — `agentsso update`. minisign-verify for ed25519 release
+# signature verification (same `install/permitlayer.pub` key that
+# install.sh + install.ps1 use); flate2 + tar for unpacking the
+# `dist`-produced `.tar.gz` archives; semver for version comparison.
+minisign-verify = { workspace = true }
+flate2 = "1.0"
+tar = { workspace = true }
+semver = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+# Story 7.5 — `rustix::fs::statvfs` for the disk-space pre-flight.
+# POSIX-only; the Windows path uses a PowerShell shell-out fallback.
+rustix = { workspace = true }
 
 [build-dependencies]
 serde_json.workspace = true
@@ -93,6 +104,15 @@ http-body-util.workspace = true
 # Needed by the `FailingAuditStore` test fixture in `server::control::tests`
 # to impl the `AuditStore` trait (which is defined via `#[async_trait]`).
 async-trait.workspace = true
+# Story 7.5 update_e2e — mock GitHub Releases API for the in-place
+# update flow's integration test.
+mockito = { workspace = true }
+# Story 7.5 review patch P22 (F26): test-only minisign signer for
+# building the signed fixture archive served by the apply-flow
+# integration test. Same trust-root family as `minisign-verify`
+# (production-side dep at workspace level); zero impact on release
+# builds since this is dev-deps only.
+minisign = "0.9"
 
 [lints]
 workspace = true
