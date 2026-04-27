@@ -192,10 +192,96 @@ impl CredentialStore for CredentialFsStore {
         })
         .await?
     }
+
+    async fn list_services(&self) -> Result<Vec<String>, StoreError> {
+        let vault_dir = self.home.join("vault");
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>, StoreError> {
+            let mut out = Vec::new();
+            let read_dir = match std::fs::read_dir(&vault_dir) {
+                Ok(rd) => rd,
+                // Vault dir absent (fresh install before first put) is
+                // not an error — return empty list. Mirrors
+                // `AgentIdentityStore::list` posture.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+                Err(e) => return Err(StoreError::IoError(e)),
+            };
+            for entry in read_dir {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // Per-entry read_dir failure (race with remove,
+                        // perm flap) must not abort the whole listing.
+                        tracing::warn!(
+                            dir = %vault_dir.display(),
+                            error = %e,
+                            "skipping unreadable vault directory entry"
+                        );
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    // Non-UTF-8 filename — skip silently. Vault writes
+                    // only ASCII-safe names through `validate_service_name`,
+                    // so this only fires on operator-edited dirs.
+                    continue;
+                };
+                // Skip dotfiles, editor lockfiles, tempfiles, the
+                // rotation marker, and anything not ending in `.sealed`.
+                if file_name.starts_with('.') || file_name.starts_with('#') {
+                    continue;
+                }
+                if file_name.contains(".tmp.") || file_name.contains(".sealed.new") {
+                    continue;
+                }
+                let Some(stem) = file_name.strip_suffix(".sealed") else {
+                    continue;
+                };
+                // Reject non-regular files (symlinks etc.) per the
+                // Story 7.3 P63 precedent — autostart status applies the
+                // same rule. The vault adapter only ever writes regular
+                // files via atomic rename; a symlink at one of these
+                // paths means out-of-band edit.
+                let meta = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "skipping vault entry — symlink_metadata failed"
+                        );
+                        continue;
+                    }
+                };
+                if !meta.file_type().is_file() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping vault entry — not a regular file (symlink?)"
+                    );
+                    continue;
+                }
+                if validate_service_name(stem).is_err() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping vault entry with invalid service name in stem"
+                    );
+                    continue;
+                }
+                out.push(stem.to_owned());
+            }
+            Ok(out)
+        })
+        .await?
+    }
 }
 
 /// Encode a `SealedCredential` to the on-disk envelope format.
-pub(crate) fn encode_envelope(sealed: &SealedCredential) -> Vec<u8> {
+///
+/// `pub` (not `pub(crate)`) so Story 7.6's rotate-key flow can stage
+/// re-encrypted envelopes at `<service>.sealed.new` paths using the
+/// exact same on-disk format. The CLI orchestrator builds bytes here,
+/// then writes them atomically to the staging location it manages.
+pub fn encode_envelope(sealed: &SealedCredential) -> Vec<u8> {
     let aad = sealed.aad();
     let ct = sealed.ciphertext();
     let mut buf = Vec::with_capacity(FIXED_HEADER_LEN + aad.len() + ct.len());
@@ -725,5 +811,85 @@ mod tests {
             err,
             StoreError::CorruptEnvelope { source: EnvelopeParseError::AadTooLarge { .. } }
         ));
+    }
+
+    // ── Story 7.6: list_services tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn list_services_returns_empty_when_vault_dir_absent() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        // Delete the vault dir that `new_store` just created so we
+        // exercise the NotFound branch.
+        std::fs::remove_dir_all(tmp.path().join("vault")).unwrap();
+        let services = store.list_services().await.unwrap();
+        assert!(services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_services_returns_all_persisted_services() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
+        store.put("gmail-refresh", fake_sealed("gmail-refresh", 0xBB)).await.unwrap();
+        store.put("calendar", fake_sealed("calendar", 0xCC)).await.unwrap();
+
+        let mut services = store.list_services().await.unwrap();
+        services.sort();
+        assert_eq!(services, vec!["calendar", "gmail", "gmail-refresh"]);
+    }
+
+    #[tokio::test]
+    async fn list_services_skips_dotfiles_and_tempfiles_and_marker() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
+
+        // Plant noise the rotate-key flow may legitimately produce.
+        let vault_dir = tmp.path().join("vault");
+        std::fs::write(vault_dir.join(".rotation.in-progress"), b"{}").unwrap();
+        std::fs::write(vault_dir.join(".DS_Store"), b"").unwrap();
+        std::fs::write(vault_dir.join("gmail.sealed.tmp.999.0.deadbeef"), b"junk").unwrap();
+        std::fs::write(vault_dir.join("calendar.sealed.new"), b"in-flight").unwrap();
+        std::fs::write(vault_dir.join("readme.txt"), b"not a sealed envelope").unwrap();
+        std::fs::write(vault_dir.join("#editor#"), b"emacs lockfile").unwrap();
+
+        let services = store.list_services().await.unwrap();
+        assert_eq!(services, vec!["gmail"]);
+    }
+
+    #[tokio::test]
+    async fn list_services_skips_files_with_invalid_service_names() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
+
+        // Plant a file whose stem fails validate_service_name (uppercase).
+        let vault_dir = tmp.path().join("vault");
+        std::fs::write(vault_dir.join("BadName.sealed"), b"impossible-via-put").unwrap();
+
+        let services = store.list_services().await.unwrap();
+        assert_eq!(services, vec!["gmail"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_services_skips_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
+
+        // Create a symlink at <vault>/calendar.sealed pointing at the
+        // gmail file. Even though the *content* is valid, we treat the
+        // symlink as suspicious and skip it (Story 7.3 P63 precedent).
+        let vault_dir = tmp.path().join("vault");
+        std::os::unix::fs::symlink(
+            vault_dir.join("gmail.sealed"),
+            vault_dir.join("calendar.sealed"),
+        )
+        .unwrap();
+
+        let services = store.list_services().await.unwrap();
+        assert_eq!(services, vec!["gmail"]);
     }
 }

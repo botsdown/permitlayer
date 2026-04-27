@@ -13,6 +13,7 @@ pub mod kill;
 pub mod logs;
 pub mod reload;
 pub mod resume;
+pub mod rotate_key;
 pub mod scrub;
 pub mod setup;
 pub mod start;

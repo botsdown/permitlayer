@@ -2328,6 +2328,7 @@ version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "hkdf",
+ "hmac",
  "permitlayer-credential",
  "permitlayer-keystore",
  "proptest",

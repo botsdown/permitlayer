@@ -48,6 +48,25 @@ pub trait CredentialStore: Send + Sync {
     /// Retrieve a sealed credential. Returns `Ok(None)` if no entry
     /// exists for this service.
     async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError>;
+
+    /// Enumerate every service for which a sealed credential is
+    /// persisted. Returns service names (not paths) — callers that need
+    /// the full envelope follow up with [`Self::get`].
+    ///
+    /// Implementations MUST:
+    /// - Skip dotfiles, editor lockfiles (`#name#`), tempfiles
+    ///   (`*.tmp.*`), and any non-regular file (symlinks, FIFOs).
+    /// - Validate each candidate name via `validate_service_name` and
+    ///   skip-and-warn on any invalid name (mirrors
+    ///   `AgentIdentityStore::list` posture).
+    /// - Tolerate the vault directory being absent — return
+    ///   `Ok(vec![])`.
+    /// - NOT promise any particular order. Callers that need
+    ///   determinism must sort.
+    ///
+    /// Used by Story 7.6 (`agentsso rotate-key`) to enumerate every
+    /// vault entry that needs re-encryption under a fresh master key.
+    async fn list_services(&self) -> Result<Vec<String>, StoreError>;
 }
 
 /// Append audit events to a durable log.

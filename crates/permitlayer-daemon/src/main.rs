@@ -66,6 +66,13 @@ enum Commands {
     /// (`--apply`). Preserves vault, audit log, policies, agent
     /// registrations, and the OS-keychain master key. FR73-76.
     Update(cli::update::UpdateArgs),
+    /// Rotate the master encryption key in your OS keychain (FR17).
+    /// Re-encrypts every credential under a fresh key; OAuth refresh
+    /// tokens persist (no re-consent needed). Agent bearer tokens
+    /// are invalidated — agents must re-run `agentsso agent register`.
+    /// Destructive — requires interactive confirmation OR --yes.
+    /// Daemon must be stopped first (`agentsso stop`).
+    RotateKey(cli::rotate_key::RotateKeyArgs),
 }
 
 /// Top-level `main` dispatcher.
@@ -115,6 +122,9 @@ async fn main() -> ExitCode {
         Some(Commands::Autostart(args)) => anyhow_to_exit_code(cli::autostart::run(args).await),
         Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),
+        Some(Commands::RotateKey(args)) => {
+            rotate_key_to_exit_code(cli::rotate_key::run(args).await)
+        }
         None => {
             use clap::CommandFactory;
             if let Err(e) = Cli::command().print_help() {
@@ -200,6 +210,41 @@ fn update_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
             let exit_three = e.downcast_ref::<cli::update::UpdateExitCode3>().is_some();
             let exit_four = e.downcast_ref::<cli::update::UpdateExitCode4>().is_some();
             let exit_five = e.downcast_ref::<cli::update::UpdateExitCode5>().is_some();
+            let resolved_code = if exit_three {
+                3
+            } else if exit_four {
+                4
+            } else if exit_five {
+                5
+            } else {
+                1
+            };
+            if e.downcast_ref::<cli::SilentCliError>().is_some()
+                || e.chain().any(|s| s.is::<cli::SilentCliError>())
+            {
+                return ExitCode::from(resolved_code);
+            }
+            eprintln!("error: {e:#}");
+            ExitCode::from(resolved_code)
+        }
+    }
+}
+
+/// `agentsso rotate-key`-specific dispatch (Story 7.6). Same shape as
+/// `update_to_exit_code` — three typed exit-code markers
+/// (`RotateKeyExitCode3/4/5`) covering resource-conflict / auth-or-
+/// keystore failure / rotation failure. **Architecture note:** this
+/// is the third `*_to_exit_code` dispatcher with the same pattern
+/// (uninstall + update + rotate-key). The 4th-consumer story should
+/// extract a `cli::common::exit_code::dispatch_with_markers` helper —
+/// see deferred-work.md cross-story note from Story 7.6.
+fn rotate_key_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let exit_three = e.downcast_ref::<cli::rotate_key::RotateKeyExitCode3>().is_some();
+            let exit_four = e.downcast_ref::<cli::rotate_key::RotateKeyExitCode4>().is_some();
+            let exit_five = e.downcast_ref::<cli::rotate_key::RotateKeyExitCode5>().is_some();
             let resolved_code = if exit_three {
                 3
             } else if exit_four {

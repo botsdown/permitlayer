@@ -652,3 +652,140 @@ Every observable step emits an audit event you can review with
   has no equivalent excuse — refuse-and-stop is the only path.
 - **No automatic apply.** Even with the future opt-in periodic
   check, applying still requires a manual `agentsso update --apply`.
+
+## Rotate the master key — `agentsso rotate-key`
+
+`agentsso rotate-key` mints a fresh 32-byte master encryption key,
+re-encrypts every credential in your vault under the new key, and
+replaces the old master key in your OS keychain. Your Google
+connections survive — refresh tokens are preserved, no re-OAuth-
+consent needed.
+
+### When to run it
+
+Run rotate-key when you suspect your master key may be compromised:
+a stolen device backup, a suspicious filesystem-restore from
+untrusted media, or a security-baseline policy that mandates
+periodic rotation.
+
+If you don't have a specific reason to rotate, **don't**. The OS
+keychain protects the master key with hardware-backed encryption on
+modern macOS (Secure Enclave on Apple Silicon) and Windows
+(DPAPI / TPM-backed); periodic rotation without a triggering event
+adds risk (an interrupted rotation can leave the vault in a
+transient state that requires `agentsso rotate-key` to be re-run)
+without security gain.
+
+### Stop the daemon first
+
+```sh
+agentsso stop
+agentsso rotate-key --yes
+```
+
+`rotate-key` refuses to run while the daemon is up — the daemon
+holds an in-memory copy of the OLD master key, and rotating around
+it would desync the daemon's view of authentication state. The
+refusal is fast and produces a clean structured error pointing you
+at `agentsso stop`.
+
+### Confirmation prompt
+
+By default, `rotate-key` prints a manifest and waits for `y/N`:
+
+```text
+This will rotate the agentsso master encryption key:
+
+  • Mint a fresh 32-byte master key from your OS RNG
+  • Re-encrypt every credential in ~/.agentsso/vault/ under the new key
+  • Replace the old master key in your OS keychain (idempotent overwrite)
+  • Rebuild the agent-registry HMAC lookup index in ~/.agentsso/agents/
+  • NOT touch your OAuth refresh tokens — Google connections survive
+
+If the rotation is interrupted, re-run `agentsso rotate-key` to
+finish or roll back automatically.
+
+Continue? [y/N]
+```
+
+Pass `--yes` to skip the prompt (required from CI / non-tty
+contexts):
+
+```sh
+agentsso rotate-key --yes
+```
+
+### What gets invalidated
+
+- ✅ **OAuth refresh tokens are preserved.** Your Google
+  connections (`gmail`, `calendar`, `drive`) keep working without
+  re-consent.
+- ⚠️ **Agent bearer tokens are invalidated.** Every agent
+  registered via `agentsso agent register <name>` must re-run the
+  register command. The bearer token issued at registration time
+  was bound to the old master key's `daemon_subkey`; that subkey
+  no longer exists after rotation.
+
+To re-register an agent after rotation:
+
+```sh
+agentsso agent register my-agent --policy=gmail-readonly
+```
+
+### Passphrase-mode users
+
+If you're running on Linux without a usable libsecret backend (or
+forced into passphrase mode via `--keystore-fallback=passphrase`),
+`agentsso rotate-key` refuses with:
+
+```text
+error: rotate_key_passphrase_adapter
+  the passphrase keystore rotates by changing the passphrase, not by
+  minting a new master key. A dedicated `agentsso change-passphrase`
+  command will be added in a future story; for now, the passphrase-
+  mode rotation path is unavailable.
+  remediation: (future) agentsso change-passphrase — not yet implemented
+```
+
+Passphrase rotation lands in a future story.
+
+### Crash recovery
+
+Rotation is multi-phase: stage re-encrypted files alongside the old
+ones, write a `.rotation.in-progress` marker, swap the keystore
+master key, atomically rename staged files into place, invalidate
+agent files, clean up. If your machine crashes mid-rotation, the
+marker file at `~/.agentsso/vault/.rotation.in-progress` records
+the in-flight state.
+
+Re-run `agentsso rotate-key` after the crash; it detects the marker
+and finishes the rotation idempotently. **Never delete the marker
+file by hand** — its presence is what tells the next invocation
+that the keystore was already swapped.
+
+### Audit events
+
+Every rotation emits a `master-key-rotated` audit event with:
+
+- `old_keyid` — HMAC-SHA256 fingerprint of the old key (16 hex chars).
+- `new_keyid` — same for the new key.
+- `kdf` — `"OsRng"` (master-key entropy source).
+- `vault_reseal_count` — number of credentials re-encrypted.
+- `agents_invalidated` — number of agent files removed.
+- `elapsed_ms` — rotation duration.
+
+Failures emit `master-key-rotation-failed` with `failure_step` (1–5
+mapping to internal Phases A–E) and `failure_reason`. Both event
+types live under the `master-key-*` namespace; review them with
+`agentsso audit | grep master-key-`.
+
+### Exit codes
+
+- **0** — rotation succeeded.
+- **3** — resource conflict (daemon running, brew-services
+  managing agentsso).
+- **4** — auth / keystore failure (passphrase adapter,
+  `set_master_key` rejected, RNG failure).
+- **5** — rotation failure during the on-disk state machine
+  (rolled back when possible; re-run `agentsso rotate-key` to
+  resume if a `.rotation.in-progress` marker is on disk).

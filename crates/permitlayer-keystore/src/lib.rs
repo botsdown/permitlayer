@@ -123,6 +123,34 @@ pub trait KeyStore: Send + Sync {
     /// just unlink the on-disk verifier file directly).
     #[must_use = "delete_master_key result must not be silently discarded"]
     async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError>;
+
+    /// Identify which adapter family backs this keystore.
+    ///
+    /// Used by `agentsso rotate-key` (Story 7.6) to refuse cleanly on
+    /// passphrase-mode hosts (which rotate by changing the passphrase,
+    /// not by minting a new key). The default impl returns
+    /// [`KeyStoreKind::Native`] — passphrase adapters override.
+    fn kind(&self) -> KeyStoreKind {
+        KeyStoreKind::Native
+    }
+}
+
+/// Adapter family — used by callers that need to branch on
+/// "is this an OS-keychain-backed keystore vs a passphrase-derived one?"
+/// (Story 7.6 rotate-key refusal). Native covers
+/// macOS Keychain Services / Linux libsecret / Windows DPAPI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyStoreKind {
+    /// OS-keychain-backed adapter: macOS Keychain Services, Linux
+    /// libsecret, or Windows DPAPI / Credential Manager. Master key
+    /// is replaceable via [`KeyStore::set_master_key`].
+    Native,
+    /// Passphrase-derived adapter: master key is `Argon2id(passphrase,
+    /// salt)`. There is no key to "rotate" — only a passphrase to
+    /// change. [`KeyStore::set_master_key`] returns
+    /// [`KeyStoreError::PassphraseAdapterImmutable`] for this adapter.
+    Passphrase,
 }
 
 /// Configuration passed by the daemon to select a keystore adapter.

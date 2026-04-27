@@ -106,6 +106,10 @@ async fn conformance_passphrase() {
     let err = ks2.set_master_key(&[0u8; MASTER_KEY_LEN]).await.unwrap_err();
     assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));
 
+    // Story 7.6: passphrase adapter advertises Passphrase kind so the
+    // rotate-key flow can refuse cleanly without a side-effect probe.
+    assert_eq!(ks2.kind(), permitlayer_keystore::KeyStoreKind::Passphrase);
+
     // delete_master_key is immutable for passphrase adapter — there's
     // no persisted entry to remove. Story 7.4's uninstall flow handles
     // this case by following up with a direct unlink of
@@ -210,12 +214,29 @@ async fn conformance_windows() {
 /// original key (tests share one well-known OS-keychain entry).
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 async fn native_conformance<K: KeyStore>(ks: &K) {
+    // 0. Story 7.6: native adapter advertises Native kind so the
+    //    rotate-key flow can detect adapter type without a side-
+    //    effect probe.
+    assert_eq!(ks.kind(), permitlayer_keystore::KeyStoreKind::Native);
+
     // 1. Read the baseline (either pre-existing or just-minted).
     let original = ks.master_key().await.unwrap();
     let original_bytes: [u8; MASTER_KEY_LEN] = *original;
 
     // 2. Idempotency.
     assert_master_key_idempotent(ks).await.unwrap();
+
+    // Story 7.6: assert the set_master_key idempotent-overwrite
+    // contract that rotate-key relies on (Phase C of the atomicity
+    // sequence). Writing the SAME bytes back must succeed and read
+    // back the same value — this is what makes Phase C safe to retry.
+    let snapshot = original_bytes;
+    ks.set_master_key(&snapshot).await.unwrap();
+    let read_after_idempotent_write = ks.master_key().await.unwrap();
+    assert_eq!(
+        &*read_after_idempotent_write, &snapshot,
+        "idempotent set_master_key with original bytes must round-trip — Story 7.6 Phase C invariant"
+    );
 
     // 3. set_master_key round-trip with a test key that's clearly
     //    not the original.

@@ -143,7 +143,18 @@ impl Vault {
     /// Shared seal implementation operating on raw bytes. Both `seal()` and
     /// `seal_refresh()` delegate here — the crypto is identical, only the
     /// wrapper type differs.
-    fn seal_bytes(&self, service: &str, plaintext: &[u8]) -> Result<SealedCredential, VaultError> {
+    ///
+    /// `pub(crate)` so the `rotation` module can perform a single-frame
+    /// reseal (unseal-with-old-vault → seal-with-new-vault) without
+    /// crossing an `OAuthToken` boundary. The `Zeroizing<Vec<u8>>` buffer
+    /// is the only plaintext exposure and lives entirely on the stack
+    /// frame of `rotation::reseal`. Outside the crate, callers use the
+    /// type-safe `seal` / `seal_refresh` wrappers.
+    pub(crate) fn seal_bytes(
+        &self,
+        service: &str,
+        plaintext: &[u8],
+    ) -> Result<SealedCredential, VaultError> {
         if service.len() > MAX_SERVICE_BYTES {
             return Err(VaultError::ServiceNameTooLong {
                 service: service.chars().take(64).collect(),
@@ -189,7 +200,10 @@ impl Vault {
     /// Shared unseal implementation returning raw bytes. Both `unseal()` and
     /// `unseal_refresh()` delegate here — the crypto is identical, only the
     /// wrapper type differs.
-    fn unseal_bytes(
+    ///
+    /// `pub(crate)` so the `rotation` module can perform single-frame
+    /// reseal — see [`Vault::seal_bytes`] for the full discipline.
+    pub(crate) fn unseal_bytes(
         &self,
         service: &str,
         sealed: &SealedCredential,

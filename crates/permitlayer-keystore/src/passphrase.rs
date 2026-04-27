@@ -62,7 +62,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::error::KeyStoreError;
-use crate::{DeleteOutcome, KeyStore, MASTER_KEY_LEN};
+use crate::{DeleteOutcome, KeyStore, KeyStoreKind, MASTER_KEY_LEN};
 
 /// OWASP 2024 interactive profile. Changing any of these values is a
 /// breaking on-disk format change.
@@ -210,6 +210,10 @@ impl KeyStore for PassphraseKeyStore {
         // `std::fs::remove_file({home}/keystore/passphrase.state)`
         // (covered by the data-dir / keystore-only wipe step).
         Err(KeyStoreError::PassphraseAdapterImmutable)
+    }
+
+    fn kind(&self) -> KeyStoreKind {
+        KeyStoreKind::Passphrase
     }
 }
 

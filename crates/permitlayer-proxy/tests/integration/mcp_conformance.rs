@@ -64,6 +64,9 @@ impl CredentialStore for MockCredentialStore {
             None => Ok(None),
         }
     }
+    async fn list_services(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self.services.keys().cloned().collect())
+    }
 }
 
 struct MockAuditStore {
