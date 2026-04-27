@@ -54,23 +54,40 @@ binary, and you can restart with `brew services start agentsso`.
 
 ### Uninstalling
 
+For a Homebrew install, `brew uninstall agentsso` is the canonical
+path — it removes the binary, the brew receipt, and tears down the
+brew-services plist if the service is running. `agentsso uninstall`
+deliberately **refuses** when it detects `brew services` is managing
+the daemon (it would otherwise leave Homebrew's plist respawning a
+missing binary at every login).
+
 ```sh
 brew services stop agentsso   # if the service is running
 brew uninstall agentsso
 brew untap permitlayer/tap    # optional
 ```
 
-`brew uninstall` does NOT remove `~/.agentsso/` — your vault,
-credentials, and audit log stay put. Remove them manually if you
-want a full clean:
+`brew uninstall` does NOT touch `~/.agentsso/` (vault, credentials,
+audit log) or your OS keychain entry. To wipe those after `brew
+uninstall`, run:
 
 ```sh
+agentsso uninstall --keep-binary --yes
+```
+
+Or, if you've already run `brew uninstall` and the binary is gone,
+clean up manually:
+
+```sh
+# Remove the OS keychain master-key entry
+security delete-generic-password -s io.permitlayer.master-key
+
+# Remove user data (vault, audit log, policies, agent registrations)
 rm -rf ~/.agentsso
 ```
 
-(This deletes encrypted credentials, the vault master key, and
-audit history. Only do this if you intend to re-run
-`agentsso setup gmail` from scratch.)
+See the [Uninstall section below](#uninstall--clean-removal) for the
+full cross-platform reference.
 
 ## macOS / Linux — curl | sh
 
@@ -190,30 +207,15 @@ schtasks /Delete /TN "AgentSSO Daemon" /F
 Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk" -ErrorAction SilentlyContinue
 ```
 
-### Uninstall — Story 7.4 will own this
-
-There is currently no `agentsso uninstall` command. To remove cleanly:
+### Uninstall
 
 ```powershell
-# Stop the daemon (if running)
-agentsso stop
-
-# Remove the binary
-Remove-Item "$env:LOCALAPPDATA\Programs\agentsso" -Recurse
-
-# Remove autostart shortcut (if you used -Autostart)
-Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk" -ErrorAction SilentlyContinue
-
-# Remove user data (vault, audit log, policies). This deletes encrypted
-# credentials and the vault master key — only do this if you want a full
-# clean re-install.
-Remove-Item "$env:APPDATA\agentsso" -Recurse -ErrorAction SilentlyContinue
-
-# Remove from user PATH (manual): open System Properties → Environment
-# Variables → User → Path, and delete the agentsso entry.
+agentsso uninstall
 ```
 
-Story 7.4 will replace all of the above with `agentsso uninstall`.
+Same flow as macOS / Linux — see the [Uninstall section
+below](#uninstall--clean-removal) for the full reference, including
+the `--keep-data`, `--keep-binary`, and `--yes` flags.
 
 ## Build from source
 
@@ -352,3 +354,145 @@ through both connecting a Google service AND deciding about autostart.
 Per-service flows (`agentsso setup gmail|calendar|drive`) skip the
 autostart prompt — they're for users scripting OAuth setup who don't
 want a follow-up question.
+
+## Uninstall — clean removal
+
+`agentsso uninstall` is a single-command teardown for the binary, the
+OS keychain master-key entry, the autostart artifact, and (optionally)
+the data directory at `~/.agentsso/`. It is **destructive by design**
+but **fail-soft per step** — a half-uninstall is worse than an
+uninstall-with-warnings, so each step warn-and-continues if it can't
+complete.
+
+### Default (full removal)
+
+```sh
+agentsso uninstall
+```
+
+Prompts:
+
+```
+This will remove:
+  • the agentsso binary at /usr/local/bin/agentsso
+  • /Users/maya/.agentsso/ (vault, audit log, policies, agent registrations)
+  • the OS keychain master-key entry (io.permitlayer.master-key / master)
+  • autostart at login (launchd, if enabled)
+
+Continue? [y/N]
+```
+
+Default answer is `n`. Press `y` + Enter to proceed. The teardown
+runs in this order:
+
+1. Stop the daemon (read PID file, SIGTERM, wait ≤10s).
+2. Disable autostart (idempotent — no-op if not enabled).
+3. Delete the OS keychain master-key entry.
+4. Remove `~/.agentsso/`.
+5. Remove the binary.
+
+The binary is last so you can re-run `agentsso uninstall` if any
+earlier step warned.
+
+### Flags
+
+| Flag | Effect |
+|------|--------|
+| `--yes` | Skip the confirmation prompt. **Required** in non-tty contexts (CI, scripts, pipes) — uninstall refuses to silently proceed in scripts. |
+| `--keep-data` | Preserve `vault/`, `audit/`, `policies/`, `agents/`, `scrub-rules/`, `plugins/`, `crashes/`, `logs/`. Still wipes `keystore/` + `agentsso.pid` (the passphrase verifier and stale PID become garbage once the master key is deleted). |
+| `--keep-binary` | Leave the agentsso binary on disk. Auto-applied for Homebrew-managed binaries (see below). |
+| `--non-interactive` | Treat as scripted invocation; implies `--yes` is required. |
+
+### Homebrew (and other package-manager) installs
+
+`agentsso uninstall` deliberately **refuses** to delete a
+Homebrew-managed binary — Homebrew owns the receipt and the
+`brew-services` plist, so removing the binary out from under brew
+would leave inconsistent state. The command detects:
+
+- A `Cellar/agentsso/<version>/` segment in `current_exe()` (Apple
+  Silicon: `/opt/homebrew/Cellar/...`; Intel: `/usr/local/Cellar/...`).
+- An `INSTALL_RECEIPT.json` in any ancestor directory.
+- `dpkg -S` or `rpm -qf` reporting package ownership on Linux.
+
+When detected, the binary step prints a warn-and-skip line pointing
+at the package manager's uninstall command. Use:
+
+```sh
+# macOS — Homebrew install:
+agentsso uninstall --keep-binary --yes   # cleans keychain + autostart + data
+brew uninstall agentsso                  # cleans the binary + brew receipt
+```
+
+If `brew services` is currently managing the daemon at uninstall
+time, `agentsso uninstall` refuses up front (exit code 3) with a
+remediation pointing you at:
+
+```sh
+brew services stop agentsso
+agentsso uninstall
+```
+
+This avoids leaving Homebrew's plist respawning the daemon at every
+login until you `brew uninstall agentsso`.
+
+### Re-install after uninstall
+
+```sh
+agentsso uninstall --yes
+curl -fsSL https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.sh | sh
+agentsso setup gmail --oauth-client ./client_secret.json
+```
+
+A clean uninstall guarantees the next install mints a fresh master
+key, creates a new vault, and hits no "passphrase verifier mismatch"
+or "vault dir exists with stale meta" errors.
+
+### Manual cleanup (when `agentsso uninstall` is unavailable)
+
+If you've lost the binary before running uninstall (e.g., you deleted
+it manually first), here's the per-platform manual sequence:
+
+**macOS / Linux:**
+
+```sh
+# 1. Stop any running daemon
+pkill -TERM agentsso
+
+# 2. Remove the OS keychain entry
+security delete-generic-password -s io.permitlayer.master-key  # macOS
+secret-tool clear service io.permitlayer.master-key            # Linux
+
+# 3. Remove autostart artifacts
+launchctl bootout gui/$(id -u)/dev.agentsso.daemon
+rm -f ~/Library/LaunchAgents/dev.agentsso.daemon.plist
+systemctl --user disable --now agentsso.service
+rm -f ~/.config/systemd/user/agentsso.service
+
+# 4. Remove user data
+rm -rf ~/.agentsso
+
+# 5. Remove the binary
+rm -f /usr/local/bin/agentsso
+```
+
+**Windows:**
+
+```powershell
+# 1. Stop the daemon
+Get-Process agentsso -ErrorAction SilentlyContinue | Stop-Process
+
+# 2. Remove the Credential Manager entry
+cmdkey /delete:io.permitlayer.master-key
+
+# 3. Remove autostart
+schtasks /Delete /TN "AgentSSO Daemon" /F
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk" -ErrorAction SilentlyContinue
+
+# 4. Remove user data + binary
+Remove-Item "$env:APPDATA\agentsso" -Recurse -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\Programs\agentsso" -Recurse -ErrorAction SilentlyContinue
+
+# 5. Remove from user PATH manually: System Properties → Environment
+#    Variables → User → Path, delete the agentsso entry.
+```

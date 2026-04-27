@@ -62,7 +62,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::error::KeyStoreError;
-use crate::{KeyStore, MASTER_KEY_LEN};
+use crate::{DeleteOutcome, KeyStore, MASTER_KEY_LEN};
 
 /// OWASP 2024 interactive profile. Changing any of these values is a
 /// breaking on-disk format change.
@@ -196,6 +196,19 @@ impl KeyStore for PassphraseKeyStore {
     }
 
     async fn set_master_key(&self, _key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
+        Err(KeyStoreError::PassphraseAdapterImmutable)
+    }
+
+    async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError> {
+        // The passphrase adapter does not persist a master-key entry
+        // anywhere — the key is re-derived from the user's passphrase
+        // on every process start. There is nothing to delete here.
+        //
+        // `agentsso uninstall` (Story 7.4) handles the passphrase case
+        // by treating `PassphraseAdapterImmutable` as "no keychain
+        // entry to remove" and following up with a direct
+        // `std::fs::remove_file({home}/keystore/passphrase.state)`
+        // (covered by the data-dir / keystore-only wipe step).
         Err(KeyStoreError::PassphraseAdapterImmutable)
     }
 }

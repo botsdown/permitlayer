@@ -36,7 +36,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use permitlayer_keystore::{KeyStore, KeyStoreError, MASTER_KEY_LEN, PassphraseKeyStore};
+use permitlayer_keystore::{
+    DeleteOutcome, KeyStore, KeyStoreError, MASTER_KEY_LEN, PassphraseKeyStore,
+};
 use tempfile::TempDir;
 
 const TEST_PASSPHRASE: &str = "test-passphrase-correct-horse";
@@ -103,6 +105,13 @@ async fn conformance_passphrase() {
     // set_master_key is immutable for passphrase adapter.
     let err = ks2.set_master_key(&[0u8; MASTER_KEY_LEN]).await.unwrap_err();
     assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));
+
+    // delete_master_key is immutable for passphrase adapter — there's
+    // no persisted entry to remove. Story 7.4's uninstall flow handles
+    // this case by following up with a direct unlink of
+    // `keystore/passphrase.state`.
+    let del_err = ks2.delete_master_key().await.unwrap_err();
+    assert!(matches!(del_err, KeyStoreError::PassphraseAdapterImmutable));
 }
 
 #[tokio::test]
@@ -218,6 +227,59 @@ async fn native_conformance<K: KeyStore>(ks: &K) {
     // 4. Restore the original key so this test is re-runnable and
     //    doesn't clobber whatever was there.
     ks.set_master_key(&original_bytes).await.unwrap();
+
+    // 5. delete_master_key round-trip for `agentsso uninstall`
+    //    (Story 7.4). After delete, the next master_key() call mints
+    //    a fresh random key (per the adapter's
+    //    `fetch_or_create_master_key` first-run path), so the
+    //    post-delete read MUST differ from `original`.
+    //
+    //    P9 (review): this section is destructive — it deletes the
+    //    `io.permitlayer.master-key/master` entry from the OS keychain
+    //    and lets the adapter auto-mint a NEW entry on the next read.
+    //    A developer running this test on their own machine would
+    //    clobber their actual master key (the dev's vault then needs
+    //    a re-seal to recover). Gate behind `AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1`
+    //    so the test is only executed in CI / dedicated test
+    //    environments. Without the env var, the steps 1-4 still run
+    //    and exercise idempotency / set / cross-restart.
+    if std::env::var("AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping native_conformance step 5 (delete_master_key destructive round-trip) — \
+             set AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1 to enable on a CI runner / dedicated host"
+        );
+        return;
+    }
+
+    let outcome = ks.delete_master_key().await.unwrap();
+    // The keychain entry existed (we just wrote it via set_master_key
+    // above), so this MUST be `Removed`.
+    assert_eq!(outcome, DeleteOutcome::Removed);
+
+    // After delete, the entry is gone. The next master_key() call
+    // hits the NoEntry branch and auto-mints a fresh random key.
+    let post_delete = ks.master_key().await.unwrap();
+    assert_ne!(
+        *post_delete, original_bytes,
+        "post-delete master_key must mint a fresh key, not return the deleted one"
+    );
+
+    // The post-delete master_key() call above auto-minted a fresh
+    // entry on the NoEntry path, so a SECOND delete here reports
+    // `Removed`, not `AlreadyAbsent`. (P8 review fix: previous comment
+    // here claimed "Idempotent re-delete returns AlreadyAbsent" but
+    // the assert immediately below is `Removed`.)
+    let outcome2 = ks.delete_master_key().await.unwrap();
+    assert_eq!(outcome2, DeleteOutcome::Removed);
+
+    // NOW the keychain entry is truly absent — a third delete is the
+    // idempotent no-op that reports `AlreadyAbsent`.
+    let outcome3 = ks.delete_master_key().await.unwrap();
+    assert_eq!(
+        outcome3,
+        DeleteOutcome::AlreadyAbsent,
+        "delete_master_key on empty keychain must report AlreadyAbsent"
+    );
 }
 
 // ================================================================

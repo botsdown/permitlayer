@@ -58,6 +58,10 @@ enum Commands {
     Connectors(cli::connectors::ConnectorsArgs),
     /// Manage opt-in autostart at login (FR7) — enable/disable/status
     Autostart(cli::autostart::AutostartArgs),
+    /// Uninstall permitlayer cleanly: stop daemon, remove keychain
+    /// entry, autostart, data dir, and binary (FR8). Destructive —
+    /// requires interactive confirmation OR --yes.
+    Uninstall(cli::uninstall::UninstallArgs),
 }
 
 /// Top-level `main` dispatcher.
@@ -105,6 +109,7 @@ async fn main() -> ExitCode {
         Some(Commands::Agent(args)) => anyhow_to_exit_code(cli::agent::run(args).await),
         Some(Commands::Connectors(args)) => anyhow_to_exit_code(cli::connectors::run(args).await),
         Some(Commands::Autostart(args)) => anyhow_to_exit_code(cli::autostart::run(args).await),
+        Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
         None => {
             use clap::CommandFactory;
             if let Err(e) = Cli::command().print_help() {
@@ -136,6 +141,40 @@ fn anyhow_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
             }
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `agentsso uninstall`-specific dispatch: same shape as
+/// [`anyhow_to_exit_code`] but recognises the
+/// `uninstall_exit_code:3` context tag the uninstall flow attaches
+/// to its brew-services pre-flight refusal (Story 7.4 AC #8).
+///
+/// Exit-code conventions per architecture.md:1023 — 3 is the
+/// resource-conflict code (the same one `cli::start::run` returns
+/// when port :3820 is already bound). Brew-services managing the
+/// daemon is morally identical: a different lifecycle owner is
+/// already in charge.
+fn uninstall_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // P10 + P11 (review): typed markers (was: substring scan
+            // for "uninstall_exit_code:3" in the error chain — could
+            // collide with operator-visible remediation text). We
+            // probe via `downcast_ref` instead of `chain().any(is::<T>)`
+            // because anyhow's `.context(C)` wraps C in an internal
+            // `ContextError<C>` struct that hides the concrete type
+            // from a chain-walk's `is::<T>()` check; downcasting
+            // through anyhow handles the wrapping correctly.
+            let exit_three = e.downcast_ref::<cli::uninstall::UninstallExitCode3>().is_some();
+            if e.downcast_ref::<cli::SilentCliError>().is_some()
+                || e.chain().any(|s| s.is::<cli::SilentCliError>())
+            {
+                return if exit_three { ExitCode::from(3) } else { ExitCode::FAILURE };
+            }
+            eprintln!("error: {e:#}");
+            if exit_three { ExitCode::from(3) } else { ExitCode::FAILURE }
         }
     }
 }

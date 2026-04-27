@@ -74,6 +74,22 @@ pub const MASTER_KEY_SERVICE: &str = "io.permitlayer.master-key";
 /// rotation (Story 7.6) introduces versioning.
 pub const MASTER_KEY_ACCOUNT: &str = "master";
 
+/// Outcome of a [`KeyStore::delete_master_key`] call.
+///
+/// Distinguishes "we removed an entry that was there" from "there was
+/// nothing to remove". Both are success — `agentsso uninstall`
+/// (Story 7.4) treats them identically — but operators benefit from
+/// the distinction in audit/log output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeleteOutcome {
+    /// An existing master-key entry was removed from the OS keychain.
+    Removed,
+    /// No entry existed for ([`MASTER_KEY_SERVICE`], [`MASTER_KEY_ACCOUNT`])
+    /// — the call was a no-op and idempotent.
+    AlreadyAbsent,
+}
+
 /// Cross-platform provider for the 32-byte master encryption key.
 ///
 /// Implementations wrap native OS keychains or derive the key from a
@@ -97,6 +113,16 @@ pub trait KeyStore: Send + Sync {
     /// input rather than persisting it.
     #[must_use = "set_master_key result must not be silently discarded"]
     async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError>;
+
+    /// Remove the persisted master-key entry from the OS keychain.
+    /// Used by `agentsso uninstall` (Story 7.4). Returns
+    /// `Ok(DeleteOutcome::Removed)` if an entry was deleted,
+    /// `Ok(DeleteOutcome::AlreadyAbsent)` if no entry existed (idempotent),
+    /// or `Err(KeyStoreError::PassphraseAdapterImmutable)` for the
+    /// passphrase adapter (no persisted entry to remove — caller should
+    /// just unlink the on-disk verifier file directly).
+    #[must_use = "delete_master_key result must not be silently discarded"]
+    async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError>;
 }
 
 /// Configuration passed by the daemon to select a keystore adapter.
@@ -250,6 +276,11 @@ mod factory_tests {
         // set_master_key on passphrase adapter must be immutable.
         let err = boxed.set_master_key(&[0u8; MASTER_KEY_LEN]).await.unwrap_err();
         assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));
+        // delete_master_key on passphrase adapter must also be
+        // immutable — the key is re-derived from a passphrase, never
+        // persisted, so there is nothing to delete.
+        let del_err = boxed.delete_master_key().await.unwrap_err();
+        assert!(matches!(del_err, KeyStoreError::PassphraseAdapterImmutable));
     }
 
     #[test]

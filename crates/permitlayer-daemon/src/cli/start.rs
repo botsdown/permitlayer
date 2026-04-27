@@ -2331,7 +2331,7 @@ fn render_policy_error(err: &PolicyCompileError) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use permitlayer_keystore::{KeyStore, KeyStoreError, MASTER_KEY_LEN};
+    use permitlayer_keystore::{DeleteOutcome, KeyStore, KeyStoreError, MASTER_KEY_LEN};
     use std::sync::Mutex;
     use zeroize::Zeroizing;
 
@@ -2421,6 +2421,15 @@ mod tests {
         async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
             *self.stored.lock().unwrap() = Some(*key);
             Ok(())
+        }
+
+        async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError> {
+            let mut slot = self.stored.lock().unwrap();
+            if slot.take().is_some() {
+                Ok(DeleteOutcome::Removed)
+            } else {
+                Ok(DeleteOutcome::AlreadyAbsent)
+            }
         }
     }
 

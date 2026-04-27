@@ -11,7 +11,7 @@
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::KeyStoreError;
-use crate::{KeyStore, MASTER_KEY_ACCOUNT, MASTER_KEY_LEN, MASTER_KEY_SERVICE};
+use crate::{DeleteOutcome, KeyStore, MASTER_KEY_ACCOUNT, MASTER_KEY_LEN, MASTER_KEY_SERVICE};
 
 const BACKEND: &str = "apple";
 
@@ -44,6 +44,24 @@ impl KeyStore for MacKeyStore {
         // spawn_blocking task finishes, not left on the heap.
         let key_copy: Zeroizing<[u8; MASTER_KEY_LEN]> = Zeroizing::new(*key);
         tokio::task::spawn_blocking(move || set_and_verify(&key_copy)).await.map_err(join_err)?
+    }
+
+    async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError> {
+        tokio::task::spawn_blocking(delete_entry).await.map_err(join_err)?
+    }
+}
+
+/// Delete the master-key entry from the macOS Keychain.
+///
+/// Tolerates `keyring::Error::NoEntry` as `AlreadyAbsent` for
+/// idempotency — `agentsso uninstall` calls this unconditionally and
+/// must succeed whether or not an entry exists.
+fn delete_entry() -> Result<DeleteOutcome, KeyStoreError> {
+    let entry = keyring::Entry::new(MASTER_KEY_SERVICE, MASTER_KEY_ACCOUNT).map_err(map_err)?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(DeleteOutcome::Removed),
+        Err(keyring::Error::NoEntry) => Ok(DeleteOutcome::AlreadyAbsent),
+        Err(e) => Err(map_err(e)),
     }
 }
 
