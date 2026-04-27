@@ -52,7 +52,34 @@ pub(crate) fn xml_record_path(home: &Path) -> PathBuf {
 
 /// Resolve the Story 7.2 Startup-folder shortcut path. Filename pinned
 /// to `agentsso.lnk` per Story 7.2 Dev Notes "Cross-story fences" item 1.
+///
+/// **P56 (code review round 5, M8):** the previous implementation
+/// hardcoded `home/AppData/Roaming/...`. Domain-joined Windows hosts
+/// often have `%APPDATA%` redirected to a network share via Folder
+/// Redirection — Story 7.2's `install.ps1` reads `$env:APPDATA`, so
+/// the install-time `.lnk` lives wherever APPDATA points, NOT
+/// necessarily under `%USERPROFILE%`. With the old hardcoded path,
+/// AC #6 (migration on `enable`) would silently fail to find +
+/// remove the shortcut on redirected profiles. Now: prefer
+/// `$env:APPDATA` when set, fall back to the home-relative path
+/// (which is what tests pass via tempdirs).
 pub(crate) fn startup_shortcut_path(home: &Path) -> PathBuf {
+    // Tests pass a tempdir via `home` and rely on the produced path
+    // landing inside that tempdir; honor that path under
+    // `cfg(test)` regardless of whether `%APPDATA%` is set in the
+    // test environment.
+    if !cfg!(test)
+        && let Ok(appdata) = std::env::var("APPDATA")
+        && !appdata.is_empty()
+    {
+        return PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join("agentsso.lnk");
+    }
     home.join("AppData")
         .join("Roaming")
         .join("Microsoft")
@@ -315,8 +342,8 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
         return Ok(AutostartStatus::Disabled);
     }
 
-    let xml = std::fs::read_to_string(&xml_path).unwrap_or_default();
-    let daemon_path = parse_command_path(&xml).unwrap_or_default();
+    let daemon_path =
+        std::fs::read_to_string(&xml_path).ok().and_then(|xml| parse_command_path(&xml));
     Ok(AutostartStatus::Enabled { artifact_path: xml_path, mechanism: MECHANISM, daemon_path })
 }
 
@@ -333,9 +360,31 @@ fn task_registered(exec: &impl Engine) -> Result<bool, AutostartError> {
     Ok(out.status.success())
 }
 
-/// Detect schtasks /Delete's "task does not exist" exit code (1).
+/// Detect schtasks /Delete's "task does not exist" outcome.
+///
+/// **P45 (code review round 5):** the previous implementation matched
+/// every exit-1 from schtasks as "already gone." But schtasks /Delete
+/// returns 1 for many failure modes — access-denied, RPC errors,
+/// group-policy refusals, malformed args — not just "task not found."
+/// Treating those as idempotent success let a corp-policy-blocked
+/// delete succeed-by-error: the operator-visible Removed outcome was
+/// reported but the registered task kept firing at every login.
+///
+/// schtasks emits the literal string `ERROR: The system cannot find
+/// the file specified.` on stderr when the task doesn't exist
+/// (verified on Windows 10 + 11, en-US locale). Match that token
+/// alongside exit 1 so other exit-1 modes surface as
+/// `ServiceManagerFailed`.
 fn task_already_gone(out: &std::process::Output) -> bool {
-    matches!(out.status.code(), Some(1))
+    if out.status.code() != Some(1) {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Lower-case + match a stable substring that survives minor
+    // wording drift across schtasks versions. The "cannot find"
+    // shape is consistent on Windows 10 + 11 + Server 2019/2022.
+    let s = stderr.to_lowercase();
+    s.contains("cannot find") || s.contains("does not exist")
 }
 
 /// Pull the daemon path out of a rendered Task XML by finding the
@@ -376,10 +425,28 @@ fn current_user_id() -> std::io::Result<String> {
              agentsso autostart enable must run from an interactive user session",
         )
     })?;
-    if let Ok(domain) = std::env::var("USERDOMAIN") {
+    // **P57 (code review round 5, M9):** Task Scheduler's `<UserId>`
+    // expects `DOMAIN\user`, an SID, or a UPN. A bare username may
+    // bind the registered task to the wrong principal on a
+    // domain-joined host with `USERDOMAIN` not set. Prefer
+    // `USERDOMAIN`; fall back to `COMPUTERNAME` (always set on a
+    // sane Windows install) so the principal is at least
+    // `LOCALMACHINE\user`. If neither is set, refuse — schtasks
+    // would silently register against an undefined principal.
+    if let Ok(domain) = std::env::var("USERDOMAIN")
+        && !domain.is_empty()
+    {
         Ok(format!("{domain}\\{username}"))
+    } else if let Ok(machine) = std::env::var("COMPUTERNAME")
+        && !machine.is_empty()
+    {
+        Ok(format!("{machine}\\{username}"))
     } else {
-        Ok(username)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "cannot determine current user principal — neither USERDOMAIN nor COMPUTERNAME \
+             is set; agentsso autostart enable must run from an interactive user session",
+        ))
     }
 }
 

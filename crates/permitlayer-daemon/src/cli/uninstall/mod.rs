@@ -1124,7 +1124,7 @@ mod tests {
         let status = AutostartStatus::Enabled {
             artifact_path: PathBuf::from("/home/maya/.config/systemd/user/agentsso.service"),
             mechanism: "systemd-user",
-            daemon_path: PathBuf::from("/usr/local/bin/agentsso"),
+            daemon_path: Some(PathBuf::from("/usr/local/bin/agentsso")),
         };
         let out = build_prompt_manifest(&args, &home, Some(&target), Some(&status));
         assert!(out.contains("This will remove:"));

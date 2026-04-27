@@ -110,7 +110,16 @@ pub enum AutostartStatus {
         /// Absolute path to the daemon binary that the artifact will
         /// invoke at login. Story 7.5 verifies this stays stable across
         /// in-place upgrades.
-        daemon_path: PathBuf,
+        ///
+        /// **P54 (code review round 5, M4):** `Option` instead of
+        /// `PathBuf` so callers can distinguish "couldn't parse the
+        /// embedded path out of the artifact" from "parsed an empty
+        /// path." The previous `unwrap_or_default()` collapsed both
+        /// to an empty `PathBuf`, breaking Story 7.5's drift-
+        /// detection contract that the dev's own Task 9 cross-story
+        /// note pinned ("detect binary-path drift via
+        /// `status().daemon_path` vs `current_exe()`").
+        daemon_path: Option<PathBuf>,
     },
 
     /// Two autostart mechanisms are active at the same time. Currently
@@ -169,13 +178,25 @@ impl Engine for RealExec {
     }
 }
 
-/// Spawn a command + read its output, killing the process if it
-/// hasn't exited within `timeout`. Pure-std implementation — no
-/// extra crate dep — using `Command::spawn` + `Child::wait_timeout`
-/// (manually polled because `wait_timeout` isn't on stable std yet).
+/// Spawn a command, drain stdout/stderr concurrently, kill if the
+/// child hasn't exited within `timeout`. Pure-std — no extra crate
+/// dep.
 ///
-/// Uses 100ms polling intervals which is plenty granular for
-/// service-manager calls (typical wall-time: <1s).
+/// **P42 (code review round 5):** the previous implementation used
+/// `try_wait`-poll-then-drain-on-exit. With piped stdio, the child
+/// blocks on the first write that overflows the OS pipe buffer
+/// (~64 KiB Linux, ~16 KiB macOS); we never drain, so the child
+/// never makes progress, and our timeout fires falsely on tools that
+/// were working correctly (e.g., `schtasks /Query` on a host with
+/// hundreds of tasks). Now: spawn reader threads for stdout/stderr
+/// and join them after `try_wait` reports exit. Pipes are drained
+/// continuously so the buffer never fills.
+///
+/// **M13 deferred genuine:** placing the child in its own process
+/// group (so SIGKILL reaches grandchildren) requires `pre_exec`,
+/// which is `unsafe`. The crate root has `#![forbid(unsafe_code)]`,
+/// which `#[allow]` cannot override at child scope. Workspace-wide
+/// policy decision — same shape as D10 in the original review.
 fn run_with_timeout(
     program: &str,
     args: &[&str],
@@ -184,30 +205,48 @@ fn run_with_timeout(
     use std::io::Read as _;
     use std::time::Instant;
 
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+
+    // Spawn reader threads to drain pipes continuously so the child
+    // never blocks on a full pipe buffer.
+    let stdout_handle = child.stdout.take().map(|mut h| {
+        std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            h.read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut h| {
+        std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            h.read_to_end(&mut buf)?;
+            Ok(buf)
+        })
+    });
+
     let start = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait()? {
-            Some(status) => {
-                // Process exited — drain stdout/stderr and return.
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut h) = child.stdout.take() {
-                    let _ = h.read_to_end(&mut stdout);
-                }
-                if let Some(mut h) = child.stderr.take() {
-                    let _ = h.read_to_end(&mut stderr);
-                }
-                return Ok(Output { status, stdout, stderr });
-            }
+            Some(status) => break status,
             None => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Drain whatever the readers captured before the
+                    // SIGKILL closed the pipes (best-effort; we drop
+                    // the data anyway, the timeout error is the signal).
+                    if let Some(h) = stdout_handle {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = stderr_handle {
+                        let _ = h.join();
+                    }
                     tracing::warn!(
                         program,
                         elapsed_ms = start.elapsed().as_millis() as u64,
@@ -221,10 +260,15 @@ fn run_with_timeout(
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-    }
+    };
+
+    let stdout = stdout_handle.and_then(|h| h.join().ok()).and_then(|r| r.ok()).unwrap_or_default();
+    let stderr = stderr_handle.and_then(|h| h.join().ok()).and_then(|r| r.ok()).unwrap_or_default();
+    Ok(Output { status, stdout, stderr })
 }
 
-/// Reject paths that aren't valid UTF-8 with a clean structured error.
+/// Reject paths that aren't valid UTF-8 *or* contain ASCII control
+/// characters with a clean structured error.
 ///
 /// **P36 (code review round 3):** the per-platform XML/plist/unit
 /// renderers used `to_string_lossy()`, which silently replaces invalid
@@ -233,15 +277,44 @@ fn run_with_timeout(
 /// opaque "file not found" instead of a clear "your daemon path
 /// contains non-UTF-8 bytes". Pre-flight check at the public API
 /// boundary so the failure surfaces before we corrupt the artifact.
+///
+/// **P51 (code review round 5, M1+M5):** POSIX paths legally contain
+/// `\n`, `\r`, NUL, and other ASCII control bytes. A newline in the
+/// daemon path renders into the systemd unit as new directives
+/// (`ExecStart=/foo\nKill=true\n/bar/agentsso` would be a directive
+/// injection sink if `current_daemon_path` ever resolves a
+/// user-writable path). Plist / Task XML parsers will silently
+/// truncate at NUL or reject non-XML-1.0 control chars. Reject any
+/// byte `< 0x20` (excluding `\t` which IS legal in XML 1.0 text)
+/// at this boundary so the failure mode is "your daemon path
+/// contains illegal characters" rather than "schtasks failed with
+/// cryptic error."
 pub(crate) fn require_utf8_path(p: &Path) -> std::io::Result<&str> {
-    p.to_str().ok_or_else(|| {
+    let s = p.to_str().ok_or_else(|| {
         std::io::Error::other(format!(
             "path contains non-UTF-8 bytes: {} — autostart cannot embed this path \
              into the platform service-manager artifact (LaunchAgent plist / \
              systemd unit / Task XML are all UTF-8 formats)",
             p.display()
         ))
-    })
+    })?;
+    if let Some(bad) = s.chars().find(|c| {
+        let v = *c as u32;
+        // Reject ASCII control chars (0x00-0x1F) except TAB (0x09).
+        // Allow LF (0x0A) and CR (0x0D)? No — they break systemd unit
+        // line parsing and inject directives. Reject everything below
+        // 0x20 except 0x09. Also reject DEL (0x7F).
+        (v < 0x20 && v != 0x09) || v == 0x7F
+    }) {
+        return Err(std::io::Error::other(format!(
+            "path contains illegal control character U+{:04X}: {} — autostart cannot \
+             embed this path into the platform service-manager artifact (newline \
+             injection / NUL truncation / XML 1.0 control-char rejection)",
+            bad as u32,
+            p.display()
+        )));
+    }
+    Ok(s)
 }
 
 /// Resolve the absolute path of the currently-running `agentsso` binary
@@ -610,6 +683,18 @@ pub(crate) fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
+        // **P60 (code review round 5, M12):** fsync the parent
+        // directory so the rename itself is durable. Without this,
+        // a crash between rename and the OS's eventual dir-flush
+        // (default ext4 ordered mode) can lose the rename — old
+        // plist/unit reappears or new path goes missing on reboot.
+        // Best-effort: silently ignore filesystems that don't
+        // support directory fsync (Windows, some FUSE mounts).
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
         Ok(())
     })();
 
@@ -711,9 +796,23 @@ mod tests {
         write_atomic(&target, "hello\n").unwrap();
         let actual = std::fs::read_to_string(&target).unwrap();
         assert_eq!(actual, "hello\n");
-        // The temp file should not be left behind.
-        let tmp_file = target.with_extension("tmp");
-        assert!(!tmp_file.exists(), "expected {} to be removed", tmp_file.display());
+        // **P62 (code review round 5, D2-promoted):** the previous
+        // assertion looked for `target.with_extension("tmp")` (i.e.,
+        // `output.tmp`), but the real code uses `<name>.tmp.<pid>`
+        // (P3 + P4 fix). The old check ALWAYS passed because that
+        // file never existed under any code path — false confidence.
+        // Walk the parent dir and assert that no sibling file starts
+        // with `<basename>.tmp.` so any future regression that stops
+        // cleaning up after a successful write is caught.
+        let parent = target.parent().unwrap();
+        let basename = target.file_name().unwrap().to_string_lossy();
+        let leaked: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{basename}.tmp.")))
+            .map(|e| e.path())
+            .collect();
+        assert!(leaked.is_empty(), "leaked tmp files: {leaked:?}");
     }
 
     #[test]
@@ -741,7 +840,7 @@ mod tests {
         let enabled = AutostartStatus::Enabled {
             artifact_path: "/tmp/x".into(),
             mechanism: "launchd",
-            daemon_path: "/usr/local/bin/agentsso".into(),
+            daemon_path: Some("/usr/local/bin/agentsso".into()),
         };
         assert!(!disabled.is_enabled());
         assert!(!conflict.is_enabled());

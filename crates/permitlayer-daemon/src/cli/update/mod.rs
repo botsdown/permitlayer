@@ -695,7 +695,11 @@ async fn run_apply(args: UpdateArgs) -> Result<()> {
     .await;
 
     // ── Step 12: Re-write autostart artifact if path drifted ───────
-    if let Ok(AutostartStatus::Enabled { daemon_path, .. }) = autostart::status()
+    // **P54 (M4):** `daemon_path` is `Option<PathBuf>` — only attempt
+    // drift detection when we actually parsed a path. `None` means
+    // the artifact was hand-edited or corrupt; we leave that for the
+    // operator to fix rather than blowing it away here.
+    if let Ok(AutostartStatus::Enabled { daemon_path: Some(daemon_path), .. }) = autostart::status()
         && daemon_path != swap_paths.current
     {
         tracing::info!(

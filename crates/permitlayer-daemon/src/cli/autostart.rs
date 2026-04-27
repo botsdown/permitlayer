@@ -68,11 +68,22 @@ pub enum AutostartCommand {
 
 /// Run the `autostart` subcommand. Mirrors the per-subcommand entry-
 /// point convention used by `cli::reload::run` etc.
+///
+/// **P47 (code review round 5):** the underlying `autostart::*`
+/// functions are sync and poll subprocesses for up to 30s each. To
+/// keep the tokio runtime making progress, dispatch each subcommand
+/// through `spawn_blocking`.
 pub async fn run(args: AutostartArgs) -> Result<()> {
     match args.command {
-        AutostartCommand::Enable => run_enable(),
-        AutostartCommand::Disable => run_disable(),
-        AutostartCommand::Status => run_status(),
+        AutostartCommand::Enable => tokio::task::spawn_blocking(run_enable)
+            .await
+            .map_err(|e| anyhow::anyhow!("autostart enable join failed: {e}"))?,
+        AutostartCommand::Disable => tokio::task::spawn_blocking(run_disable)
+            .await
+            .map_err(|e| anyhow::anyhow!("autostart disable join failed: {e}"))?,
+        AutostartCommand::Status => tokio::task::spawn_blocking(run_status)
+            .await
+            .map_err(|e| anyhow::anyhow!("autostart status join failed: {e}"))?,
     }
 }
 
@@ -116,15 +127,18 @@ pub(crate) fn render_enable_outcome(outcome: Result<EnableOutcome, AutostartErro
             Ok(())
         }
         Ok(EnableOutcome::MigratedFromStartupShortcut { artifact_path, removed_shortcut }) => {
-            // Two step lines: migration first, then enable.
+            // **P49 (code review round 5):** AC #6 invariant says ONE
+            // info-level line for the migration outcome. Previous
+            // code emitted two step lines (migration + enable) which
+            // violated the spec wording. Collapse to a single
+            // `→ migrating autostart  ✓ ...` line that names both the
+            // shortcut removal and the Task Scheduler registration.
             println!(
-                "{} migrating autostart  {} removed Story 7.2 shortcut at {}",
-                g.arrow,
-                g.check,
-                removed_shortcut.display()
+                "{} migrating autostart  {} removed Story 7.2 Startup-folder shortcut, registered Task Scheduler entry instead",
+                g.arrow, g.check
             );
-            println!("{} enabling autostart  {} task-scheduler", g.arrow, g.check);
             println!("  artifact: {}", artifact_path.display());
+            println!("  removed: {}", removed_shortcut.display());
             println!("  next: agentsso autostart status");
             Ok(())
         }
@@ -179,7 +193,27 @@ pub(crate) fn render_enable_outcome(outcome: Result<EnableOutcome, AutostartErro
             );
             Err(silent_cli_error("service-manager failed during enable"))
         }
-        Err(other) => Err(other.into()),
+        Err(AutostartError::Io(ref e)) => {
+            // **P50 (code review round 5):** the previous catch-all
+            // arm `Err(other) => Err(other.into())` propagated `Io`
+            // failures as a raw anyhow chain printed by the top-level
+            // dispatcher — inconsistent UX vs every other variant
+            // here. Render a structured error block with a stable
+            // code so operators can grep for it the same way they
+            // grep for `autostart_service_manager_failed`.
+            let message = format!("filesystem operation failed: {e}");
+            eprint!(
+                "{}",
+                render::error_block(
+                    "autostart_io_failed",
+                    &message,
+                    "check ~/.agentsso, ~/Library/LaunchAgents, ~/.config/systemd/user, \
+                     and the daemon binary path are readable + writable",
+                    None,
+                )
+            );
+            Err(silent_cli_error("filesystem failure during enable"))
+        }
     }
 }
 
@@ -233,7 +267,14 @@ fn run_status() -> Result<()> {
             println!("autostart: enabled");
             println!("  mechanism:   {mechanism}");
             println!("  artifact:    {}", artifact_path.display());
-            println!("  daemon path: {}", daemon_path.display());
+            // **P54 (M4):** `daemon_path` is `Option<PathBuf>` — `None`
+            // means we couldn't extract the binary path from the
+            // artifact (corrupt / hand-edited / parser miss). Render
+            // distinctly so an operator can see the parse failure.
+            match &daemon_path {
+                Some(p) => println!("  daemon path: {}", p.display()),
+                None => println!("  daemon path: (could not parse from artifact)"),
+            }
         }
         Ok(AutostartStatus::Conflict { detail }) => {
             // Per AC #3: conflict still exits 0 (status is informational,

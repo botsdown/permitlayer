@@ -143,10 +143,29 @@ pub(crate) fn disable(exec: &impl Engine, home: &Path) -> Result<DisableOutcome,
     // disable --now: stops + removes from default.target. systemctl
     // returns 5 ("Unit not found" / "no such file") if the unit was
     // never enabled — treat as success for idempotency.
+    //
+    // **P59 (code review round 5, M11):** if the user-systemd manager
+    // is unreachable (D-Bus crashed, post-logout, container without a
+    // user-bus), `systemctl --user disable` returns code 1 with
+    // "Failed to connect to bus" on stderr. The previous code hard-
+    // failed in that case, so the operator couldn't remove a stale
+    // unit file just because the bus was offline. Now: detect the
+    // bus-unreachable shape and fall through to file removal with a
+    // logged warning.
     let args = ["--user", "disable", "--now", UNIT_NAME];
     let out = exec.run("systemctl", &args)?;
     if !out.status.success() && out.status.code() != Some(5) {
-        return Err(service_manager_failed("systemctl", &args, &out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let bus_offline = stderr.contains("Failed to connect to bus")
+            || stderr.contains("No such file or directory") && stderr.contains("dbus");
+        if !bus_offline {
+            return Err(service_manager_failed("systemctl", &args, &out));
+        }
+        tracing::warn!(
+            stderr = %stderr.trim(),
+            "systemctl --user disable failed because the user-bus is unreachable; \
+             removing the unit file anyway so disable is idempotent"
+        );
     }
 
     std::fs::remove_file(&unit)?;
@@ -173,17 +192,45 @@ pub(crate) fn disable(exec: &impl Engine, home: &Path) -> Result<DisableOutcome,
 /// daemon would never auto-start.
 pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus, AutostartError> {
     let unit = unit_path(home);
-    if !unit.exists() {
+    // **P63 (code review round 5, D4-promoted):** reject symlinks at
+    // the expected unit path — see macos.rs for rationale. The
+    // autostart subsystem only writes regular files via
+    // `write_atomic`; a symlink here means out-of-band edit and
+    // surfacing a daemon_path through it would break Story 7.5
+    // drift detection.
+    let unit_present = match std::fs::symlink_metadata(&unit) {
+        Ok(meta) => meta.file_type().is_file(),
+        Err(_) => false,
+    };
+    if !unit_present {
         return Ok(AutostartStatus::Disabled);
     }
 
-    // P35: probe systemd. `is-enabled` returns 0 when the unit is
-    // enabled (or `linked`/`static`/`alias`), non-zero otherwise. If
-    // systemctl is unavailable, fall back to file-presence — the
-    // `enable` path would have refused that host anyway.
+    // P35: probe systemd. `is-enabled` returns 0 + a state string
+    // on stdout for any of: `enabled`, `enabled-runtime`, `linked`,
+    // `linked-runtime`, `alias`, `static`, `indirect`, `generated`,
+    // `transient`. Non-zero exit indicates `disabled`, `masked`, or
+    // a bus failure.
+    //
+    // **P58 (code review round 5, M10):** the previous code matched
+    // any exit-0 as "enabled", which let `static`, `linked`, and
+    // `masked`-via-stdout (some systemd versions return 0 +
+    // "masked" in unusual configurations) all report Enabled. But
+    // `static` units lack `[Install]`, so they NEVER auto-start at
+    // login — operators editing the unit to remove `[Install]`
+    // would see misleading "enabled" status. Match the literal
+    // `enabled` / `enabled-runtime` stdout tokens explicitly.
     let probe_args = ["--user", "is-enabled", UNIT_NAME];
     let enabled_in_systemd = match exec.run("systemctl", &probe_args) {
-        Ok(out) => out.status.success(),
+        Ok(out) => {
+            if !out.status.success() {
+                false
+            } else {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let token = stdout.trim();
+                token == "enabled" || token == "enabled-runtime"
+            }
+        }
         Err(_) => true, // systemctl missing → trust the file
     };
     if !enabled_in_systemd {
@@ -191,7 +238,7 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
     }
 
     let body = std::fs::read_to_string(&unit)?;
-    let daemon_path = parse_exec_start(&body).unwrap_or_default();
+    let daemon_path = parse_exec_start(&body);
     Ok(AutostartStatus::Enabled { artifact_path: unit, mechanism: MECHANISM, daemon_path })
 }
 
@@ -263,12 +310,23 @@ fn parse_exec_start(body: &str) -> Option<PathBuf> {
     for line in body.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("ExecStart=") {
-            // Strip exactly the trailing ` start` subcommand marker;
-            // anything before it is the daemon path (which may itself
-            // contain spaces or the literal substring " start").
+            // Take the prefix before the FINAL ` start`. Anything
+            // after ` start` is treated as additional CLI args and
+            // discarded — see P46 below. If there's no ` start` at
+            // all, return the whole rest (legacy fallback for
+            // hand-edited units).
+            //
+            // **P46 (code review round 5):** the previous form
+            // `match rest.rsplit_once(" start") { Some((p, "")) => p,
+            //   _ => rest }` only stripped the suffix when nothing
+            // followed it. A future Story-7.5 ExecStart of the form
+            // `/path/agentsso start --some-flag` would then return
+            // the entire line including ` start --some-flag` as the
+            // daemon_path, breaking drift detection. Now we always
+            // take the prefix when ` start` is present.
             let path = match rest.rsplit_once(" start") {
-                Some((path, "")) => path,
-                _ => rest, // no trailing " start" — return the whole rest.
+                Some((path, _suffix)) => path,
+                None => rest,
             };
             return Some(PathBuf::from(path));
         }

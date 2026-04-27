@@ -237,7 +237,14 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     }
 
     // Build the shared teal theme for all Phase 1/2 interactive prompts.
-    let teal_theme = build_teal_theme(&theme);
+    // **P61 (code review round 5, D1-promoted):** wrap the per-service
+    // `dialoguer.interact()` calls in `tokio::task::spawn_blocking` to
+    // match P32's posture for the orchestrator. dialoguer is sync and
+    // blocks on stdin; calling it directly inside a `#[tokio::main]`
+    // runtime stalls an executor thread until the user types. The
+    // theme is shared across phases via `Arc` so each `spawn_blocking`
+    // closure can take ownership of a clone.
+    let teal_theme = std::sync::Arc::new(build_teal_theme(&theme));
 
     // ── Phase 1: Scope preview + overwrite confirmation ─────────────────
 
@@ -251,10 +258,15 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             println!(
                 "  {styled_service} is already connected \u{00b7} re-running will replace existing credentials"
             );
-            let confirm = dialoguer::Confirm::with_theme(&teal_theme)
-                .with_prompt("replace existing credentials?")
-                .default(false)
-                .interact()?;
+            let theme_clone = teal_theme.clone();
+            let confirm = tokio::task::spawn_blocking(move || {
+                dialoguer::Confirm::with_theme(&*theme_clone)
+                    .with_prompt("replace existing credentials?")
+                    .default(false)
+                    .interact()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("setup overwrite-confirm join failed: {e}"))??;
             if !confirm {
                 println!("  setup cancelled");
                 return Ok(());
@@ -295,10 +307,16 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // ── Phase 2: Confirm ────────────────────────────────────────────────
 
     if interactive {
-        let confirm = dialoguer::Confirm::with_theme(&teal_theme)
-            .with_prompt("open browser for Google consent?")
-            .default(false)
-            .interact()?;
+        // P61: wrap in spawn_blocking — see Phase 1 above.
+        let theme_clone = teal_theme.clone();
+        let confirm = tokio::task::spawn_blocking(move || {
+            dialoguer::Confirm::with_theme(&*theme_clone)
+                .with_prompt("open browser for Google consent?")
+                .default(false)
+                .interact()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("setup browser-confirm join failed: {e}"))??;
 
         if !confirm {
             println!("  setup cancelled");
@@ -507,7 +525,14 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // decline is non-blocking: the wizard returns `Ok(())` exactly
     // as today.
     if interactive {
-        let accepted = prompt_start_audit_follow(&teal_theme)?;
+        // P61: `prompt_start_audit_follow` is itself sync and contains
+        // a real `dialoguer.interact()` blocking call; wrap in
+        // `spawn_blocking`. The early-return test seam at the top of
+        // the helper still works since it does no blocking IO.
+        let theme_clone = teal_theme.clone();
+        let accepted = tokio::task::spawn_blocking(move || prompt_start_audit_follow(&theme_clone))
+            .await
+            .map_err(|e| anyhow::anyhow!("prompt_start_audit_follow join failed: {e}"))??;
         if accepted {
             // In-process dispatch: no subprocess, no double daemon
             // handle leak. `AuditArgs::default()` produces the
@@ -904,11 +929,13 @@ fn non_interactive_skip_reason(force: bool) -> &'static str {
 // dispatching back into [`run`], then offers OPT-IN autostart with
 // `default = NO` (per AC #5).
 //
-// `--non-interactive` here is a hard error: the orchestrator's whole
-// purpose is the interactive prompts; CI/scripted callers should pass
-// `agentsso setup gmail` directly. Refusing here gives a clean
-// `setup_service_required` error rather than silently inferring a
-// service.
+// **P52 (code review round 5, M3):** `--non-interactive` previously
+// hard-errored here. Per AC #5 letter — *"Skipping the prompt
+// (`--non-interactive`) leaves autostart disabled"* — the correct
+// behavior is "skip and exit 0," not error. The orchestrator now
+// short-circuits with a clean `autostart: skipped (--non-interactive)`
+// line. Scripted callers that need a service arg still get a clear
+// remediation hint via the trailing `agentsso setup gmail` message.
 // ─────────────────────────────────────────────────────────────────────
 
 /// Services the per-service path validates and the orchestrator
@@ -921,22 +948,21 @@ async fn run_orchestrator(args: SetupArgs) -> anyhow::Result<()> {
     use crate::design::render;
 
     if args.non_interactive {
-        eprint!(
-            "{}",
-            render::error_block(
-                "setup_service_required",
-                "no service argument provided and --non-interactive is set",
-                "agentsso setup gmail   # (or calendar | drive)",
-                None,
-            )
-        );
-        return Err(crate::cli::silent_cli_error(
-            "non-interactive setup invoked without a service",
-        ));
+        // P52 (M3): skip cleanly with exit 0 per AC #5 letter.
+        // Print a message so an operator inspecting CI logs can see
+        // that this path was hit (no silent-no-op).
+        println!("autostart: skipped (--non-interactive, no service)");
+        println!("  to actually run setup non-interactively, pass an explicit service:");
+        println!("    agentsso setup gmail --non-interactive   # (or calendar | drive)");
+        return Ok(());
     }
 
-    let stdout_is_tty = console::Term::stdout().is_term();
-    if !stdout_is_tty {
+    // **P53 (M14):** the previous TTY check only verified stdout. A
+    // user running `echo 0 | agentsso setup` could have stdout still
+    // attached to a terminal but stdin redirected — `dialoguer::Select`
+    // would silently read piped input and pick a service unexpectedly.
+    // Use `console::user_attended()` which checks both.
+    if !console::user_attended() {
         // P22 (code review): rename from `setup_non_interactive_required`
         // to `setup_orchestrator_requires_tty` so operators grepping
         // logs can distinguish the orchestrator-specific TTY error from
@@ -944,17 +970,21 @@ async fn run_orchestrator(args: SetupArgs) -> anyhow::Result<()> {
         // means "you piped per-service setup without --non-interactive").
         // The remediation differs: orchestrator → use a real terminal
         // OR pass an explicit service arg; per-service → add the flag.
+        //
+        // **P53 (M14):** the message used to say "stdout is not a
+        // terminal" but `console::user_attended()` checks both stdin
+        // and stdout. Reword to match.
         eprint!(
             "{}",
             render::error_block(
                 "setup_orchestrator_requires_tty",
-                "stdout is not a terminal — the orchestrator's interactive picker can't run; \
-                 either run from a real terminal or pass an explicit service arg",
+                "stdin or stdout is not a terminal — the orchestrator's interactive picker \
+                 can't run; either run from a real terminal or pass an explicit service arg",
                 "agentsso setup gmail   # (or calendar | drive)",
                 None,
             )
         );
-        return Err(crate::cli::silent_cli_error("orchestrator invoked with stdout not a tty"));
+        return Err(crate::cli::silent_cli_error("orchestrator invoked without a tty"));
     }
 
     // P34 (code review round 3): build the same teal-themed
@@ -1030,12 +1060,24 @@ async fn run_orchestrator(args: SetupArgs) -> anyhow::Result<()> {
         // structured error-rendering helper the `agentsso autostart
         // enable` CLI uses, so an orchestrator-side autostart failure
         // produces the same `error_block` an operator gets from the
-        // direct CLI surface (with structured codes for grep). The
-        // helper returns Err on autostart failure; here we
-        // intentionally swallow that Err — OAuth setup already
-        // succeeded, the autostart prompt is sugar on top, and the
-        // user can retry via `agentsso autostart enable` standalone.
-        let outcome = crate::lifecycle::autostart::enable();
+        // direct CLI surface (with structured codes for grep).
+        //
+        // **P47 (code review round 5):** `lifecycle::autostart::enable`
+        // is a sync function that polls subprocesses for up to 30s
+        // each (brew probe + bootstrap; on macOS up to ~90s total in
+        // the worst case). Calling it directly from this async fn
+        // burns a tokio worker for the duration. Wrap in
+        // `spawn_blocking` matching P32's posture for dialoguer.
+        let outcome = tokio::task::spawn_blocking(crate::lifecycle::autostart::enable)
+            .await
+            .map_err(|e| anyhow::anyhow!("autostart enable join failed: {e}"))?;
+        // **P48 (M7):** propagate `Io` errors so automation can detect
+        // filesystem failures via process exit code. User-recoverable
+        // errors (BrewServicesActive, SystemdUnavailable, etc.) are
+        // still rendered as warnings without aborting setup, since
+        // OAuth already succeeded.
+        let is_io_failure =
+            matches!(&outcome, Err(crate::lifecycle::autostart::AutostartError::Io(_)));
         if let Err(e) = crate::cli::autostart::render_enable_outcome(outcome) {
             // The structured error block was already rendered by the
             // helper. Just append the "OAuth still ok" reassurance.
@@ -1044,6 +1086,9 @@ async fn run_orchestrator(args: SetupArgs) -> anyhow::Result<()> {
                 "(OAuth setup succeeded; you can retry autostart later \
                            with `agentsso autostart enable`.)"
             );
+            if is_io_failure {
+                return Err(e);
+            }
         }
     } else {
         println!("autostart: skipped (off by default)");

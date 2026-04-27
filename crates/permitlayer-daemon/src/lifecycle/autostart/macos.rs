@@ -165,7 +165,25 @@ pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, A
     let args = ["bootstrap", target.as_str(), plist_arg];
     let out = exec.run("launchctl", &args)?;
     if !out.status.success() && !already_loaded(&out) {
-        return Err(service_manager_failed("launchctl", &args, &out));
+        // **P44 (code review round 5):** exit 119 ("Service is disabled")
+        // means the agent IS bootstrapped but launchd has it disabled
+        // (operator ran `launchctl disable` manually at some point). The
+        // daemon will NOT start at login until we clear that flag. The
+        // previous code conflated 119 with "already loaded" and silently
+        // reported success — direct AC #1 violation. Now: detect 119,
+        // run `launchctl enable gui/$UID/<label>` to clear the flag,
+        // then recover. Bootstrap is not re-run because the agent is
+        // already known to launchd; clearing the disable is enough.
+        if out.status.code() == Some(119) {
+            let enable_target = format!("gui/{user}/{LAUNCHD_LABEL}");
+            let enable_args = ["enable", enable_target.as_str()];
+            let enable_out = exec.run("launchctl", &enable_args)?;
+            if !enable_out.status.success() {
+                return Err(service_manager_failed("launchctl", &enable_args, &enable_out));
+            }
+        } else {
+            return Err(service_manager_failed("launchctl", &args, &out));
+        }
     }
 
     if unchanged {
@@ -223,7 +241,19 @@ pub(crate) fn disable(exec: &impl Engine, home: &Path) -> Result<DisableOutcome,
 /// auto-start.
 pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus, AutostartError> {
     let plist = plist_path(home);
-    let plist_present = plist.exists();
+    // **P63 (code review round 5, D4-promoted):** a symlink at the
+    // expected plist path is suspicious — the autostart subsystem
+    // only ever writes regular files via `write_atomic` (which uses
+    // `create_new(true)` and refuses to follow symlinks). A symlink
+    // means an operator manually replaced the artifact, OR something
+    // outside our control put one there. Reading through the symlink
+    // would surface a `daemon_path` from an unrelated file and break
+    // Story 7.5's drift detection. Treat any non-regular-file
+    // artifact as Disabled.
+    let plist_present = match std::fs::symlink_metadata(&plist) {
+        Ok(meta) => meta.file_type().is_file(),
+        Err(_) => false,
+    };
     let brew_active = brew_services_active(exec).unwrap_or(false);
 
     // Conflict detection runs FIRST so a brew-services-active +
@@ -250,17 +280,21 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
     // `agentsso autostart enable` to fix.
     let user = match current_user_id() {
         Ok(uid) => uid,
-        // If we can't even determine the uid (root without SUDO_UID),
-        // we can't probe launchd. Fall back to file-presence — the
-        // `enable` path would have refused this state anyway.
+        // **P55 (code review round 5, D3-promoted):** previous code
+        // fell back to "file-presence == Enabled" when uid resolution
+        // failed (e.g., logged-in-as-root with no SUDO_UID). That
+        // directly contradicts P35's invariant that file existence
+        // is NOT authoritative — a leftover plist from a failed prior
+        // install would falsely report Enabled to a root user. Now:
+        // when we can't probe launchd, report Disabled and warn so
+        // an operator monitoring tracing can see that a probe was
+        // skipped.
         Err(_) => {
-            let xml = std::fs::read_to_string(&plist)?;
-            let daemon_path = parse_program_path(&xml).unwrap_or_default();
-            return Ok(AutostartStatus::Enabled {
-                artifact_path: plist,
-                mechanism: MECHANISM,
-                daemon_path,
-            });
+            tracing::warn!(
+                "autostart status: cannot resolve uid (running as root with no SUDO_UID?); \
+                 reporting Disabled — file presence alone is not authoritative"
+            );
+            return Ok(AutostartStatus::Disabled);
         }
     };
     let target = format!("gui/{user}/{LAUNCHD_LABEL}");
@@ -280,7 +314,7 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
     // structured XML; we do a narrow grep rather than depending on the
     // `plist` crate.
     let xml = std::fs::read_to_string(&plist)?;
-    let daemon_path = parse_program_path(&xml).unwrap_or_default();
+    let daemon_path = parse_program_path(&xml);
     Ok(AutostartStatus::Enabled { artifact_path: plist, mechanism: MECHANISM, daemon_path })
 }
 
@@ -288,14 +322,18 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
 /// entry. Returns `Ok(false)` if `brew` isn't on PATH (most common
 /// case for non-Homebrew users).
 ///
-/// **P37 (code review round 3):** the probe runs in production via
-/// [`std::process::Command::output`], which has no native timeout.
-/// Wrapping it would require `Sync`-bounded `Engine` + `thread::scope`
-/// — but `MockExec` uses `RefCell` which is `!Sync`, so adding the
-/// bound breaks all unit tests. Instead, the **production-only** path
-/// uses [`Command::output`] with a process-group SIGKILL after 5s via
-/// the `wait_with_timeout` helper below. The `MockExec` test path
-/// returns immediately. This keeps the trait `Sync`-free.
+/// **P37 (code review round 3):** the production probe goes through
+/// [`Engine::run`], which is implemented for [`super::RealExec`] via
+/// the shared `super::run_with_timeout` helper at the module level.
+/// The helper drains stdout/stderr via reader threads (P42) and
+/// kills the child after 30 s. The `MockExec` test path returns
+/// immediately and bypasses the timeout. The trait stays `!Sync`
+/// because `MockExec`'s `RefCell` is `!Sync`.
+///
+/// **H6 (code review round 5):** this comment previously claimed
+/// `Command::output` was used directly with a 5-second SIGKILL via
+/// a `wait_with_timeout` helper that didn't exist. Updated to
+/// reflect the actual `RealExec::run` + 30-second timeout.
 fn brew_services_active(exec: &impl Engine) -> Result<bool, AutostartError> {
     let args = ["services", "list", "--json"];
     let out = match exec.run("brew", &args) {
@@ -387,16 +425,14 @@ fn parse_program_path(xml: &str) -> Option<PathBuf> {
 /// - **17 = EEXIST "File exists"** — the canonical "already loaded"
 ///   code on macOS 13+; bootstrap returns this when the label is
 ///   already known to launchd.
-/// - **119 = "Service is disabled"** — the agent IS bootstrapped but
-///   launchd has it disabled (e.g., `launchctl disable` was run
-///   manually). Treat as "already loaded" for our purposes — the user
-///   can re-enable via `launchctl enable`.
 ///
-/// The previous code matched `5` (which decodes to `EIO "I/O error"` —
-/// NOT "already loaded"; a real bootstrap I/O error would have been
-/// silently swallowed). Removed.
+/// **P44 (round 5):** exit 119 ("Service is disabled") was previously
+/// matched here as success — but a disabled service does NOT start at
+/// login, so we silently violated AC #1. The bootstrap path now
+/// detects 119 separately and runs `launchctl enable` to clear the
+/// flag before reporting success.
 fn already_loaded(out: &Output) -> bool {
-    matches!(out.status.code(), Some(17) | Some(119))
+    matches!(out.status.code(), Some(17))
 }
 
 /// Detect launchctl bootout's "service not loaded" exit code.
