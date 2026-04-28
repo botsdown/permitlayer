@@ -1,35 +1,67 @@
-//! `agentsso rotate-key` — master-key rotation for Story 7.6 (FR17).
+//! `agentsso rotate-key` — master-key rotation for Story 7.6b (FR17).
 //!
 //! Rotates the 32-byte master key that protects the vault, re-encrypts
-//! every sealed credential under the new key, and rebuilds the agent-
-//! registry HMAC lookup index. The user keeps every Google connection;
-//! no re-OAuth-consent is required.
+//! every sealed credential under the new key, and re-issues every
+//! agent's bearer token under the new master-derived subkey. The user
+//! keeps every Google connection; no re-OAuth-consent is required.
+//! Each agent's existing v1 token is invalidated and replaced with a
+//! fresh `agt_v2_<name>_<random>` token printed to stdout for the
+//! operator to copy into agent configs.
 //!
-//! See `_bmad-output/implementation-artifacts/7-6-rotate-key.md` for
-//! the spec, the four strategic-question defaults (Q1–Q4), and the
-//! cross-story fences inherited from Stories 1.2 / 1.3 / 1.15 / 7.4 /
-//! 7.5.
+//! See `_bmad-output/implementation-artifacts/7-6b-rotate-key-v2.md`
+//! for the spec, the four strategic-question decisions (Q1–Q4), and
+//! the cross-story fences inherited from Stories 1.2 / 1.3 / 1.15 /
+//! 7.4 / 7.5 / 7.6a / 8.8b.
 //!
-//! # Atomicity sequence (Phases A–F)
+//! # Atomicity sequence (Phases A–G)
 //!
 //! Reproduced here for the dev's eye-line; full table is in the spec's
-//! Dev Notes "Order of operations is the load-bearing invariant":
+//! Dev Notes "Crash-recovery state classification":
 //!
-//! - **A. Re-seal alongside old.** For each credential in the vault,
-//!   `unseal_old → seal_new`, write to `<service>.sealed.new`. Old
-//!   `.sealed` files untouched. Crash here: orphaned `.sealed.new`,
-//!   recoverable to OLD state.
-//! - **B. Write `.rotation.in-progress` marker.** Records both keyids,
-//!   timestamp, sealed-count. Atomic write + dir fsync.
-//! - **C. Keystore swap.** `keystore.set_master_key(new)`. **Pivot.**
-//!   Crash before ⇒ recoverable to OLD; crash after ⇒ resume forward
-//!   to NEW.
-//! - **D. Rename `.sealed.new → .sealed`.** One atomic rename per
-//!   service. Idempotent (resume re-runs).
-//! - **E. Rebuild agent registry HMACs.** Re-derive every agent's
-//!   `lookup_hmac` field under the new master key.
-//! - **F. Cleanup.** Delete `.rotation.in-progress`. Emit
-//!   `master-key-rotated` audit event.
+//! - **A. VaultLock acquire.** `VaultLock::try_acquire(home)`. On
+//!   `VaultLockError::Busy` refuse with `RotateKeyExitCode3` +
+//!   structured holder info. The lock is held through Phase G.
+//! - **B. Read keystore + probe.** Read the OLD primary master key.
+//!   Read the rotation-state marker from `<home>/vault/.rotation-state`.
+//!   If present → resume from `marker.keystore_phase` (the marker is
+//!   the AUTHORITATIVE record of in-flight state — the keystore is
+//!   inspected only to read-back-verify each step). If absent and
+//!   `previous_master_key()` returns None → fresh rotation. If absent
+//!   but previous-slot is populated → REFUSE: ambiguous state, escape
+//!   hatch is `agentsso keystore-clear-previous`.
+//! - **B'. Resume from marker.** Per-phase recovery:
+//!   - `pre-previous` → re-run Phase C' from step 1.
+//!   - `pre-primary` → REFUSE: NEW key bytes were lost in the crashed
+//!     process and cannot be reconstructed. Operator clears the
+//!     marker + previous slot to abandon the rotation.
+//!   - `committed` → keystore is fully staged; proceed to Phase D.
+//! - **C. Mint new key.** `MasterKey::generate()`; check
+//!   `new_key_id = old_key_id.checked_add(1)`.
+//! - **C'. Marker-staged dual-slot install.** Three sub-steps, each
+//!   marker-fenced and read-back-verified:
+//!   1. Write marker `pre-previous(old_kid, new_kid)` and fsync.
+//!   2. `keystore.set_previous_master_key(OLD)` then read back and
+//!      verify equality with OLD.
+//!   3. Write marker `pre-primary` and fsync.
+//!   4. `keystore.set_master_key(NEW)` then read back and verify
+//!      equality with NEW (and previous still equals OLD).
+//!   5. Write marker `committed` and fsync.
+//!
+//!   From step 5 until Phase F, every crash is recoverable.
+//! - **D. Per-envelope reseal under VaultLock.** For each envelope:
+//!   if at `new_key_id` already → skip (resume idempotent); if at
+//!   `old_key_id` → reseal under NEW; else surface `RotateKeyExitCode5`.
+//! - **E. Agent registry rebuild.** Per agent: recompute
+//!   `lookup_key_hex` under the new daemon subkey, mint a fresh v2
+//!   bearer token, atomic-rewrite the agent file. Idempotent: an
+//!   already-rewritten agent (lookup_key matches new subkey) is
+//!   skipped.
+//! - **F. Clear previous-key slot.**
+//!   `keystore.clear_previous_master_key()`. Rotation is now logically
+//!   complete.
+//! - **G. Audit + cleanup.** Drop the `VaultLock`; emit
+//!   `master-key-rotated` audit event; print success line + new
+//!   bearer tokens.
 
 use std::path::Path;
 use std::time::Instant;
@@ -42,12 +74,11 @@ use crate::design::render;
 use crate::design::terminal::ColorSupport;
 use permitlayer_keystore::{FallbackMode, KeyStoreKind, KeystoreConfig, default_keystore};
 
-mod resume;
+pub(crate) mod keystore_clear_previous;
+pub(crate) mod marker;
 mod rotation;
-mod state;
 
 pub(crate) use rotation::run_rotation;
-pub(crate) use state::ROTATION_MARKER_FILENAME;
 
 // ── Typed exit-code markers (AC #9) ────────────────────────────────
 //
@@ -57,9 +88,7 @@ pub(crate) use state::ROTATION_MARKER_FILENAME;
 // colliding with operator-visible remediation text.
 
 /// Exit-code 3 marker — resource conflict (daemon running, brew-
-/// services managing agentsso). Same semantics as `cli::start`'s
-/// exit-3 for a port :3820 conflict and Stories 7.4+7.5's resource-
-/// conflict refusals.
+/// services managing agentsso, vault lock held by another process).
 #[derive(Debug)]
 pub(crate) struct RotateKeyExitCode3;
 
@@ -72,9 +101,8 @@ impl std::fmt::Display for RotateKeyExitCode3 {
 impl std::error::Error for RotateKeyExitCode3 {}
 
 /// Exit-code 4 marker — auth / keystore failure (passphrase adapter
-/// rotation refused, set_master_key verify failure, RNG failure).
-/// Distinct from 5 so operators can tell "the keystore said no" apart
-/// from "the swap succeeded but a later step rolled back."
+/// rotation refused, set_master_key verify failure, RNG failure,
+/// `key_id` overflow at 255).
 #[derive(Debug)]
 pub(crate) struct RotateKeyExitCode4;
 
@@ -86,15 +114,17 @@ impl std::fmt::Display for RotateKeyExitCode4 {
 
 impl std::error::Error for RotateKeyExitCode4 {}
 
-/// Exit-code 5 marker — re-seal / rename / agent-rebuild failure.
-/// Reserved as distinct from 4 so operators can triage "did the
-/// keystore reject the swap?" vs "did the on-disk rotation roll back?".
+/// Exit-code 5 marker — re-seal / agent-rebuild / unexpected envelope
+/// `key_id` failure. Distinct from 4 so operators can triage "did the
+/// keystore reject the swap?" vs "did the on-disk rotation fail
+/// mid-flight?" — the latter is recoverable by re-running rotate-key
+/// (the previous-slot stays populated through Phase F).
 #[derive(Debug)]
 pub(crate) struct RotateKeyExitCode5;
 
 impl std::fmt::Display for RotateKeyExitCode5 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("rotate-key: rotation failure (rolled back where possible)")
+        f.write_str("rotate-key: rotation failure (re-run to resume)")
     }
 }
 
@@ -149,132 +179,126 @@ pub struct RotateKeyArgs {
 
 /// Run the `rotate-key` subcommand.
 ///
-/// **Story 7.6a dormancy fence (Task 9).** The CLI surface ships
-/// dormant in v0.4: invocation refuses with `RotateKeyExitCode4` and
-/// a forward-pin to v0.5 / Story 7.6b. The dispatcher in `main.rs`
-/// still wires `Commands::RotateKey` so the binary's `--help`
-/// continues to list the subcommand (operators can see what's
-/// coming), but actually running it is not user-supported until
-/// 7.6b lands.
-///
-/// Why dormant rather than removed: Story 7.6 (commit `9f089f9`)
-/// stays in main as a reference implementation that 7.6b commits
-/// will replace piecewise. Removing the surface would force
-/// re-creating it; refusing at the entry point keeps the existing
-/// modules (`master_key`, `rotation::reseal`, `state`, the
-/// `RotateKeyExitCode3/4/5` typed markers) in tree where 7.6b
-/// expects them.
-///
-/// Story 7.6b's first commit will REMOVE this refusal and rebuild
-/// the rotate-key flow on top of `VaultLock` + `key_id`-aware
-/// envelope-by-envelope reseal.
-#[allow(unused_variables)] // `args` is consumed only by 7.6b's body.
+/// Pre-flights run BEFORE `init_tracing` so we don't pay the
+/// tracing-subscriber setup cost (or risk creating ~/.agentsso/logs/
+/// that uninstall would have to delete) when rotate-key is going to
+/// refuse anyway. See `cli::start`'s P19/P23 review pattern.
 pub async fn run(args: RotateKeyArgs) -> Result<()> {
     use anyhow::Context as _;
 
-    // ── Story 7.6a Task 9: hard refusal until 7.6b ─────────────────
-    eprint!(
-        "{}",
-        render::error_block(
-            "rotate_key_dormant",
-            "agentsso rotate-key is being upgraded for v0.4 and is temporarily \
-             disabled. Please wait for the next release.",
-            "see release notes — Story 7.6 → 7.6a → 7.6b transition",
-            None,
-        )
-    );
-    return Err(exit4());
-
-    // The remainder of this function is dead code under the dormancy
-    // fence. 7.6b will delete the early `return Err(exit4())` above
-    // and resume normal flow on the new primitives. We retain the
-    // body so existing test fixtures + integration coverage do not
-    // bit-rot before 7.6b restores them.
-    #[allow(unreachable_code)]
-    {
-        // ── Pre-flight 1: brew-services double-bind detection (macOS) ──
-        //
-        // P19 (Story 7.4 review): pre-flights run BEFORE `init_tracing`
-        // so we don't pay the tracing-subscriber setup cost (or risk
-        // creating ~/.agentsso/logs/ that step 4 would have to delete)
-        // when rotate-key is going to refuse anyway.
-        #[cfg(target_os = "macos")]
-        if brew_services_managing_agentsso().await {
-            eprint!(
-                "{}",
-                render::error_block(
-                    "rotate_key_managed_externally",
-                    "agentsso is managed by Homebrew (brew services); rotating the master \
+    // ── Pre-flight 1: brew-services double-bind detection (macOS) ──
+    #[cfg(target_os = "macos")]
+    if brew_services_managing_agentsso().await {
+        eprint!(
+            "{}",
+            render::error_block(
+                "rotate_key_managed_externally",
+                "agentsso is managed by Homebrew (brew services); rotating the master \
                  key would desync brew's view of the daemon and may leave it pointing at \
                  stale credentials.",
-                    "brew services stop agentsso && agentsso rotate-key",
-                    None,
-                )
-            );
-            return Err(exit3());
-        }
+                "brew services stop agentsso && agentsso rotate-key",
+                None,
+            )
+        );
+        return Err(exit3());
+    }
 
-        // ── Pre-flight 2: daemon-running guard (AC #5) ─────────────────
-        //
-        // Q1 default A: refuse if daemon up. Rotating while the daemon
-        // holds an in-memory copy of the OLD master key opens the same
-        // race surface that Story 1.15's HIGH patch closed (AuthLayer /
-        // ScopedTokenIssuer desync). Stop first; we don't try to be
-        // clever.
-        let home = super::agentsso_home()?;
-        let daemon_running = crate::lifecycle::pid::PidFile::is_daemon_running(&home)
+    // ── Pre-flight 2: daemon-running guard (AC #5) ─────────────────
+    let home = super::agentsso_home()?;
+    let daemon_running = crate::lifecycle::pid::PidFile::is_daemon_running(&home)
         .unwrap_or_else(|e| {
-            // PID-file-read failure during pre-flight: don't refuse,
-            // don't proceed silently. Log + treat as "running" (safer
-            // — operator can investigate). The error message goes to
-            // stderr via the structured-error block below.
             tracing::warn!(error = %e, "PID-file probe failed; treating daemon as running for safety");
             true
         });
-        if daemon_running {
-            eprint!(
-                "{}",
-                render::error_block(
-                    "rotate_key_daemon_running",
-                    "agentsso daemon is running; rotate-key requires the daemon to be \
+    if daemon_running {
+        eprint!(
+            "{}",
+            render::error_block(
+                "rotate_key_daemon_running",
+                "agentsso daemon is running; rotate-key requires the daemon to be \
                  stopped to avoid in-memory key desync.",
-                    "agentsso stop && agentsso rotate-key",
-                    None,
-                )
-            );
-            return Err(exit3());
-        }
+                "agentsso stop && agentsso rotate-key",
+                None,
+            )
+        );
+        return Err(exit3());
+    }
 
-        // Now safe to init tracing.
-        let _guards =
-            crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
+    // Now safe to init tracing.
+    let _guards =
+        crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
 
-        // ── Pre-flight 3: tty / non-interactive guard (AC #7) ──────────
-        let stdout_is_tty = console::Term::stdout().is_term();
-        let interactive = !args.non_interactive && stdout_is_tty;
-        if !args.yes && !interactive {
-            eprint!(
-                "{}",
-                render::error_block(
-                    "rotate_key_requires_confirmation",
-                    "rotate-key is destructive (replaces the master key in your OS keychain) \
+    // ── Pre-flight 3: tty / non-interactive guard (AC #7) ──────────
+    let stdout_is_tty = console::Term::stdout().is_term();
+    let interactive = !args.non_interactive && stdout_is_tty;
+    if !args.yes && !interactive {
+        eprint!(
+            "{}",
+            render::error_block(
+                "rotate_key_requires_confirmation",
+                "rotate-key is destructive (replaces the master key in your OS keychain) \
                  and requires interactive confirmation OR an explicit `--yes` flag.",
-                    "agentsso rotate-key --yes",
-                    None,
-                )
-            );
-            return Err(silent_cli_error("non-interactive rotate-key without --yes"));
-        }
+                "agentsso rotate-key --yes",
+                None,
+            )
+        );
+        return Err(silent_cli_error("non-interactive rotate-key without --yes"));
+    }
 
-        // ── Pre-flight 4: keystore-adapter detection (AC #6) ───────────
-        //
-        // Q2 default A: passphrase adapters cannot be rotated by minting
-        // a new key — they rotate by changing the passphrase. Refuse
-        // cleanly with a forward-pin to a future `agentsso change-passphrase`
-        // command. Do this BEFORE reading the master key so we don't
-        // prompt for a passphrase we're about to refuse to use.
-        let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
-        let keystore = match default_keystore(&keystore_config) {
+    // ── Pre-flight 4: keystore-adapter detection (AC #6) ───────────
+    //
+    // Story 7.6b round-1 review re-triage (2026-04-28): when the
+    // env var `AGENTSSO_TEST_KEYSTORE_FILE_BACKED=1` is set,
+    // construct a `FileBackedKeyStore` instead of the OS keychain.
+    // Used exclusively by the rotate-key integration tests
+    // (`rotate_key_e2e.rs`, `rotate_key_crash_resume_e2e.rs`) so
+    // they can exercise the full Phase A→G flow without touching
+    // the test runner's real keychain AND so a subprocess crash
+    // mid-rotation leaves recoverable state on disk.
+    //
+    // Story 7.6b round-2 re-triage: the seam is gated by the
+    // `test-seam` Cargo feature (NOT `cfg(debug_assertions)`). The
+    // feature is enabled by `cargo test`'s integration target via
+    // `required-features = ["test-seam"]`; it is OFF for `cargo
+    // build`, `cargo build --release`, and `cargo install`. Pre-
+    // round-2 the seam was gated by `cfg(debug_assertions)` —
+    // which exposed casual-`cargo build` users to leaked-shell-var
+    // bypasses of the real keychain. The feature flag makes the
+    // boundary an explicit Cargo metadata fact.
+    #[cfg(feature = "test-seam")]
+    let test_file_keystore: Option<Box<dyn permitlayer_keystore::KeyStore>> =
+        if std::env::var("AGENTSSO_TEST_KEYSTORE_FILE_BACKED").is_ok() {
+            tracing::warn!(
+                "AGENTSSO_TEST_KEYSTORE_FILE_BACKED is set — using file-backed test keystore. \
+                 This env var is only honored when agentsso is built with the `test-seam` \
+                 Cargo feature, which production builds (`cargo install`) never enable."
+            );
+            match permitlayer_keystore::FileBackedKeyStore::new(&home) {
+                Ok(ks) => Some(Box::new(ks)),
+                Err(e) => {
+                    eprint!(
+                        "{}",
+                        render::error_block(
+                            "rotate_key_test_keystore_init_failed",
+                            &format!("test file-backed keystore init failed: {e}"),
+                            "ensure ~/.agentsso is writable",
+                            None,
+                        )
+                    );
+                    return Err(exit4());
+                }
+            }
+        } else {
+            None
+        };
+    #[cfg(not(feature = "test-seam"))]
+    let test_file_keystore: Option<Box<dyn permitlayer_keystore::KeyStore>> = None;
+
+    let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
+    let keystore = if let Some(test_ks) = test_file_keystore {
+        test_ks
+    } else {
+        match default_keystore(&keystore_config) {
             Ok(ks) => ks,
             Err(e) => {
                 eprint!(
@@ -283,72 +307,58 @@ pub async fn run(args: RotateKeyArgs) -> Result<()> {
                         "rotate_key_keystore_unavailable",
                         &format!("keystore initialization failed: {e}"),
                         "verify your OS keychain is available; on Linux this typically \
-                     requires libsecret + a running secret-storage daemon (gnome-keyring \
-                     / kwallet)",
+                         requires libsecret + a running secret-storage daemon (gnome-keyring \
+                         / kwallet)",
                         None,
                     )
                 );
                 return Err(exit4());
             }
-        };
-        if keystore.kind() == KeyStoreKind::Passphrase {
-            eprint!(
-                "{}",
-                render::error_block(
-                    "rotate_key_passphrase_adapter",
-                    "the passphrase keystore rotates by changing the passphrase, not by \
+        }
+    };
+    if keystore.kind() == KeyStoreKind::Passphrase {
+        eprint!(
+            "{}",
+            render::error_block(
+                "rotate_key_passphrase_adapter",
+                "the passphrase keystore rotates by changing the passphrase, not by \
                  minting a new master key. A dedicated `agentsso change-passphrase` \
                  command will be added in a future story; for now, the passphrase-mode \
                  rotation path is unavailable.",
-                    "(future) agentsso change-passphrase — not yet implemented",
-                    None,
-                )
-            );
-            return Err(exit4());
+                "(future) agentsso change-passphrase — not yet implemented",
+                None,
+            )
+        );
+        return Err(exit4());
+    }
+
+    // ── Confirm prompt (AC #7) ─────────────────────────────────────
+    if !args.yes {
+        let manifest = build_prompt_manifest(&home);
+        println!("{manifest}");
+
+        let join = tokio::task::spawn_blocking(|| {
+            dialoguer::Confirm::new().with_prompt("Continue?").default(false).interact()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("rotate-key confirm join failed: {e}"))?;
+        // `dialoguer::Error` (Ctrl-C, stdin closed) → treat as cancel.
+        let confirmed: bool = join.unwrap_or_default();
+        if !confirmed {
+            println!("rotate-key cancelled");
+            return Ok(());
         }
+    }
 
-        // ── Pre-flight 5: crash-resume detection (AC #4) ───────────────
-        //
-        // If a previous rotate-key attempt crashed between Phase C
-        // (keystore swap) and Phase F (cleanup), there is a
-        // `.rotation.in-progress` marker on disk. Detect it and route to
-        // the resume path — DO NOT prompt for confirmation again, and DO
-        // NOT mint a new key (the keystore already has the new one).
-        let marker_path = home.join("vault").join(ROTATION_MARKER_FILENAME);
-        if marker_path.exists() {
-            tracing::info!(
-                marker = %marker_path.display(),
-                "detected in-flight rotation; entering resume path"
-            );
-            return resume::run_resume(&home, keystore.as_ref()).await;
-        }
-
-        // ── Confirm prompt ─────────────────────────────────────────────
-        if !args.yes {
-            let manifest = build_prompt_manifest(&home);
-            println!("{manifest}");
-
-            let join = tokio::task::spawn_blocking(|| {
-                dialoguer::Confirm::new().with_prompt("Continue?").default(false).interact()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("rotate-key confirm join failed: {e}"))?;
-            // `dialoguer::Error` (Ctrl-C, stdin closed) → treat as cancel.
-            let confirmed: bool = join.unwrap_or_default();
-            if !confirmed {
-                println!("rotate-key cancelled");
-                return Ok(());
-            }
-        }
-
-        // ── Run the rotation ───────────────────────────────────────────
-        let started = Instant::now();
-        run_rotation(&home, keystore.as_ref(), started).await
-    } // end of unreachable dead-code block (Story 7.6a Task 9)
+    // ── Run the rotation ───────────────────────────────────────────
+    let started = Instant::now();
+    run_rotation(&home, keystore.as_ref(), started).await
 }
 
 /// Build the manifest block printed before the confirmation prompt
-/// (mirrors Story 7.4 `build_prompt_manifest`).
+/// (mirrors Story 7.4 `build_prompt_manifest`). Story 7.6b updates
+/// the agent bullet from Q4-B (invalidate) to Q4-A (preserve agents,
+/// re-issue tokens).
 fn build_prompt_manifest(home: &Path) -> String {
     let vault_dir = home.join("vault");
     let mut s = String::new();
@@ -357,13 +367,16 @@ fn build_prompt_manifest(home: &Path) -> String {
         "  • Mint a fresh 32-byte master key from your OS RNG\n  \
          • Re-encrypt every credential in {} under the new key\n  \
          • Replace the old master key in your OS keychain (idempotent overwrite)\n  \
-         • Rebuild the agent-registry HMAC lookup index in ~/.agentsso/agents/\n  \
-         • NOT touch your OAuth refresh tokens — Google connections survive\n\n",
+         • Rebuild every agent's HMAC lookup key under the new master-derived subkey \
+         AND issue a fresh agt_v2_* bearer token for each agent (operator must update \
+         agent configs with the printed tokens — old tokens are invalidated)\n\n",
         vault_dir.display()
     ));
+    s.push_str("Existing OAuth refresh tokens are preserved.\n\n");
     s.push_str(
-        "If the rotation is interrupted, re-run `agentsso rotate-key` to \
-         finish or roll back automatically.\n",
+        "If the rotation is interrupted, re-run `agentsso rotate-key` to finish; \
+         the keystore stages both keys atomically before any vault write begins, so \
+         every crash mode is recoverable.\n",
     );
     s
 }
@@ -403,22 +416,20 @@ async fn brew_services_managing_agentsso() -> bool {
 mod tests {
     use super::*;
 
-    /// Story 7.6a Task 9: the dormancy fence rejects every invocation
-    /// regardless of args. The error chain carries
-    /// `RotateKeyExitCode4` so `main.rs::rotate_key_to_exit_code`
-    /// returns exit code 4.
-    #[tokio::test]
-    async fn run_refuses_with_dormancy_fence() {
-        let err = run(RotateKeyArgs::default()).await.unwrap_err();
-        // Walk the anyhow chain looking for the typed marker.
-        let has_marker = err.chain().any(|e| e.is::<RotateKeyExitCode4>());
-        assert!(has_marker, "expected RotateKeyExitCode4 in error chain: {err:?}");
-    }
-
-    #[tokio::test]
-    async fn run_refuses_even_with_yes_flag() {
-        let err = run(RotateKeyArgs { yes: true, non_interactive: true }).await.unwrap_err();
-        let has_marker = err.chain().any(|e| e.is::<RotateKeyExitCode4>());
-        assert!(has_marker, "expected RotateKeyExitCode4 in error chain: {err:?}");
+    #[test]
+    fn build_prompt_manifest_mentions_token_re_issuance() {
+        // Story 7.6b: the manifest must call out that operators
+        // need to update agent configs with the printed v2 tokens.
+        let home = std::path::PathBuf::from("/tmp/test-home");
+        let manifest = build_prompt_manifest(&home);
+        assert!(manifest.contains("agt_v2_"), "manifest must mention v2 token format");
+        assert!(
+            manifest.contains("operator must update"),
+            "manifest must instruct operator to update configs"
+        );
+        assert!(
+            manifest.contains("OAuth refresh tokens are preserved"),
+            "manifest must reassure that OAuth survives"
+        );
     }
 }

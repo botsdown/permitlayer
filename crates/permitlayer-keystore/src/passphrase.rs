@@ -215,6 +215,33 @@ impl KeyStore for PassphraseKeyStore {
     fn kind(&self) -> KeyStoreKind {
         KeyStoreKind::Passphrase
     }
+
+    async fn set_previous_master_key(
+        &self,
+        _previous: &[u8; MASTER_KEY_LEN],
+    ) -> Result<(), KeyStoreError> {
+        // Story 7.6b: rotation does not apply to the passphrase
+        // adapter — `agentsso rotate-key` refuses early on the
+        // passphrase backend (AC #6). Returning the same immutable
+        // marker as `set_master_key` keeps adapter behavior uniform.
+        Err(KeyStoreError::PassphraseAdapterImmutable)
+    }
+
+    async fn previous_master_key(
+        &self,
+    ) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>, KeyStoreError> {
+        // Story 7.6b: there is no previous slot in the passphrase
+        // adapter; rotation does not flow through here. Surface the
+        // same immutable marker as `set_master_key` rather than
+        // returning `Ok(None)`, so a misuse caller (rotation against
+        // a passphrase keystore) fails fast with a structurally
+        // identical error to the existing AC #6 refusal.
+        Err(KeyStoreError::PassphraseAdapterImmutable)
+    }
+
+    async fn clear_previous_master_key(&self) -> Result<(), KeyStoreError> {
+        Err(KeyStoreError::PassphraseAdapterImmutable)
+    }
 }
 
 fn derive_key(

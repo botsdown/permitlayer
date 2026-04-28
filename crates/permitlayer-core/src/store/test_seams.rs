@@ -54,4 +54,17 @@ impl AgentIdentityStore for MockAgentStore {
         self.touched.lock().unwrap().push(identity.name().to_owned());
         Ok(())
     }
+
+    async fn update_lookup_key_and_token(
+        &self,
+        _name: &str,
+        _new_lookup_key_hex: String,
+        _new_token_hash: String,
+    ) -> Result<bool, StoreError> {
+        // Mock returns `Ok(false)` ("no such agent") because `get`
+        // always returns `None`. Tests that exercise rotation-Phase-E
+        // mutation should use the real `AgentIdentityFsStore` rather
+        // than this mock.
+        Ok(false)
+    }
 }

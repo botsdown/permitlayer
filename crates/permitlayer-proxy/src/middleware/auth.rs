@@ -40,7 +40,7 @@ use std::task::{Context, Poll};
 use axum::body::Body;
 use axum::http::{Request, Response};
 use permitlayer_core::agent::{
-    AgentRegistry, LOOKUP_KEY_BYTES, compute_lookup_key, hash_token, verify_token,
+    AgentRegistry, LOOKUP_KEY_BYTES, compute_lookup_key, hash_token, parse_v2_token, verify_token,
 };
 use permitlayer_core::audit::dispatcher::AuditDispatcher;
 use permitlayer_core::audit::event::AuditEvent;
@@ -54,20 +54,28 @@ use crate::middleware::util::is_operational_path;
 
 /// Hard cap on inbound bearer-token length, in bytes (Story 4.4).
 ///
-/// Legitimate `agt_v1_*` tokens are exactly 50 characters. We accept
-/// up to 256 chars to leave room for a future format rotation
-/// (`agt_v2_*`) without changing this constant. Beyond 256, the
-/// request is rejected before any HMAC computation — defense against
-/// an attacker sending megabytes in the Authorization header to
-/// inflate the audit log via `token_prefix`.
+/// Legitimate `agt_v2_<name>_<random>` tokens are at most ~120 chars
+/// (7-byte prefix + up to 64-byte name + `_` + base64 of 32 random
+/// bytes). 256 leaves room for a future name-length expansion without
+/// changing this constant. Beyond 256, the request is rejected before
+/// any HMAC computation — defense against an attacker sending
+/// megabytes in the Authorization header to inflate the audit log via
+/// `token_prefix`.
 pub const MAX_BEARER_TOKEN_LEN: usize = 256;
 
 /// Number of characters of the inbound bearer token to capture in the
-/// `agent-auth-denied` audit event for grep correlation. The first 8
-/// characters of an `agt_v1_*` token are `agt_v1_<one>` — enough to
-/// distinguish a misconfigured agent from a typo from a stolen token,
-/// not enough to reverse-engineer the credential.
-pub const TOKEN_PREFIX_AUDIT_LEN: usize = 8;
+/// `agent-auth-denied` audit event for grep correlation.
+///
+/// Story 7.6b round-1 review: shrunk 8 → 7 because v2 tokens have the
+/// shape `agt_v2_<name>_<random>` and the 8th character is the FIRST
+/// character of the agent name. Capturing 8 chars over a stream of
+/// denied-auth events lets an attacker enumerate first letters of
+/// registered agent names (privacy regression vs. v1, where the 8th
+/// char was random). Seven characters yields the literal token
+/// version prefix (`agt_v2_`) — still useful for distinguishing v1
+/// from v2 auth failures during a migration without leaking name
+/// material.
+pub const TOKEN_PREFIX_AUDIT_LEN: usize = 7;
 
 // ──────────────────────────────────────────────────────────────────
 // Tower Layer + Service
@@ -221,16 +229,30 @@ where
             });
         }
 
-        // 5. HMAC lookup (~1 µs, synchronous — no point spawning).
-        //    On miss we still pay ~100 ms of dummy Argon2id work
-        //    inside spawn_blocking before returning 401, so an
-        //    attacker cannot distinguish "unknown agent" from "known
+        // 5. Parse the v2 token + HMAC lookup (~1 µs, synchronous —
+        //    no point spawning). Story 7.6b: tokens are now
+        //    `agt_v2_<name>_<random>`; the parser pulls the agent
+        //    name out of the prefix so the HMAC can be computed
+        //    against `name` (single deterministic value per agent).
+        //    On parse-failure OR lookup-miss we still pay ~100 ms of
+        //    dummy Argon2id work inside spawn_blocking before
+        //    returning 401, so an attacker cannot distinguish
+        //    "malformed token" from "unknown agent" from "known
         //    agent, wrong token" via response-latency timing.
         // Auto-deref chains through Arc → Zeroizing → [u8; 32] to
         // match compute_lookup_key's `&[u8; LOOKUP_KEY_BYTES]`.
-        let lookup_key = compute_lookup_key(&self.daemon_lookup_key, token_str.as_bytes());
-        let snapshot = self.registry.snapshot();
-        let matched_agent = snapshot.lookup_by_key(&lookup_key).cloned();
+        let matched_agent = match parse_v2_token(&token_str) {
+            Some((name, _random)) => {
+                let lookup_key = compute_lookup_key(&self.daemon_lookup_key, name.as_bytes());
+                let snapshot = self.registry.snapshot();
+                snapshot.lookup_by_key(&lookup_key).cloned()
+            }
+            // Malformed token (wrong prefix, bad name, bad base64).
+            // Treat indistinguishably from a registry miss to keep
+            // the timing oracle closed — the dummy Argon2id verify
+            // below still runs.
+            None => None,
+        };
 
         // Clone everything the async block needs up front — `self`
         // and `req` both cross the await boundary.
@@ -470,11 +492,17 @@ mod tests {
 
     /// Build a test fixture: a registry containing one agent with a
     /// known plaintext token, plus a fake daemon lookup key.
+    ///
+    /// Story 7.6b: tokens use the v2 format
+    /// `agt_v2_<name>_<base64-random>`, and `lookup_key_hex` is
+    /// derived from `HMAC(daemon_key, name.as_bytes())` so the auth
+    /// path's O(1) index hit succeeds.
     fn fixture(name: &str, policy: &str) -> (Arc<AgentRegistry>, [u8; LOOKUP_KEY_BYTES], String) {
         let plaintext = generate_bearer_token_bytes();
-        let token_string = format!("agt_v1_{}", base64_url(&plaintext));
+        let token_string = format!("agt_v2_{}_{}", name, base64_url(&plaintext));
         let daemon_key = [0x42u8; LOOKUP_KEY_BYTES];
-        let lookup_key = compute_lookup_key(&daemon_key, token_string.as_bytes());
+        // Lookup key is HMAC over the AGENT NAME, not the token.
+        let lookup_key = compute_lookup_key(&daemon_key, name.as_bytes());
         let hash = hash_token(token_string.as_bytes()).unwrap();
         let agent = AgentIdentity::new(
             name.to_owned(),
@@ -641,7 +669,7 @@ mod tests {
         let mut req =
             Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
         req.headers_mut()
-            .insert("authorization", HeaderValue::from_static("Bearer agt_v1_garbageDoesNotMatch"));
+            .insert("authorization", HeaderValue::from_static("Bearer agt_v2_garbageDoesNotMatch"));
         let resp: Response<Body> = svc.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -649,7 +677,7 @@ mod tests {
         assert_eq!(json["error"]["code"], "auth.invalid_token");
         // Token prefix MUST NOT leak into the error body.
         let body_str = String::from_utf8(body.to_vec()).unwrap();
-        assert!(!body_str.contains("agt_v1_g"));
+        assert!(!body_str.contains("agt_v2_g"));
     }
 
     #[tokio::test]
@@ -746,21 +774,23 @@ mod tests {
             Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
         req.extensions_mut().insert(RequestId("01TESTBAD".to_owned()));
         req.headers_mut()
-            .insert("authorization", HeaderValue::from_static("Bearer agt_v1_garbage"));
+            .insert("authorization", HeaderValue::from_static("Bearer agt_v2_garbage"));
         let _resp: Response<Body> = svc.oneshot(req).await.unwrap();
         let _ = dispatcher.drain(std::time::Duration::from_secs(2)).await;
         let events = mock_store.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "agent-auth-denied");
         assert_eq!(events[0].extra["reason"], "invalid_token");
-        // First 8 chars of "agt_v1_garbage" → "agt_v1_g".
-        assert_eq!(events[0].extra["token_prefix"], "agt_v1_g");
+        // First 7 chars of "agt_v2_garbage" → "agt_v2_". Story 7.6b
+        // round-1 review: was 8 chars; the 8th would have leaked the
+        // first letter of the agent name across denied events.
+        assert_eq!(events[0].extra["token_prefix"], "agt_v2_");
     }
 
     #[tokio::test]
     async fn short_invalid_token_omits_token_prefix() {
-        // Token shorter than 8 chars → token_prefix is null (don't
-        // bother capturing a near-full short token).
+        // Token shorter than TOKEN_PREFIX_AUDIT_LEN chars → token_prefix
+        // is null (don't bother capturing a near-full short token).
         let (registry, daemon_key, _token) = fixture("agent1", "default");
         let mock_store = MockAuditStore::default();
         let store: Arc<dyn AuditStore> = Arc::new(mock_store.clone());
@@ -814,25 +844,39 @@ mod tests {
     // ── audit_token_prefix unit tests ─────────────────────────────
 
     #[test]
-    fn audit_token_prefix_captures_first_8_chars_when_long_enough() {
-        assert_eq!(audit_token_prefix("agt_v1_garbage"), Some("agt_v1_g".to_owned()));
+    fn audit_token_prefix_captures_first_7_chars_when_long_enough() {
+        // Story 7.6b round-1 review: 7 chars (was 8). The 8th char of
+        // a v2 token is the first letter of the agent name, which
+        // would leak names across denied-auth events.
+        assert_eq!(audit_token_prefix("agt_v2_garbage"), Some("agt_v2_".to_owned()));
+    }
+
+    #[test]
+    fn audit_token_prefix_does_not_leak_agent_name_first_letter() {
+        // The captured prefix must be IDENTICAL for two different
+        // agent names — the only useful signal is the version prefix
+        // (`agt_v2_`), not the name material.
+        let alpha = audit_token_prefix("agt_v2_alice_xxxxxxxxxxxxxx");
+        let bravo = audit_token_prefix("agt_v2_bob_yyyyyyyyyyyyyyyy");
+        assert_eq!(alpha, bravo, "prefix must not differ on agent name");
     }
 
     #[test]
     fn audit_token_prefix_returns_none_when_too_short() {
         assert_eq!(audit_token_prefix(""), None);
         assert_eq!(audit_token_prefix("abc"), None);
-        assert_eq!(audit_token_prefix("1234567"), None);
+        assert_eq!(audit_token_prefix("123456"), None);
     }
 
     #[test]
     fn audit_token_prefix_handles_non_ascii_safely() {
-        // 🦀 is one char (4 bytes UTF-8). The prefix must take 8 chars,
-        // not 8 bytes — slicing mid-codepoint would panic.
+        // 🦀 is one char (4 bytes UTF-8). The prefix must take
+        // TOKEN_PREFIX_AUDIT_LEN chars, not bytes — slicing
+        // mid-codepoint would panic.
         let token = "🦀🦀🦀🦀🦀🦀🦀🦀🦀";
         let prefix = audit_token_prefix(token);
         assert!(prefix.is_some());
-        assert_eq!(prefix.unwrap().chars().count(), 8);
+        assert_eq!(prefix.unwrap().chars().count(), TOKEN_PREFIX_AUDIT_LEN);
     }
 
     // ── touch_last_seen integration ───────────────────────────────
@@ -861,5 +905,173 @@ mod tests {
         let touched = mock_agent_store.touched.lock().unwrap();
         assert_eq!(touched.len(), 1);
         assert_eq!(touched[0], "agent1");
+    }
+
+    // ── Story 7.6b AC #15 — v2-token auth-path tests ─────────────
+
+    #[tokio::test]
+    async fn auth_with_v2_token_o1_lookup_succeeds() {
+        // The fixture mints a v2 token; auth should accept it with
+        // the new "parse name → HMAC(name) → registry hit → Argon2id
+        // verify" sequence.
+        let (registry, daemon_key, token) = fixture("o1-test", "default");
+        assert!(token.starts_with("agt_v2_"), "fixture must mint v2 tokens: {token}");
+        let svc = build_layer_only_service(registry, daemon_key, None);
+        let mut req =
+            Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
+        req.headers_mut()
+            .insert("authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        let resp: Response<Body> = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_v1_token_after_upgrade() {
+        // Synthetic agt_v1_<base64> tokens fail the v2 prefix check
+        // and are rejected with 401 (the parser returns None,
+        // matched_agent stays None, dummy Argon2id runs, 401 is
+        // returned).
+        let (registry, daemon_key, _token) = fixture("agent1", "default");
+        let svc = build_layer_only_service(registry, daemon_key, None);
+        let mut req =
+            Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
+        req.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_static("Bearer agt_v1_legacyTokenShouldBeRejected"),
+        );
+        let resp: Response<Body> = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "auth.invalid_token");
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_malformed_v2_token() {
+        let (registry, daemon_key, _token) = fixture("agent1", "default");
+        let svc = build_layer_only_service(registry, daemon_key, None);
+        let mut req =
+            Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
+        // Missing the `_` separator between name and base64.
+        req.headers_mut()
+            .insert("authorization", HeaderValue::from_static("Bearer agt_v2_no-separator-blob"));
+        let resp: Response<Body> = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_dummy_argon2id_still_runs_on_miss() {
+        // Sanity: a well-formed v2 token for an unregistered name
+        // returns 401, not panic. The dummy Argon2id verify path is
+        // exercised but we don't assert latency here (CI noise).
+        let (registry, daemon_key, _token) = fixture("agent1", "default");
+        let svc = build_layer_only_service(registry, daemon_key, None);
+        let mut req =
+            Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
+        let bogus = format!("agt_v2_unknown-agent_{}", base64_url(&[0u8; 32]));
+        req.headers_mut()
+            .insert("authorization", HeaderValue::from_str(&format!("Bearer {bogus}")).unwrap());
+        let resp: Response<Body> = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_post_rotation_token_succeeds() {
+        // Story 7.6b round-1 review: spec AC #15 listed five v2 auth
+        // tests; this one was missing. End-to-end shape:
+        //   1. Register an agent (pre-rotation token, pre-rotation
+        //      lookup_key keyed by old_subkey).
+        //   2. Simulate Phase E: same agent now has a NEW token AND
+        //      a NEW lookup_key keyed by the new daemon subkey.
+        //   3. The auth layer is constructed with the NEW subkey
+        //      (post-restart). The NEW token must succeed; the OLD
+        //      token must fail (token_hash no longer matches).
+        let agent_name = "rotated-agent";
+        let policy = "default";
+
+        // Pre-rotation context (the OLD subkey + token are
+        // implicit — rotation has discarded them by the time the
+        // post-rotation registry is constructed below).
+
+        // Post-rotation: mint NEW token under NEW subkey.
+        let new_subkey = [0x55u8; LOOKUP_KEY_BYTES];
+        let new_token_bytes = generate_bearer_token_bytes();
+        let new_token = format!("agt_v2_{}_{}", agent_name, base64_url(&new_token_bytes));
+        let new_lookup_key = compute_lookup_key(&new_subkey, agent_name.as_bytes());
+        let new_token_hash = hash_token(new_token.as_bytes()).unwrap();
+
+        // Build a registry pointing at the NEW state — this is
+        // what the daemon would see post-rotation-and-restart.
+        let agent = AgentIdentity::new(
+            agent_name.to_owned(),
+            policy.to_owned(),
+            new_token_hash,
+            lookup_key_to_hex(&new_lookup_key),
+            Utc::now(),
+            None,
+        )
+        .unwrap();
+        let registry = Arc::new(AgentRegistry::new(vec![agent]));
+
+        // Daemon now runs under the NEW subkey.
+        let svc = build_layer_only_service(registry, new_subkey, None);
+
+        // NEW token → 200.
+        let mut req =
+            Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
+        req.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {new_token}")).unwrap(),
+        );
+        let resp: Response<Body> = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "post-rotation token must authenticate");
+    }
+
+    #[tokio::test]
+    async fn auth_pre_rotation_token_fails_after_rotation() {
+        // Companion to `auth_post_rotation_token_succeeds`: presents
+        // a token that was valid before rotation. Under the post-
+        // rotation registry (new subkey, new token_hash), the OLD
+        // token's name will still parse + HMAC-hit (the agent name
+        // didn't change), but the Argon2id verify against the new
+        // token_hash MUST fail.
+        let agent_name = "rotated-agent";
+        let policy = "default";
+
+        let old_token_bytes = generate_bearer_token_bytes();
+        let old_token = format!("agt_v2_{}_{}", agent_name, base64_url(&old_token_bytes));
+
+        let new_subkey = [0x55u8; LOOKUP_KEY_BYTES];
+        let new_token_bytes = generate_bearer_token_bytes();
+        let new_token = format!("agt_v2_{}_{}", agent_name, base64_url(&new_token_bytes));
+        // Sanity: tokens differ (otherwise the test is meaningless).
+        assert_ne!(old_token, new_token);
+        let new_lookup_key = compute_lookup_key(&new_subkey, agent_name.as_bytes());
+        let new_token_hash = hash_token(new_token.as_bytes()).unwrap();
+
+        let agent = AgentIdentity::new(
+            agent_name.to_owned(),
+            policy.to_owned(),
+            new_token_hash,
+            lookup_key_to_hex(&new_lookup_key),
+            Utc::now(),
+            None,
+        )
+        .unwrap();
+        let registry = Arc::new(AgentRegistry::new(vec![agent]));
+        let svc = build_layer_only_service(registry, new_subkey, None);
+
+        let mut req =
+            Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
+        req.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {old_token}")).unwrap(),
+        );
+        let resp: Response<Body> = svc.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "pre-rotation token must NOT authenticate post-rotation"
+        );
     }
 }

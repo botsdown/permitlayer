@@ -367,6 +367,61 @@ pub fn encode_envelope(sealed: &SealedCredential) -> Vec<u8> {
     buf
 }
 
+/// Atomic-write `bytes` to `target` via tempfile + rename + parent
+/// fsync. Companion to [`encode_envelope`] for callers that already
+/// hold the [`crate::VaultLock`] and MUST NOT route through
+/// [`CredentialFsStore::put`] (which would deadlock on lock
+/// re-acquire). Story 7.6b promoted this from a private helper in
+/// `cli::update::migrations::envelope_v1_to_v2` so rotation's reseal
+/// loop can reuse the discipline without duplicating it.
+///
+/// On Unix, the tempfile is created with mode `0o600`. On a
+/// failed `rename`, the tempfile is best-effort cleaned up.
+pub fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent directory")
+    })?;
+    let tmp_name = match target.file_name().and_then(|n| n.to_str()) {
+        Some(n) => format!("{n}.tmp.{}.{}", std::process::id(), {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        }),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "target has no file name",
+            ));
+        }
+    };
+    let tmp = parent.join(tmp_name);
+
+    let mut file = open_tempfile_0600(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let dir = std::fs::File::open(parent)?;
+    dir.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_tempfile_0600(tmp: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(tmp)
+}
+
+#[cfg(not(unix))]
+fn open_tempfile_0600(tmp: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
+}
+
 /// Parse the on-disk envelope into a `SealedCredential`.
 ///
 /// Story 7.6a — dispatches on the `version` byte:

@@ -51,10 +51,13 @@
 pub mod identity;
 pub mod registry;
 
-pub use identity::{AgentIdentity, AgentIdentityRaw, AgentNameError, validate_agent_name};
+pub use identity::{
+    AgentIdentity, AgentIdentityRaw, AgentNameError, MAX_AGENT_NAME_LEN, validate_agent_name,
+};
 pub use registry::{
-    ARGON2_PARAMS_M_COST, ARGON2_PARAMS_P_COST, ARGON2_PARAMS_T_COST, AgentRegistry,
-    BEARER_TOKEN_BYTES, BEARER_TOKEN_PREFIX, LOOKUP_KEY_BYTES, RegistrySnapshot,
+    AGENT_LOOKUP_HKDF_INFO, ARGON2_PARAMS_M_COST, ARGON2_PARAMS_P_COST, ARGON2_PARAMS_T_COST,
+    AgentRegistry, BEARER_TOKEN_BYTES, BEARER_TOKEN_PREFIX, LOOKUP_KEY_BYTES,
+    MAX_V2_TOKEN_NAME_BYTES, MAX_V2_TOKEN_RANDOM_BYTES, RegistrySnapshot, base64_url_no_pad_encode,
     compute_lookup_key, generate_bearer_token_bytes, hash_token, lookup_key_from_hex,
-    lookup_key_to_hex, verify_token,
+    lookup_key_to_hex, parse_v2_token, verify_token,
 };

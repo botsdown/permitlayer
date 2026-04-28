@@ -54,7 +54,12 @@ const MIN_AGENT_NAME_LEN: usize = 2;
 /// Maximum agent name length. Same as `validate_service_name` — caps
 /// `agents/<name>.toml` path length at `len("agents/") + 64 + len(".toml") = 75`,
 /// well under any platform's `PATH_MAX`.
-const MAX_AGENT_NAME_LEN: usize = 64;
+///
+/// Public so the v2 token parser (`parse_v2_token` in `registry`) can
+/// pin its name-length ceiling to the same value the validator
+/// enforces. Bumping this value MUST be done with the parser's check
+/// in mind — a divergence would silently reject legitimate tokens.
+pub const MAX_AGENT_NAME_LEN: usize = 64;
 
 /// Validate an agent name against the path-traversal-safe allowlist.
 ///

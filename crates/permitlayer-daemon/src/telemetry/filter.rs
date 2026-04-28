@@ -111,6 +111,14 @@ const SENSITIVE_PATTERNS: &[SensitivePattern] = &[
     // _bytes` prefix. Not in the test set below because the existing
     // `telemetry/mod.rs` tests already lock this in.
     SensitivePattern { prefix: b"agt_v1_", body_byte_class: is_base64url_byte },
+    // Story 7.6b: v2 token format `agt_v2_<name>_<base64>`. The body
+    // class still treats `_` as inside-token, so a token like
+    // `agt_v2_my-agent_BASE64` redacts to `agt_v2_<REDACTED>` —
+    // including the agent name. That's the intended privacy posture
+    // (agent names are sensitive in operational logs because the
+    // first half of the token IS the name and treating it as
+    // separately public would leak operator topology).
+    SensitivePattern { prefix: b"agt_v2_", body_byte_class: is_base64url_byte },
     // Google OAuth 2.0 access token prefix. Typical shape:
     // `ya29.a0AcM612w...`. Body extends through base64url + `.`.
     SensitivePattern { prefix: b"ya29.", body_byte_class: is_google_token_body_byte },

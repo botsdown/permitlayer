@@ -138,7 +138,7 @@ fn register_agent(port: u16, name: &str, policy: &str) -> String {
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     assert_eq!(parsed["status"], "ok");
     let token = parsed["bearer_token"].as_str().unwrap().to_owned();
-    assert!(token.starts_with("agt_v1_"), "bearer token must use the agt_v1_ prefix: {token}");
+    assert!(token.starts_with("agt_v2_"), "bearer token must use the agt_v2_ prefix: {token}");
     token
 }
 
@@ -226,7 +226,7 @@ fn full_register_auth_policy_lifecycle() {
         port,
         "/v1/tools/gmail/users/me/messages",
         &[
-            ("authorization", "Bearer agt_v1_garbageDoesNotMatchAnyAgent"),
+            ("authorization", "Bearer agt_v2_garbageDoesNotMatchAnyAgent"),
             ("x-agentsso-scope", "gmail.readonly"),
         ],
     );
@@ -281,18 +281,21 @@ fn full_register_auth_policy_lifecycle() {
     // 10. Audit assertion: the agent-auth-denied event from step 5
     //     (bogus token) was written with the correct token_prefix.
     //     Use a firm assertion (Story 4.3 review MED #3 lesson).
+    //     Story 7.6b round-1 review: TOKEN_PREFIX_AUDIT_LEN shrunk
+    //     8 → 7 (was leaking the first letter of the agent name).
+    //     Expected prefix is now the literal version-prefix `agt_v2_`.
     let audit_dir = home.path().join("audit");
     let found = wait_for_audit_event(
         &audit_dir,
         |event| {
             event["event_type"] == "agent-auth-denied"
-                && event["extra"]["token_prefix"] == "agt_v1_g"
+                && event["extra"]["token_prefix"] == "agt_v2_"
         },
         Duration::from_secs(2),
     );
     assert!(
         found.is_some(),
-        "expected an agent-auth-denied audit event with token_prefix='agt_v1_g'"
+        "expected an agent-auth-denied audit event with token_prefix='agt_v2_'"
     );
 
     // DaemonHandle Drop SIGKILLs on scope exit; explicit graceful

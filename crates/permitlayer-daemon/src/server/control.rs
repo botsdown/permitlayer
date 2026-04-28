@@ -1108,9 +1108,14 @@ pub(crate) async fn register_agent_handler(
     };
 
     // 4. Generate the plaintext token + derived material.
+    //
+    // Story 7.6b: bearer tokens are now `agt_v2_<name>_<random>` so
+    // the auth path can parse the agent name from the prefix and look
+    // up the agent in O(1) keyed by HMAC(daemon_subkey, name).
+    // Before 7.6b: `agt_v1_<random>` plus a global Argon2id sweep.
     let raw_bytes = generate_bearer_token_bytes();
     let plaintext_body = base64_url_no_pad(&raw_bytes);
-    let bearer_token = format!("{BEARER_TOKEN_PREFIX}{plaintext_body}");
+    let bearer_token = format!("{BEARER_TOKEN_PREFIX}{}_{plaintext_body}", payload.name);
     // Argon2id hashing is a ~100ms CPU burn — bounce it off the
     // blocking pool so the tokio worker thread isn't stalled for the
     // duration. The plaintext bytes are cloned into a Vec<u8> so the
@@ -1137,7 +1142,10 @@ pub(crate) async fn register_agent_handler(
             );
         }
     };
-    let lookup_key = compute_lookup_key(&state.agent_lookup_key, bearer_token.as_bytes());
+    // Story 7.6b: HMAC message is the agent name, NOT the full
+    // bearer token. The auth path parses the name from the v2 token
+    // prefix and computes the same HMAC to hit the registry index.
+    let lookup_key = compute_lookup_key(&state.agent_lookup_key, payload.name.as_bytes());
     let lookup_key_hex = lookup_key_to_hex(&lookup_key);
 
     let created_at = chrono::Utc::now();

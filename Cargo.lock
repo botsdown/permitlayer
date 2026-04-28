@@ -2158,6 +2158,7 @@ dependencies = [
  "trybuild",
  "ulid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]
@@ -2192,6 +2193,7 @@ dependencies = [
  "http-body-util",
  "indicatif",
  "insta",
+ "libc",
  "minisign",
  "minisign-verify",
  "mockito",
@@ -2204,6 +2206,7 @@ dependencies = [
  "permitlayer-plugins",
  "permitlayer-proxy",
  "permitlayer-vault",
+ "rand 0.8.5",
  "reqwest 0.12.28",
  "rmcp",
  "rquickjs",
@@ -2212,6 +2215,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

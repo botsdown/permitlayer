@@ -127,4 +127,33 @@ pub trait AgentIdentityStore: Send + Sync {
     /// MAY return `Ok(())` without persisting. The auth hot path uses
     /// this on every successful authentication.
     async fn touch_last_seen(&self, identity: AgentIdentity) -> Result<(), StoreError>;
+
+    /// Atomically rewrite the `lookup_key_hex` and `token_hash` fields
+    /// of an existing agent. Used by `agentsso rotate-key`'s Phase E
+    /// (Story 7.6b AC #11) to re-issue bearer tokens under the new
+    /// master-derived subkey while preserving every other field
+    /// (`name`, `policy_name`, `created_at`, `last_seen_at`).
+    ///
+    /// Implementations MUST:
+    /// - validate `name` via `agent::validate_agent_name` and surface
+    ///   [`StoreError::InvalidAgentName`] on failure
+    /// - mirror `put`'s atomic-write discipline (tempfile → fsync →
+    ///   rename → fsync parent dir; mode `0o600` on Unix in `0o700`
+    ///   parent dir)
+    /// - return `Ok(false)` if no agent with that name exists
+    /// - return `Ok(true)` on a successful rewrite
+    ///
+    /// **Why a dedicated 2-field method:** rotation must NEVER mutate
+    /// `name`, `policy_name`, `created_at`, or `last_seen_at`. A
+    /// typed method makes that invariant a compiler-checked property
+    /// rather than relying on convention; a generic `put_overwrite`
+    /// would be a footgun for any future caller who reaches for "I
+    /// just need to update some fields" and accidentally clobbers
+    /// others.
+    async fn update_lookup_key_and_token(
+        &self,
+        name: &str,
+        new_lookup_key_hex: String,
+        new_token_hash: String,
+    ) -> Result<bool, StoreError>;
 }

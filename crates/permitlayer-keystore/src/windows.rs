@@ -4,13 +4,20 @@
 //! (`MASTER_KEY_SERVICE`, `MASTER_KEY_ACCOUNT`) via the `keyring`
 //! crate's `windows-native` backend. All FFI calls go through
 //! `tokio::task::spawn_blocking` (AC #3).
+//!
+//! Story 7.6b round-1 review re-triage: the per-helper logic was
+//! extracted to `keyring_shared.rs` because it was identical across
+//! `macos.rs` / `linux.rs` / `windows.rs`.
 
 #![cfg(target_os = "windows")]
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::KeyStoreError;
-use crate::{DeleteOutcome, KeyStore, MASTER_KEY_ACCOUNT, MASTER_KEY_LEN, MASTER_KEY_SERVICE};
+use crate::keyring_shared as shared;
+use crate::{
+    DeleteOutcome, KeyStore, MASTER_KEY_ACCOUNT, MASTER_KEY_LEN, MASTER_KEY_PREVIOUS_ACCOUNT,
+};
 
 const BACKEND: &str = "windows";
 
@@ -22,7 +29,7 @@ pub struct WindowsKeyStore {
 impl WindowsKeyStore {
     /// Construct and probe the Credential Manager backend.
     pub fn new() -> Result<Self, KeyStoreError> {
-        probe_backend()?;
+        shared::probe_backend(BACKEND, MASTER_KEY_ACCOUNT)?;
         Ok(Self { _private: () })
     }
 }
@@ -30,123 +37,61 @@ impl WindowsKeyStore {
 #[async_trait::async_trait]
 impl KeyStore for WindowsKeyStore {
     async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
-        tokio::task::spawn_blocking(fetch_or_create_master_key).await.map_err(join_err)?
+        tokio::task::spawn_blocking(|| {
+            shared::fetch_or_create_master_key_at_account(BACKEND, MASTER_KEY_ACCOUNT)
+        })
+        .await
+        .map_err(|e| shared::join_err(BACKEND, e))?
     }
 
     async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
         let key_copy: Zeroizing<[u8; MASTER_KEY_LEN]> = Zeroizing::new(*key);
-        tokio::task::spawn_blocking(move || set_and_verify(&key_copy)).await.map_err(join_err)?
+        tokio::task::spawn_blocking(move || {
+            shared::set_and_verify_at_account(
+                BACKEND,
+                MASTER_KEY_ACCOUNT,
+                &key_copy,
+                "set_master_key read-back did not match written value",
+            )
+        })
+        .await
+        .map_err(|e| shared::join_err(BACKEND, e))?
     }
 
     async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError> {
-        tokio::task::spawn_blocking(delete_entry).await.map_err(join_err)?
+        tokio::task::spawn_blocking(|| shared::delete_account(BACKEND, MASTER_KEY_ACCOUNT))
+            .await
+            .map_err(|e| shared::join_err(BACKEND, e))?
     }
-}
 
-/// Delete the master-key entry from the Windows Credential Manager.
-///
-/// Tolerates `keyring::Error::NoEntry` as `AlreadyAbsent` for
-/// idempotency — `agentsso uninstall` calls this unconditionally and
-/// must succeed whether or not an entry exists.
-fn delete_entry() -> Result<DeleteOutcome, KeyStoreError> {
-    let entry = keyring::Entry::new(MASTER_KEY_SERVICE, MASTER_KEY_ACCOUNT).map_err(map_err)?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(DeleteOutcome::Removed),
-        Err(keyring::Error::NoEntry) => Ok(DeleteOutcome::AlreadyAbsent),
-        Err(e) => Err(map_err(e)),
+    async fn set_previous_master_key(
+        &self,
+        previous: &[u8; MASTER_KEY_LEN],
+    ) -> Result<(), KeyStoreError> {
+        let prev_copy: Zeroizing<[u8; MASTER_KEY_LEN]> = Zeroizing::new(*previous);
+        tokio::task::spawn_blocking(move || {
+            shared::set_and_verify_at_account(
+                BACKEND,
+                MASTER_KEY_PREVIOUS_ACCOUNT,
+                &prev_copy,
+                "previous-slot read-back did not match written value",
+            )
+        })
+        .await
+        .map_err(|e| shared::join_err(BACKEND, e))?
     }
-}
 
-fn set_and_verify(key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
-    let entry = keyring::Entry::new(MASTER_KEY_SERVICE, MASTER_KEY_ACCOUNT).map_err(map_err)?;
-    entry.set_secret(key).map_err(map_err)?;
-    let mut read_back = entry.get_secret().map_err(map_err)?;
-    let eq = read_back.len() == MASTER_KEY_LEN && constant_time_eq(&read_back, key);
-    read_back.zeroize();
-    if !eq {
-        return Err(KeyStoreError::PlatformError {
-            backend: BACKEND,
-            message: "set_master_key read-back did not match written value".into(),
-        });
+    async fn previous_master_key(
+        &self,
+    ) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>, KeyStoreError> {
+        tokio::task::spawn_blocking(|| shared::read_account(BACKEND, MASTER_KEY_PREVIOUS_ACCOUNT))
+            .await
+            .map_err(|e| shared::join_err(BACKEND, e))?
     }
-    Ok(())
-}
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
-
-fn probe_backend() -> Result<(), KeyStoreError> {
-    let entry = keyring::Entry::new(MASTER_KEY_SERVICE, MASTER_KEY_ACCOUNT).map_err(map_err)?;
-    match entry.get_secret() {
-        Ok(mut bytes) => {
-            bytes.zeroize();
-            Ok(())
-        }
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(map_err(e)),
-    }
-}
-
-fn fetch_or_create_master_key() -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
-    let entry = keyring::Entry::new(MASTER_KEY_SERVICE, MASTER_KEY_ACCOUNT).map_err(map_err)?;
-    match entry.get_secret() {
-        Ok(mut bytes) => {
-            let result = read_key_from_bytes(&bytes);
-            bytes.zeroize();
-            result
-        }
-        Err(keyring::Error::NoEntry) => {
-            use rand::RngCore;
-            let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
-            rand::rngs::OsRng.fill_bytes(&mut *key);
-            match entry.set_secret(&*key) {
-                Ok(()) => {
-                    let mut bytes = entry.get_secret().map_err(map_err)?;
-                    let result = read_key_from_bytes(&bytes);
-                    bytes.zeroize();
-                    result
-                }
-                Err(_) => {
-                    let mut bytes = entry.get_secret().map_err(map_err)?;
-                    let result = read_key_from_bytes(&bytes);
-                    bytes.zeroize();
-                    result
-                }
-            }
-        }
-        Err(e) => Err(map_err(e)),
-    }
-}
-
-fn read_key_from_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
-    if bytes.len() != MASTER_KEY_LEN {
-        return Err(KeyStoreError::MalformedMasterKey {
-            expected_len: MASTER_KEY_LEN,
-            actual_len: bytes.len(),
-        });
-    }
-    let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
-    key.copy_from_slice(bytes);
-    Ok(key)
-}
-
-fn map_err(e: keyring::Error) -> KeyStoreError {
-    match e {
-        keyring::Error::NoStorageAccess(source) => {
-            KeyStoreError::BackendUnavailable { backend: BACKEND, source }
-        }
-        keyring::Error::PlatformFailure(source) => {
-            KeyStoreError::PlatformError { backend: BACKEND, message: source.to_string() }
-        }
-        other => KeyStoreError::PlatformError { backend: BACKEND, message: other.to_string() },
-    }
-}
-
-fn join_err(e: tokio::task::JoinError) -> KeyStoreError {
-    KeyStoreError::PlatformError {
-        backend: BACKEND,
-        message: format!("spawn_blocking join failed: {e}"),
+    async fn clear_previous_master_key(&self) -> Result<(), KeyStoreError> {
+        tokio::task::spawn_blocking(|| shared::clear_account(BACKEND, MASTER_KEY_PREVIOUS_ACCOUNT))
+            .await
+            .map_err(|e| shared::join_err(BACKEND, e))?
     }
 }

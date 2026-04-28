@@ -73,6 +73,13 @@ enum Commands {
     /// Destructive — requires interactive confirmation OR --yes.
     /// Daemon must be stopped first (`agentsso stop`).
     RotateKey(cli::rotate_key::RotateKeyArgs),
+    /// Abandon an in-flight master-key rotation (Story 7.6b round-2).
+    /// Operator escape hatch when rotate-key crashed at phase
+    /// pre-previous or pre-primary and the new key bytes were lost.
+    /// Clears the keystore's `previous` slot AND removes the
+    /// rotation-state marker; refuses if the marker phase is
+    /// `committed` (use `agentsso rotate-key` to resume instead).
+    KeystoreClearPrevious(cli::rotate_key::keystore_clear_previous::KeystoreClearPreviousArgs),
 }
 
 /// Top-level `main` dispatcher.
@@ -124,6 +131,9 @@ async fn main() -> ExitCode {
         Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),
         Some(Commands::RotateKey(args)) => {
             rotate_key_to_exit_code(cli::rotate_key::run(args).await)
+        }
+        Some(Commands::KeystoreClearPrevious(args)) => {
+            rotate_key_to_exit_code(cli::rotate_key::keystore_clear_previous::run(args).await)
         }
         None => {
             use clap::CommandFactory;

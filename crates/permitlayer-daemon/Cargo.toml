@@ -18,21 +18,59 @@ autotests = false
 name = "agentsso"
 path = "src/main.rs"
 
+[features]
+# Story 7.6b round-2 re-triage: explicit feature flag for the
+# in-binary test seams (file-backed keystore selection, crash-
+# injection in rotate-key, AGENTSSO_TEST_MASTER_KEY_HEX +
+# AGENTSSO_TEST_PASSPHRASE bootstrap shortcuts). Pre-round-2 these
+# were gated by `cfg(debug_assertions)`, which was a build-PROFILE
+# flag — `cargo build` (dev profile) shipped them enabled even
+# though the user had not opted in. The feature flag makes the
+# seam-vs-production boundary an explicit Cargo metadata fact:
+#
+#   cargo build                   → seams compiled out
+#   cargo build --release         → seams compiled out
+#   cargo install                 → seams compiled out (does not
+#                                   enable non-default features)
+#   cargo test                    → seams compiled in (the
+#                                   integration test target's
+#                                   required-features triggers it
+#                                   AND cargo unifies features
+#                                   across the workspace per-build)
+#
+# Transitively enables `permitlayer-keystore/test-seam` so the
+# `FileBackedKeyStore` and `PassphraseKeyStore::from_passphrase`
+# constructors are visible.
+test-seam = ["permitlayer-keystore/test-seam"]
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
+required-features = ["test-seam"]
 
 [dependencies]
 permitlayer-proxy.workspace = true
 permitlayer-oauth.workspace = true
 permitlayer-vault.workspace = true
-# `test-seam` enables `PassphraseKeyStore::from_passphrase` as a `pub`
-# constructor so the debug-assertion-gated `AGENTSSO_TEST_PASSPHRASE`
-# env var in `cli/start.rs::ensure_master_key_bootstrapped` can use it
-# to route integration tests through the real `bootstrap_from_keystore`
-# path. The feature is a no-op in release builds because the only
-# caller lives behind `#[cfg(debug_assertions)]` and compiles out.
-permitlayer-keystore = { workspace = true, features = ["test-seam"] }
+# Story 7.6b round-1 review: rotation read-back-verify uses
+# `subtle::ConstantTimeEq` for the byte comparison. Not strictly
+# required (rotation isn't in the auth hot path), but keeps the
+# discipline uniform with the keystore-conformance code path.
+subtle.workspace = true
+# Story 7.6b round-2 review: marker tempfile + rotate-key-output
+# tempfile use 64-bit OsRng suffixes for collision-resistance under
+# create_new(true). Workspace already pulls rand transitively, but
+# adding it as a direct dep keeps the daemon's dependency intent
+# explicit.
+rand.workspace = true
+# Story 7.6b round-2 re-triage: `permitlayer-keystore`'s `test-seam`
+# feature is now enabled ONLY when the daemon's own `test-seam`
+# feature is enabled (see `[features]` below). Pre-round-2 it was
+# enabled unconditionally — that was harmless because the env-var
+# read at `cli/start.rs::ensure_master_key_bootstrapped` was gated
+# by `cfg(debug_assertions)`, but the feature flag is a clearer
+# boundary than the build profile.
+permitlayer-keystore.workspace = true
 permitlayer-core.workspace = true
 permitlayer-credential.workspace = true
 permitlayer-plugins.workspace = true
@@ -90,6 +128,13 @@ semver = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+# Story 7.6b round-2 review: rotation-state marker file uses
+# `libc::O_NOFOLLOW` to refuse symlink-plant attacks at the marker
+# path — same discipline as `permitlayer-core::vault::lock`. Unix-
+# only; the Windows path uses `OpenOptions` without the flag (no
+# `O_NOFOLLOW` equivalent in the standard library, but Windows ACLs
+# and the marker's parent-dir 0700 perms close the gap.)
+libc = "0.2"
 # Story 7.5 — `rustix::fs::statvfs` for the disk-space pre-flight.
 # POSIX-only; the Windows path uses a PowerShell shell-out fallback.
 rustix = { workspace = true }

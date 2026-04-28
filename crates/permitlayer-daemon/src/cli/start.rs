@@ -433,10 +433,15 @@ pub(crate) fn compute_active_key_id(vault_dir: &std::path::Path) -> u8 {
         };
         let path = entry.path();
         let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        // Story 7.6b round-1 review: `.sealed.new` filter removed —
+        // it was dead code (a file named `<svc>.sealed.new` does not
+        // end in `.sealed` so the prior clause already excludes it),
+        // and Story 7.6b deleted the entire `.sealed.new` staging
+        // path. The remaining filters keep dotfiles and tempfiles
+        // (`<svc>.sealed.tmp.<pid>.<n>`) out of the iteration.
         if !file_name.ends_with(".sealed")
             || file_name.starts_with('.')
             || file_name.contains(".tmp.")
-            || file_name.contains(".sealed.new")
         {
             continue;
         }
@@ -511,6 +516,114 @@ pub(crate) fn compute_active_key_id(vault_dir: &std::path::Path) -> u8 {
         );
     }
     max_key_id
+}
+
+/// Walk the vault directory and return `(min, max)` of `key_id` over
+/// every `.sealed` file. Mirrors [`compute_active_key_id`]'s
+/// skip-and-warn discipline. Returns `None` if no readable `.sealed`
+/// envelopes were found (fresh / empty vault — the boot-time
+/// mixed-key refusal does not fire on an empty vault).
+///
+/// Story 7.6b AC #13: the boot-time check refuses to start if
+/// `min < max`, indicating a previous `agentsso rotate-key` did not
+/// complete. Re-running rotate-key resumes the rotation idempotently.
+///
+/// Story 7.6b round-1 review: return type tightened to a tri-state
+/// `Result<Option<...>, io::Error>` so the boot guard can distinguish
+/// "vault is empty" (`Ok(None)`) from "couldn't read vault dir"
+/// (`Err`). The previous `Option`-only return collapsed both into a
+/// silent boot pass — fixed.
+pub(crate) fn compute_min_max_key_id(
+    vault_dir: &std::path::Path,
+) -> Result<Option<(u8, u8)>, std::io::Error> {
+    let read_dir = match std::fs::read_dir(vault_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                dir = %vault_dir.display(),
+                "vault dir read failed during mixed-key_id check"
+            );
+            return Err(e);
+        }
+    };
+    let mut min_key_id: Option<u8> = None;
+    let mut max_key_id: u8 = 0;
+    let mut considered: u32 = 0;
+    let mut unreadable: u32 = 0;
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping unreadable vault entry while computing min/max key_id");
+                unreadable += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        // Story 7.6b round-1 review: `.sealed.new` filter removed —
+        // it was dead code (a file named `<svc>.sealed.new` does not
+        // end in `.sealed` so the prior clause already excludes it),
+        // and Story 7.6b deleted the entire `.sealed.new` staging
+        // path. The remaining filters keep dotfiles and tempfiles
+        // (`<svc>.sealed.tmp.<pid>.<n>`) out of the iteration.
+        if !file_name.ends_with(".sealed")
+            || file_name.starts_with('.')
+            || file_name.contains(".tmp.")
+        {
+            continue;
+        }
+        considered += 1;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let mut handle = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let mut header = [0u8; 4];
+        use std::io::Read as _;
+        if handle.read_exact(&mut header).is_err() {
+            unreadable += 1;
+            continue;
+        }
+        let version = u16::from_le_bytes([header[0], header[1]]);
+        let key_id = match version {
+            // v1 envelopes have no key_id byte; treat as 0.
+            1 => 0u8,
+            2 => header[3],
+            _ => continue,
+        };
+        if key_id > max_key_id {
+            max_key_id = key_id;
+        }
+        match min_key_id {
+            None => min_key_id = Some(key_id),
+            Some(cur) if key_id < cur => min_key_id = Some(key_id),
+            _ => {}
+        }
+    }
+    // Fail-closed: if at least one envelope existed but every one
+    // was unreadable, we cannot know whether the vault is in a
+    // mixed-key state. Refuse to boot rather than silently pass.
+    if considered > 0 && unreadable == considered {
+        return Err(std::io::Error::other(format!(
+            "all {considered} vault envelope(s) are unreadable; cannot determine rotation state"
+        )));
+    }
+    Ok(min_key_id.map(|min| (min, max_key_id)))
 }
 
 async fn try_build_proxy_service(
@@ -1034,7 +1147,40 @@ async fn try_build_agent_runtime(
         }
     };
 
-    // 2. Load any pre-existing agents into a fresh snapshot. An empty
+    // 2. Derive the HMAC lookup subkey from the (eagerly bootstrapped)
+    //    master key BEFORE building the registry — the registry now
+    //    sanity-checks each agent's `lookup_key_hex` against the
+    //    recomputed HMAC at construction time (Story 7.6b AC #12), so
+    //    it needs the subkey before it can build its initial snapshot.
+    //
+    //    Story 1.15 removed the pre-setup placeholder branch — by the
+    //    time `try_build_agent_runtime` runs, the master key is
+    //    guaranteed to exist (bootstrapped in `run()` before this
+    //    function is called), so the subkey is always a real HMAC
+    //    derivation, never a zero fallback.
+    //
+    //    The subkey lives inside `Zeroizing<[u8; 32]>` from derivation
+    //    through daemon shutdown — both the middleware (`AuthLayer`) and
+    //    the control plane (`ControlState`) share ONE `Arc<Zeroizing<_>>`
+    //    allocation so there is no second cleartext copy anywhere in
+    //    the process.
+    let mut lookup_key = Zeroizing::new([0u8; LOOKUP_KEY_BYTES]);
+    let hkdf = Hkdf::<Sha256>::new(None, master_key.as_slice());
+    if let Err(e) = hkdf.expand(permitlayer_core::agent::AGENT_LOOKUP_HKDF_INFO, &mut *lookup_key) {
+        // HKDF-expand with a 32-byte output and a fixed info string
+        // should never fail (the only failure mode is output length >
+        // 255 * hash_size = 8160 bytes for SHA-256, which we cannot
+        // hit with a 32-byte target). If it somehow does, fail-fast
+        // — we refuse to boot with a half-derived key. The `hkdf`
+        // crate's `InvalidLength` error captures the specific cause.
+        tracing::error!(
+            error = ?e,
+            "HKDF expansion failed for agent token lookup subkey — this should be impossible with a 32-byte output; refusing to boot"
+        );
+        return Err(StartError::HkdfExpand);
+    }
+
+    // 3. Load any pre-existing agents into a fresh snapshot. An empty
     //    list is fine — the registry boots empty until the operator
     //    runs `agentsso agent register`.
     let initial_agents = if let Some(store) = &agent_store {
@@ -1054,35 +1200,14 @@ async fn try_build_agent_runtime(
     } else {
         vec![]
     };
-    let agent_registry = Arc::new(AgentRegistry::new(initial_agents));
-
-    // 3. Derive the HMAC lookup subkey from the (eagerly bootstrapped)
-    //    master key. Story 1.15 removed the pre-setup placeholder
-    //    branch — by the time `try_build_agent_runtime` runs, the
-    //    master key is guaranteed to exist (bootstrapped in `run()`
-    //    before this function is called), so the subkey is always a
-    //    real HMAC derivation, never a zero fallback.
-    //
-    //    The subkey lives inside `Zeroizing<[u8; 32]>` from derivation
-    //    through daemon shutdown — both the middleware (`AuthLayer`) and
-    //    the control plane (`ControlState`) share ONE `Arc<Zeroizing<_>>`
-    //    allocation so there is no second cleartext copy anywhere in
-    //    the process.
-    let mut lookup_key = Zeroizing::new([0u8; LOOKUP_KEY_BYTES]);
-    let hkdf = Hkdf::<Sha256>::new(None, master_key.as_slice());
-    if let Err(e) = hkdf.expand(b"permitlayer-agent-token-lookup-v1", &mut *lookup_key) {
-        // HKDF-expand with a 32-byte output and a fixed info string
-        // should never fail (the only failure mode is output length >
-        // 255 * hash_size = 8160 bytes for SHA-256, which we cannot
-        // hit with a 32-byte target). If it somehow does, fail-fast
-        // — we refuse to boot with a half-derived key. The `hkdf`
-        // crate's `InvalidLength` error captures the specific cause.
-        tracing::error!(
-            error = ?e,
-            "HKDF expansion failed for agent token lookup subkey — this should be impossible with a 32-byte output; refusing to boot"
-        );
-        return Err(StartError::HkdfExpand);
-    }
+    // Story 7.6b AC #12: registry sanity-checks each agent's on-disk
+    // `lookup_key_hex` against `HMAC(daemon_subkey, agent.name())`.
+    // Mismatched agents are dropped from the auth index with a warn —
+    // catches the post-Phase-E-crash state where some agent files
+    // hold an HMAC keyed by the OLD subkey. The registry holds its
+    // own `Zeroizing<[u8;32]>` copy of the subkey so the bytes are
+    // scrubbed at registry drop alongside the auth-layer copy.
+    let agent_registry = Arc::new(AgentRegistry::with_subkey(initial_agents, *lookup_key));
 
     // The agent_store may still be `None` (best-effort: the agents
     // directory could not be created), in which case the register
@@ -1272,6 +1397,45 @@ pub(crate) enum StartError {
         #[source]
         source: permitlayer_plugins::PluginError,
     },
+
+    /// Story 7.6b AC #13: the vault contains envelopes at multiple
+    /// `key_id` values — a previous `agentsso rotate-key` did not
+    /// complete. The daemon refuses to boot until the rotation is
+    /// finished; re-running `agentsso rotate-key` resumes the rotation
+    /// idempotently because the keystore stages both keys atomically
+    /// before any vault write begins (Q3 transient-previous-slot).
+    /// Distinct exit code 6 — not 4 (filesystem failure) and not 5
+    /// (port bind) — so operators can triage "stale rotation state"
+    /// from "filesystem broken" or "port conflict".
+    #[error(
+        "vault rotation incomplete: envelopes span multiple key_ids \
+         (min={min}, max={max}); re-run `agentsso rotate-key` to finish"
+    )]
+    VaultRotationIncomplete {
+        /// The smallest `key_id` observed in any `.sealed` envelope.
+        min: u8,
+        /// The largest `key_id` observed in any `.sealed` envelope.
+        max: u8,
+    },
+    /// Story 7.6b round-2 review: rotation state cannot be verified
+    /// (marker file is malformed/unreadable, OR vault dir is
+    /// unreadable, OR a rotation-state marker file is on disk
+    /// indicating an in-flight rotation). Distinct from
+    /// [`Self::VaultRotationIncomplete`] which means the daemon
+    /// observed concrete proof of mixed-key state. This variant is
+    /// the "I cannot tell — refuse fail-closed" arm. Exit code 6
+    /// (same family).
+    #[error(
+        "rotation state cannot be verified: {reason}; \
+         re-run `agentsso rotate-key` to finish — or run \
+         `agentsso keystore-clear-previous` if the rotation is \
+         abandoned and you want to start fresh"
+    )]
+    VaultStateUnverifiable {
+        /// Human-readable reason: marker malformed / vault dir
+        /// unreadable / marker phase recorded.
+        reason: String,
+    },
 }
 
 impl StartError {
@@ -1301,6 +1465,10 @@ impl StartError {
             // patch — distinct remediation from "another process
             // holds it" and from "filesystem failure").
             Self::BindFailed { .. } => 5,
+            // Exit 6 — vault rotation incomplete (Story 7.6b AC #13).
+            // Distinct from 3/4/5 because the operator's remediation
+            // is unique: re-run `agentsso rotate-key` to finish.
+            Self::VaultRotationIncomplete { .. } | Self::VaultStateUnverifiable { .. } => 6,
         }
     }
 
@@ -1433,6 +1601,39 @@ impl StartError {
                  this banner (their failures are logged and the connector is\n\
                  skipped).\n"
             ),
+            Self::VaultRotationIncomplete { min, max } => format!(
+                "error: vault contains envelopes at multiple key_ids \
+                 (min={min}, max={max})\n\
+                 \n\
+                 a previous `agentsso rotate-key` started but did not finish. The\n\
+                 daemon refuses to boot until the rotation is complete because\n\
+                 a partially-rotated vault can leave the agent registry and the\n\
+                 sealed credentials out of sync.\n\
+                 \n\
+                 remediation:\n\
+                 - re-run `agentsso rotate-key`. The keystore stages both the old\n\
+                   and new master keys atomically before any vault write begins,\n\
+                   so re-running is always safe — rotation completes idempotently.\n\
+                 - once rotation finishes, `agentsso start` boots cleanly.\n"
+            ),
+            Self::VaultStateUnverifiable { reason } => format!(
+                "error: rotation state cannot be verified ({reason})\n\
+                 \n\
+                 the daemon refuses to boot when it cannot determine whether a\n\
+                 master-key rotation is in flight. This is the fail-closed posture:\n\
+                 we'd rather refuse than risk booting against a half-rotated vault.\n\
+                 \n\
+                 remediation:\n\
+                 - if a rotation is in flight, re-run `agentsso rotate-key`.\n\
+                 - if a rotation crashed at `pre-previous` or `pre-primary`, run\n\
+                   `agentsso keystore-clear-previous` to abandon it; then re-run\n\
+                   `agentsso rotate-key` to start fresh.\n\
+                 - if the rotation-state marker file is malformed, inspect or remove\n\
+                   `~/.agentsso/vault/.rotation-state` by hand; the keystore is\n\
+                   unaffected by removing the marker.\n\
+                 - if the vault directory is unreadable, fix the filesystem perms\n\
+                   (`chmod 0700 ~/.agentsso/vault/`) and try again.\n"
+            ),
         }
     }
 }
@@ -1460,11 +1661,16 @@ impl StartError {
 ///
 /// `AGENTSSO_TEST_MASTER_KEY_HEX` lets integration tests drive a
 /// deterministic master key without provisioning a real keychain
-/// entry. The env var is gated behind `#[cfg(debug_assertions)]` so
-/// release builds compile the seam out entirely — an operator with
-/// the env var exported in their shell cannot accidentally seed a
-/// known master key into a production daemon. Matches the Story 4.5
-/// pattern for the `AGENTSSO_TEST_APPROVAL_*` seams.
+/// entry. Story 7.6b round-2 re-triage: gated by the `test-seam`
+/// Cargo feature (NOT `cfg(debug_assertions)`). The feature is
+/// enabled by `cargo test`'s integration target via
+/// `required-features = ["test-seam"]`; OFF for `cargo build` /
+/// `cargo build --release` / `cargo install`. An operator with the
+/// env var exported in their shell cannot accidentally seed a known
+/// master key into a production daemon, regardless of how the
+/// binary was built. Mirrors the same Cargo-metadata-explicit
+/// boundary for the `AGENTSSO_TEST_KEYSTORE_FILE_BACKED` and
+/// `AGENTSSO_TEST_ROTATE_CRASH_AT_PHASE` seams.
 ///
 /// # Errors
 ///
@@ -1476,12 +1682,17 @@ impl StartError {
 pub(crate) async fn ensure_master_key_bootstrapped(
     config: &DaemonConfig,
 ) -> Result<zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>, StartError> {
-    // Test seams: ONLY compiled in dev/test builds via
-    // `debug_assertions` — release builds (`cargo install` without
-    // `--debug`) drop these branches so leaked env vars in an
-    // operator shell cannot bypass the real keystore. Mirrors the
-    // Story 4.5 pattern for `AGENTSSO_TEST_APPROVAL_*` seams.
-    #[cfg(debug_assertions)]
+    // Story 7.6b round-2 re-triage: test seams are gated by the
+    // `test-seam` Cargo feature (NOT `cfg(debug_assertions)`). The
+    // feature is enabled by `cargo test` via the integration test
+    // target's `required-features = ["test-seam"]`; it is OFF for
+    // `cargo build` / `cargo build --release` / `cargo install`.
+    // This makes the seam-vs-production boundary an explicit Cargo
+    // metadata fact rather than a build-profile inference. Pre-
+    // round-2 these env vars activated in any debug build, which
+    // exposed casual-`cargo build` users to leaked-shell-var
+    // bypasses of the real keystore.
+    #[cfg(feature = "test-seam")]
     {
         // (1) Test seam: force keystore error at boot. Used by the
         //     fail-fast subprocess test to drive the exit(2) path
@@ -1527,14 +1738,34 @@ pub(crate) async fn ensure_master_key_bootstrapped(
         if let Ok(passphrase) = std::env::var("AGENTSSO_TEST_PASSPHRASE") {
             tracing::warn!(
                 "AGENTSSO_TEST_PASSPHRASE is set — using test passphrase keystore. \
-                 This env var is compiled out of release builds and MUST NEVER \
-                 appear in a production deployment."
+                 This env var is only honored when agentsso is built with the \
+                 `test-seam` Cargo feature, which production builds (`cargo install`) \
+                 never enable."
             );
             let keystore = permitlayer_keystore::PassphraseKeyStore::from_passphrase(
                 &config.paths.home,
                 &passphrase,
             )
             .map_err(|source| StartError::KeystoreConstruction { source })?;
+            return bootstrap_from_keystore(&keystore).await;
+        }
+
+        // (4) Test seam: `FileBackedKeyStore` shared with rotate-key.
+        //     Story 7.6b round-2 review: the auth-round-trip e2e test
+        //     in `rotate_key_e2e.rs::auth_round_trip_against_running_daemon`
+        //     needs the daemon AND rotate-key to use the SAME
+        //     keystore so a key rotation is visible to the daemon's
+        //     post-restart bootstrap. The file-backed test keystore
+        //     (mode 0o600, on-disk, survives subprocess restarts)
+        //     provides that — same env var the rotate-key seam uses.
+        if std::env::var("AGENTSSO_TEST_KEYSTORE_FILE_BACKED").is_ok() {
+            tracing::warn!(
+                "AGENTSSO_TEST_KEYSTORE_FILE_BACKED is set — using file-backed test \
+                 keystore at boot. This env var is only honored when agentsso is \
+                 built with the `test-seam` Cargo feature."
+            );
+            let keystore = permitlayer_keystore::FileBackedKeyStore::new(&config.paths.home)
+                .map_err(|source| StartError::KeystoreConstruction { source })?;
             return bootstrap_from_keystore(&keystore).await;
         }
     }
@@ -1590,9 +1821,9 @@ pub(crate) async fn bootstrap_from_keystore(
 /// set and valid. Returns `None` when the env var is absent, too
 /// short/long, or contains non-hex characters.
 ///
-/// Compiled out in release builds — see
-/// [`ensure_master_key_bootstrapped`] for the rationale.
-#[cfg(debug_assertions)]
+/// Compiled out unless the `test-seam` Cargo feature is enabled —
+/// see [`ensure_master_key_bootstrapped`] for the rationale.
+#[cfg(feature = "test-seam")]
 fn read_test_master_key_env()
 -> Option<zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>> {
     let Ok(hex_str) = std::env::var("AGENTSSO_TEST_MASTER_KEY_HEX") else {
@@ -1784,6 +2015,81 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             return Err(StartError::VaultLockIo { source: synth });
         }
     };
+
+    // 3a. Story 7.6b AC #13: refuse to boot if a rotation is
+    // mid-flight. There are two independent indicators, BOTH of
+    // which trigger refusal:
+    //
+    //   (a) The rotation-state marker file is present
+    //       (`<home>/vault/.rotation-state`). The marker is the
+    //       authoritative record of in-flight rotation; if it's on
+    //       disk, the previous `agentsso rotate-key` either crashed
+    //       or is still running.
+    //   (b) The vault contains envelopes at multiple `key_id`
+    //       values (`min < max`). A previous rotate-key reached
+    //       Phase D but did not finish.
+    //
+    // Story 7.6b round-1 review (fail-closed): a vault that exists
+    // but is unreadable (`compute_min_max_key_id` returns `Err`) is
+    // also a refusal. The previous code silently passed.
+    let vault_dir = config.paths.home.join("vault");
+
+    // Marker check first — it's the authoritative state.
+    match crate::cli::rotate_key::marker::read(&config.paths.home) {
+        Ok(Some(marker)) => {
+            tracing::error!(
+                keystore_phase = ?marker.keystore_phase,
+                marker_pid = marker.pid,
+                marker_started_at = %marker.started_at,
+                old_kid = marker.old_kid,
+                new_kid = marker.new_kid,
+                "daemon refusing to start: rotation-state marker present"
+            );
+            drop(_vault_lock);
+            return Err(StartError::VaultRotationIncomplete {
+                min: marker.old_kid,
+                max: marker.new_kid,
+            });
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "daemon refusing to start: rotation-state marker is malformed/unreadable"
+            );
+            drop(_vault_lock);
+            // Story 7.6b round-2 review: distinct StartError variant
+            // for "I cannot tell" so the human-facing message is
+            // accurate (the previous `VaultRotationIncomplete { 0, 0 }`
+            // produced a contradictory "envelopes span multiple
+            // key_ids (min=0, max=0)" banner — false on its face).
+            return Err(StartError::VaultStateUnverifiable {
+                reason: format!("rotation-state marker is malformed: {e}"),
+            });
+        }
+    }
+
+    // Vault min/max key_id check second.
+    match compute_min_max_key_id(&vault_dir) {
+        Ok(Some((min, max))) if min < max => {
+            drop(_vault_lock);
+            return Err(StartError::VaultRotationIncomplete { min, max });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "daemon refusing to start: vault is unreadable, cannot verify rotation state"
+            );
+            drop(_vault_lock);
+            // Story 7.6b round-2 review: distinct variant for the
+            // "vault unreadable" arm — see comment on the marker-
+            // malformed case above.
+            return Err(StartError::VaultStateUnverifiable {
+                reason: format!("vault directory is unreadable: {e}"),
+            });
+        }
+    }
 
     // 4. Initialize tracing subscriber (stdout + daily-rotating file
     // appender). The returned `WorkerGuard`s MUST live until process
@@ -2756,6 +3062,10 @@ mod tests {
         /// every call to simulate "second call sees the same key
         /// that the first call generated".
         stored: Mutex<Option<[u8; MASTER_KEY_LEN]>>,
+        /// Story 7.6b: previous-key slot for rotation crash-recovery.
+        /// `None` when no rotation is in flight; `Some` while the
+        /// keystore is in the dual-slot in-flight state.
+        previous: Mutex<Option<[u8; MASTER_KEY_LEN]>>,
         /// If `Some`, the NEXT call returns this error instead of
         /// the stored key. Consumed after one call so "simulate
         /// error once" tests behave naturally.
@@ -2770,6 +3080,7 @@ mod tests {
         fn new_empty() -> Self {
             Self {
                 stored: Mutex::new(None),
+                previous: Mutex::new(None),
                 next_error: Mutex::new(None),
                 call_count: Mutex::new(0),
             }
@@ -2778,6 +3089,7 @@ mod tests {
         fn with_stored(key: [u8; MASTER_KEY_LEN]) -> Self {
             Self {
                 stored: Mutex::new(Some(key)),
+                previous: Mutex::new(None),
                 next_error: Mutex::new(None),
                 call_count: Mutex::new(0),
             }
@@ -2786,6 +3098,7 @@ mod tests {
         fn failing(err: KeyStoreError) -> Self {
             Self {
                 stored: Mutex::new(None),
+                previous: Mutex::new(None),
                 next_error: Mutex::new(Some(err)),
                 call_count: Mutex::new(0),
             }
@@ -2826,6 +3139,25 @@ mod tests {
             } else {
                 Ok(DeleteOutcome::AlreadyAbsent)
             }
+        }
+
+        async fn set_previous_master_key(
+            &self,
+            previous: &[u8; MASTER_KEY_LEN],
+        ) -> Result<(), KeyStoreError> {
+            *self.previous.lock().unwrap() = Some(*previous);
+            Ok(())
+        }
+
+        async fn previous_master_key(
+            &self,
+        ) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>, KeyStoreError> {
+            Ok(self.previous.lock().unwrap().map(Zeroizing::new))
+        }
+
+        async fn clear_previous_master_key(&self) -> Result<(), KeyStoreError> {
+            *self.previous.lock().unwrap() = None;
+            Ok(())
         }
     }
 

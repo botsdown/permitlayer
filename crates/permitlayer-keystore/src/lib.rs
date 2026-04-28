@@ -39,6 +39,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod error;
+#[cfg(feature = "test-seam")]
+pub mod file_backed;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) mod keyring_shared;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -52,6 +56,8 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 pub use error::KeyStoreError;
+#[cfg(feature = "test-seam")]
+pub use file_backed::FileBackedKeyStore;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxKeyStore;
 #[cfg(target_os = "macos")]
@@ -73,6 +79,14 @@ pub const MASTER_KEY_SERVICE: &str = "io.permitlayer.master-key";
 /// one key per machine; this may become a slot identifier when key
 /// rotation (Story 7.6) introduces versioning.
 pub const MASTER_KEY_ACCOUNT: &str = "master";
+
+/// Account identifier for the *previous* master-key slot, used by
+/// `agentsso rotate-key` (Story 7.6b). The previous slot is non-empty
+/// only while a rotation is in flight (between Phase C' "atomic
+/// dual-slot install" and Phase F "clear previous slot"). Outside of
+/// in-flight rotation, `previous_master_key()` returns `Ok(None)` and
+/// the OS keychain entry at this account does not exist.
+pub const MASTER_KEY_PREVIOUS_ACCOUNT: &str = "master-previous";
 
 /// Outcome of a [`KeyStore::delete_master_key`] call.
 ///
@@ -133,6 +147,54 @@ pub trait KeyStore: Send + Sync {
     fn kind(&self) -> KeyStoreKind {
         KeyStoreKind::Native
     }
+
+    /// Write the "previous" master key slot.
+    ///
+    /// Story 7.6b round-1 review (Decision 1+2 resolution): the
+    /// rotation no longer asks the keystore to be transactional
+    /// across two slots — it can't, on any of our backends. Instead,
+    /// the keystore exposes single-slot primitives, and the rotation
+    /// orchestrates the dual-slot install with marker-staged crash
+    /// recovery (`cli::rotate_key::marker`). Each call here writes
+    /// exactly one slot; the rotation reads back via
+    /// [`Self::previous_master_key`] to verify and advances its
+    /// marker only when the read-back matches.
+    ///
+    /// Idempotent: writing the same bytes that are already on disk
+    /// MUST succeed. Used by `cli::rotate_key`'s Phase C' resume path
+    /// when `keystore_phase == PrePrevious` re-enters this call after
+    /// a crash.
+    ///
+    /// Returns [`KeyStoreError::PassphraseAdapterImmutable`] for the
+    /// passphrase adapter (which has no concept of a previous slot —
+    /// passphrase rotation goes through a different code path).
+    #[must_use = "set_previous_master_key result must not be silently discarded"]
+    async fn set_previous_master_key(
+        &self,
+        previous: &[u8; MASTER_KEY_LEN],
+    ) -> Result<(), KeyStoreError>;
+
+    /// Read the "previous" master key slot. Returns `Ok(None)` when
+    /// no rotation is in flight (post-Phase-F clear, or fresh
+    /// install). Story 7.6b AC #17.
+    ///
+    /// Returns [`KeyStoreError::PassphraseAdapterImmutable`] for the
+    /// passphrase adapter (which has no concept of a previous slot —
+    /// passphrase rotation goes through a different code path).
+    #[must_use = "previous_master_key result must not be silently discarded"]
+    async fn previous_master_key(
+        &self,
+    ) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>, KeyStoreError>;
+
+    /// Clear the "previous" master key slot. Idempotent — calling on
+    /// a single-slot keystore returns `Ok(())`. Called by
+    /// `agentsso rotate-key`'s Phase F to finalize rotation. Story
+    /// 7.6b AC #17.
+    ///
+    /// Returns [`KeyStoreError::PassphraseAdapterImmutable`] for the
+    /// passphrase adapter.
+    #[must_use = "clear_previous_master_key result must not be silently discarded"]
+    async fn clear_previous_master_key(&self) -> Result<(), KeyStoreError>;
 }
 
 /// Adapter family — used by callers that need to branch on

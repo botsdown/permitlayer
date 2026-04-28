@@ -789,7 +789,9 @@ mod tests {
 
     #[tokio::test]
     async fn auth_invalid_token_produces_401_with_dotted_code() {
-        let err = ProxyError::AuthInvalidToken { token_prefix: Some("agt_v1_g".to_owned()) };
+        // Story 7.6b round-1 review: prefix is now 7 chars (`agt_v2_`)
+        // — the 8th would have been the first letter of the agent name.
+        let err = ProxyError::AuthInvalidToken { token_prefix: Some("agt_v2_".to_owned()) };
         assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
         assert_eq!(err.error_code(), "auth.invalid_token");
         let response = err.into_response_with_request_id(Some("01TESTAI".to_owned()));
@@ -802,7 +804,7 @@ mod tests {
         // only used in the audit log for grep correlation.
         let body_str = serde_json::to_string(&json).unwrap();
         assert!(
-            !body_str.contains("agt_v1_g"),
+            !body_str.contains("agt_v2_"),
             "token prefix must not leak into the error response body"
         );
     }

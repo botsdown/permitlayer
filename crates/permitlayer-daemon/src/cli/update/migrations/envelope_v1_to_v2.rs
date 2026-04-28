@@ -57,7 +57,6 @@
 //!
 //! [1]: permitlayer_core::store::fs::credential_fs::decode_envelope
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use permitlayer_core::vault::lock::{VaultLock, VaultLockError};
@@ -333,7 +332,7 @@ fn rewrite_all(backup_dir: &Path, new_vault_dir: &Path) -> std::io::Result<usize
             }
         };
         let target = new_vault_dir.join(name);
-        atomic_write_bytes(&target, &v2_bytes)?;
+        permitlayer_core::store::fs::credential_fs::atomic_write_bytes(&target, &v2_bytes)?;
         count += 1;
     }
     Ok(count)
@@ -414,54 +413,10 @@ fn verify_all_v2(vault_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Atomic-write `bytes` to `target` via tempfile + rename + parent
-/// fsync. Mirrors `credential_fs::atomic_write_real`'s discipline
-/// without going through `CredentialFsStore::put` (which would
-/// re-acquire the vault lock and deadlock).
-fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = target.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent directory")
-    })?;
-    let tmp_name = match target.file_name().and_then(|n| n.to_str()) {
-        Some(n) => format!("{n}.tmp.{}.{}", std::process::id(), {
-            // Distinct counter per call — no concurrency in the
-            // migration so a simple incrementing static is fine.
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        }),
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "target has no file name",
-            ));
-        }
-    };
-    let tmp = parent.join(tmp_name);
-
-    let mut file = open_tempfile(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    if let Err(e) = std::fs::rename(&tmp, target) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    let dir = std::fs::File::open(parent)?;
-    dir.sync_all()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_tempfile(tmp: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(tmp)
-}
-
-#[cfg(not(unix))]
-fn open_tempfile(tmp: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
-}
+// Story 7.6b: `atomic_write_bytes` + `open_tempfile` were promoted to
+// `permitlayer-core::store::fs::credential_fs` so rotation's reseal
+// loop can reuse the helper. Migration imports the public version
+// inline at the call site (line 336).
 
 /// Create the vault directory with mode `0o700` on Unix. Mirrors
 /// `credential_fs::create_vault_dir` but local to the migration to

@@ -217,3 +217,89 @@ fn daemon_boots_cleanly_with_v2_envelope_in_vault() {
         "v2 envelope produced an unexpected error during boot:\n{stderr}"
     );
 }
+
+/// Story 7.6b AC #13: the daemon refuses to boot with exit code 6
+/// when the vault contains envelopes at multiple `key_id` values
+/// (a previous `agentsso rotate-key` did not finish). Re-running
+/// rotate-key resumes the rotation idempotently.
+///
+/// Story 7.6b round-1 review: migrated from the file-local
+/// `spawn_daemon_hermetic` helper to the canonical
+/// `crate::common::start_daemon` per the 8.8b helper-discipline
+/// fence.
+#[test]
+fn daemon_refuses_to_boot_on_mixed_key_id_vault() {
+    use crate::common::{DaemonTestConfig, free_port, start_daemon};
+    use permitlayer_core::store::fs::credential_fs::encode_envelope;
+    use permitlayer_credential::OAuthToken;
+    use permitlayer_vault::Vault;
+    use zeroize::Zeroizing;
+
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
+    let vault_dir = home.path().join("vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+
+    // Seed two envelopes at DIFFERENT key_ids (simulating a
+    // partially-rotated vault — what 7.6b's mid-Phase-D crash would
+    // leave on disk).
+    let key = [0x42u8; 32];
+
+    let vault_old = Vault::new(Zeroizing::new(key), 1);
+    let token_old = OAuthToken::from_trusted_bytes(b"still-at-old-key".to_vec());
+    let sealed_old = vault_old.seal("gmail", &token_old).unwrap();
+    std::fs::write(vault_dir.join("gmail.sealed"), encode_envelope(&sealed_old)).unwrap();
+
+    let vault_new = Vault::new(Zeroizing::new(key), 2);
+    let token_new = OAuthToken::from_trusted_bytes(b"already-at-new-key".to_vec());
+    let sealed_new = vault_new.seal("calendar", &token_new).unwrap();
+    std::fs::write(vault_dir.join("calendar.sealed"), encode_envelope(&sealed_new)).unwrap();
+
+    let mut handle = start_daemon(DaemonTestConfig {
+        port: free_port(),
+        home: home.path().to_path_buf(),
+        // The mixed-key refusal fires BEFORE keystore bootstrap, but
+        // start_daemon's default keystore path needs SOME bootstrap
+        // env to avoid hanging on the real OS keychain. Use the
+        // canonical test-master-key shortcut.
+        hermetic: true,
+        set_test_master_key: true,
+        extra_env: vec![("AGENTSSO_TEST_NO_PLUGINS".to_owned(), "1".to_owned())],
+        ..Default::default()
+    });
+
+    // Poll for the daemon to exit on its own (the boot guard fires
+    // synchronously and quickly). 10s is plenty of headroom; we
+    // explicitly do NOT use `wait_with_output` here because that
+    // helper sends SIGTERM unconditionally, which would mask a
+    // clean-exit-code-6 path with a signal-kill-None status if the
+    // grace window is even briefly off.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        match handle.try_wait().unwrap() {
+            Some(s) => break s,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    panic!("daemon did not exit within 10s on mixed-key_id vault");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    // Drain stderr now that the process has exited. Drop the handle
+    // afterward (its Drop's child.kill() is a no-op on a dead pid).
+    let output = handle.wait_with_output().expect("captured stderr");
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "expected exit code 6 (VaultRotationIncomplete), got {:?}; stderr:\n{}",
+        status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("vault rotation incomplete") || stderr.contains("multiple key_ids"),
+        "stderr should name the mixed-key_id refusal, got:\n{stderr}"
+    );
+}

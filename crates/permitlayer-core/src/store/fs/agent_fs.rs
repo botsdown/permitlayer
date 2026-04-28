@@ -314,6 +314,49 @@ impl AgentIdentityStore for AgentIdentityFsStore {
         .await?
     }
 
+    async fn update_lookup_key_and_token(
+        &self,
+        name: &str,
+        new_lookup_key_hex: String,
+        new_token_hash: String,
+    ) -> Result<bool, StoreError> {
+        // Story 7.6b Phase E. Reads the current on-disk record and
+        // rewrites only `lookup_key_hex` + `token_hash`; all other
+        // fields are preserved verbatim. Same atomic-write discipline
+        // as `put` and `touch_last_seen`.
+        if validate_agent_name(name).is_err() {
+            return Err(StoreError::InvalidAgentName { input: name.to_owned() });
+        }
+
+        let current = match self.get(name).await? {
+            Some(c) => c,
+            // Agent went away between rotation's enumeration and the
+            // rewrite — treat as a "nothing to update". Rotation's
+            // Phase E loop tolerates Ok(false) and moves on.
+            None => return Ok(false),
+        };
+
+        // Re-construct the identity with the new derived fields.
+        // `AgentIdentity::new` re-validates `name` (defense in depth
+        // — the on-disk file's name should never have been invalid,
+        // but checking is cheap).
+        let updated = AgentIdentity::new(
+            current.name().to_owned(),
+            current.policy_name.clone(),
+            new_token_hash,
+            new_lookup_key_hex,
+            current.created_at,
+            current.last_seen_at,
+        )
+        .map_err(|e| StoreError::AgentSerializationFailed {
+            reason: format!("identity reconstruction failed during rotation: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+        self.write_atomic(&updated).await?;
+        Ok(true)
+    }
+
     async fn touch_last_seen(&self, identity: AgentIdentity) -> Result<(), StoreError> {
         // `touch_last_seen` is best-effort and runs on the hot auth
         // path. The naive implementation — serialize the caller's
@@ -688,6 +731,143 @@ mod tests {
         store.put(fake_identity("agent1")).await.unwrap();
         assert!(tmp.path().join("agents").exists());
     }
+
+    // ── Story 7.6b AC #11: update_lookup_key_and_token ────────────
+
+    #[tokio::test]
+    async fn update_lookup_key_and_token_preserves_other_fields() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+
+        let mut id = fake_identity("rotator");
+        id.policy_name = "gmail-readonly".to_owned();
+        let original_created_at = id.created_at;
+        let original_last_seen = chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+        id.last_seen_at = Some(original_last_seen);
+        store.put(id.clone()).await.unwrap();
+
+        let new_lookup = "ab".repeat(32);
+        let new_hash = "$argon2id$v=19$m=19456,t=2,p=1$bmV3c2FsdA$bmV3aGFzaA".to_owned();
+        let updated =
+            store.update_lookup_key_and_token("rotator", new_lookup.clone(), new_hash.clone());
+        assert!(updated.await.unwrap());
+
+        let after = store.get("rotator").await.unwrap().unwrap();
+        // The two updated fields hold the new values.
+        assert_eq!(after.lookup_key_hex, new_lookup);
+        assert_eq!(after.token_hash, new_hash);
+        // Every other field is preserved exactly.
+        assert_eq!(after.name(), "rotator");
+        assert_eq!(after.policy_name, "gmail-readonly");
+        assert_eq!(after.created_at, original_created_at);
+        assert_eq!(after.last_seen_at, Some(original_last_seen));
+    }
+
+    #[tokio::test]
+    async fn update_lookup_key_and_token_returns_false_for_missing_agent() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        let updated = store
+            .update_lookup_key_and_token(
+                "ghost",
+                "11".repeat(32),
+                "$argon2id$v=19$m=19456,t=2,p=1$cw$aA".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(!updated, "missing agent must return Ok(false)");
+    }
+
+    #[tokio::test]
+    async fn update_lookup_key_and_token_rejects_invalid_name() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        let err = store
+            .update_lookup_key_and_token(
+                "../etc/passwd",
+                "22".repeat(32),
+                "$argon2id$v=19$m=19456,t=2,p=1$cw$aA".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidAgentName { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_lookup_key_and_token_atomic_no_partial_file() {
+        // Story 7.6b round-1 review: the original AC #15 listed this
+        // test but the implementation never landed. Atomicity proof:
+        // if `update_lookup_key_and_token` aborts at the rename
+        // boundary, the on-disk file MUST contain the pre-update
+        // contents byte-for-byte. We force the rename to fail by
+        // making the agents dir read-only after the initial put().
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        let mut id = fake_identity("atomic-victim");
+        id.policy_name = "default".to_owned();
+        let original_lookup = id.lookup_key_hex.clone();
+        let original_hash = id.token_hash.clone();
+        let original_created_at = id.created_at;
+        store.put(id.clone()).await.unwrap();
+
+        // Snapshot the on-disk file bytes so we can compare exactly.
+        let agent_path = tmp.path().join("agents").join("atomic-victim.toml");
+        let pre_bytes = std::fs::read(&agent_path).unwrap();
+
+        // Make the agents dir read-only. On Unix, `rename` into a
+        // read-only directory fails with EACCES, mirroring the real
+        // permission-error scenario the operator might encounter.
+        let agents_dir = tmp.path().join("agents");
+        let original_perms = std::fs::metadata(&agents_dir).unwrap().permissions();
+        std::fs::set_permissions(&agents_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = store
+            .update_lookup_key_and_token(
+                "atomic-victim",
+                "ff".repeat(32),
+                "$argon2id$v=19$m=19456,t=2,p=1$bmV3$bmV3aGFzaA".to_owned(),
+            )
+            .await;
+
+        // Restore permissions BEFORE asserting so a panic in the
+        // assertion doesn't leak read-only state into TempDir's
+        // RAII-driven cleanup.
+        std::fs::set_permissions(&agents_dir, original_perms).unwrap();
+
+        assert!(result.is_err(), "rename into a read-only dir must fail");
+
+        // The on-disk file is byte-identical to its pre-update state:
+        // no partial write, no torn TOML.
+        let post_bytes = std::fs::read(&agent_path).unwrap();
+        assert_eq!(
+            post_bytes, pre_bytes,
+            "agent file must be byte-identical after a failed update_lookup_key_and_token"
+        );
+
+        // Belt-and-suspenders: read back through the store and
+        // confirm every field matches the pre-update record.
+        let after = store.get("atomic-victim").await.unwrap().unwrap();
+        assert_eq!(after.lookup_key_hex, original_lookup);
+        assert_eq!(after.token_hash, original_hash);
+        assert_eq!(after.created_at, original_created_at);
+
+        // Sanity: no orphaned tempfile left in the agents dir.
+        let stray_tempfiles: Vec<_> = std::fs::read_dir(&agents_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            stray_tempfiles.is_empty(),
+            "no .tmp.* orphans should remain after the failed update; found {stray_tempfiles:?}"
+        );
+    }
+
+    use chrono::TimeZone as _;
 
     #[tokio::test]
     async fn put_atomic_no_partial_file_visible_to_concurrent_get() {

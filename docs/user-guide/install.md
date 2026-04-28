@@ -716,11 +716,16 @@ This will rotate the agentsso master encryption key:
   • Mint a fresh 32-byte master key from your OS RNG
   • Re-encrypt every credential in ~/.agentsso/vault/ under the new key
   • Replace the old master key in your OS keychain (idempotent overwrite)
-  • Rebuild the agent-registry HMAC lookup index in ~/.agentsso/agents/
-  • NOT touch your OAuth refresh tokens — Google connections survive
+  • Rebuild every agent's HMAC lookup key under the new master-derived
+    subkey AND issue a fresh agt_v2_* bearer token for each agent
+    (operator must update agent configs with the printed tokens —
+    old tokens are invalidated)
+
+Existing OAuth refresh tokens are preserved.
 
 If the rotation is interrupted, re-run `agentsso rotate-key` to
-finish or roll back automatically.
+finish; the keystore stages both keys atomically before any vault
+write begins, so every crash mode is recoverable.
 
 Continue? [y/N]
 ```
@@ -737,17 +742,76 @@ agentsso rotate-key --yes
 - ✅ **OAuth refresh tokens are preserved.** Your Google
   connections (`gmail`, `calendar`, `drive`) keep working without
   re-consent.
-- ⚠️ **Agent bearer tokens are invalidated.** Every agent
-  registered via `agentsso agent register <name>` must re-run the
-  register command. The bearer token issued at registration time
-  was bound to the old master key's `daemon_subkey`; that subkey
-  no longer exists after rotation.
+- ✅ **Agent registrations are preserved.** Every agent registered
+  via `agentsso agent register <name>` keeps its name, policy
+  binding, and `created_at` timestamp.
+- ⚠️ **Agent bearer tokens are replaced.** Rotation re-issues a
+  fresh `agt_v2_<name>_<random>` bearer token for every registered
+  agent and writes them to a mode-`0600` file at
+  `~/.agentsso/rotate-key-output.<pid>`. The operator reads that
+  file, updates each agent's configuration with the new token, then
+  removes the file by hand. The old tokens stop authenticating
+  immediately.
 
-To re-register an agent after rotation:
+  **Plaintext bearer tokens are NEVER printed to stdout.** Terminal
+  scrollback, multiplexer scrollback (tmux/screen), shell history,
+  process accounting, screen recording, screen sharing, and CI log
+  capture are all out of `agentsso`'s control — the file-with-`0600`
+  is the only plaintext-bearing surface, by design.
 
-```sh
-agentsso agent register my-agent --policy=gmail-readonly
+Sample post-rotation output:
+
+```text
+✓ master key rotated → 1f7c4e9b… → 94be5108… (3 entries, 2 agents rerolled, 412ms)
+
+New agent tokens written to:
+  /Users/you/.agentsso/rotate-key-output.91234
+
+Read the file (mode 0600), update your agent configs, then `rm` it.
+The previous agt_v1_*/agt_v2_* tokens are now invalid.
 ```
+
+The file content is one `<agent_name>=<token>` per line plus a
+header comment, e.g.:
+
+```text
+# rotate-key new agent tokens — keep secret, mode 0600
+# Format: <agent_name>=<token>
+email-triage=agt_v2_email-triage_AbCdEf123…
+calendar-bot=agt_v2_calendar-bot_GhIjKl456…
+```
+
+### Token format change in v0.4
+
+Story 7.6b switched the bearer-token format from `agt_v1_<random>`
+to `agt_v2_<name>_<random>`. Old `agt_v1_*` tokens stop working at
+the first daemon restart after upgrade — the auth path uses the
+agent name encoded in the v2 prefix to look up the agent in O(1)
+regardless of registry size.
+
+Why the change: the v1 path required a global Argon2id sweep at
+auth time as the registry grew (~100ms per registered agent per
+auth). The v2 format encodes the agent name in the token prefix so
+auth can compute a single HMAC against the agent's `lookup_key_hex`
+index and verify in O(1). For operators with 1–5 agents the v1
+latency was tolerable, but v2 future-proofs the auth path for any
+registry size.
+
+Operator-visible cost: existing v1 tokens stop authenticating after
+upgrade. There are two ways to mint fresh v2 tokens:
+
+1. **Run `agentsso rotate-key`.** Phase E re-issues every agent's
+   bearer token under the new master-derived subkey. Single command,
+   covers every registered agent at once. Recommended.
+2. **Re-register each agent individually.** For each `agentsso agent
+   register <name>` invocation, the daemon issues a fresh v2 token
+   on the existing master key. Useful if you're not also rotating
+   the master key.
+
+There is no automatic migration — v1 → v2 is a hard cut at deploy
+time, motivated by the small pre-1.0 user base. Rotation OR
+re-register is required for each agent before its requests will
+authenticate again.
 
 ### Passphrase-mode users
 
@@ -766,19 +830,38 @@ error: rotate_key_passphrase_adapter
 
 Passphrase rotation lands in a future story.
 
-### Crash recovery
+### Crash recovery — `rotate-key` is crash-safe by construction
 
-Rotation is multi-phase: stage re-encrypted files alongside the old
-ones, write a `.rotation.in-progress` marker, swap the keystore
-master key, atomically rename staged files into place, invalidate
-agent files, clean up. If your machine crashes mid-rotation, the
-marker file at `~/.agentsso/vault/.rotation.in-progress` records
-the in-flight state.
+Story 7.6b's rotation is a single forward pass under the vault
+advisory lock with a transient previous-master-key keystore slot
+AND a small marker file at `~/.agentsso/vault/.rotation-state`
+(mode `0600`, TOML, ~6 lines) that records the in-flight phase.
+Every crash mid-rotation falls into one of three buckets defined
+by the marker's `keystore_phase`:
 
-Re-run `agentsso rotate-key` after the crash; it detects the marker
-and finishes the rotation idempotently. **Never delete the marker
-file by hand** — its presence is what tells the next invocation
-that the keystore was already swapped.
+- **`pre-previous`** or **`pre-primary`** — the new master key was
+  generated in the crashed process's RAM but never made it to disk.
+  Recovery is "abandon the rotation and start fresh": run
+  `agentsso keystore-clear-previous` to clear the keystore's
+  previous-key slot AND remove the marker file, then re-run
+  `agentsso rotate-key`.
+- **`committed`** — both keystore slots are staged and verified.
+  Recovery is "re-run `agentsso rotate-key`" — the resume path
+  picks up Phase D / E / F from where the previous attempt
+  stopped and converges idempotently.
+
+Re-run `agentsso rotate-key` after the crash. The command reads
+the marker file FIRST (it is the authoritative record of in-flight
+state), then verifies the keystore matches what the marker claims,
+and resumes from the correct phase: it walks the vault, re-encrypts
+any envelope still keyed by the OLD master key, completes the agent
+rebuild, and clears the previous-key slot to finalize. Vault
+backups are NOT required for rotation safety.
+
+If you also try to start the daemon while a rotation is incomplete,
+`agentsso start` refuses to boot with exit code 6 and a structured
+"vault rotation incomplete" banner. Re-run rotate-key to fix the
+state, then `agentsso start` will succeed.
 
 ### Audit events
 
@@ -786,23 +869,38 @@ Every rotation emits a `master-key-rotated` audit event with:
 
 - `old_keyid` — HMAC-SHA256 fingerprint of the old key (16 hex chars).
 - `new_keyid` — same for the new key.
-- `kdf` — `"OsRng"` (master-key entropy source).
+- `kdf` — `"HKDF-SHA256"` (the KDF used to derive the agent-token
+  lookup subkey from the master key).
 - `vault_reseal_count` — number of credentials re-encrypted.
-- `agents_invalidated` — number of agent files removed.
+- `agents_rerolled_count` — number of agents that received a fresh
+  v2 bearer token.
 - `elapsed_ms` — rotation duration.
 
-Failures emit `master-key-rotation-failed` with `failure_step` (1–5
-mapping to internal Phases A–E) and `failure_reason`. Both event
-types live under the `master-key-*` namespace; review them with
-`agentsso audit | grep master-key-`.
+Failures emit `master-key-rotation-failed` with `failure_phase`
+(`A`–`F`), `failure_reason`, and `partial_state` (one of `clean`,
+`both-keys-in-keystore`, `vault-mixed`, `vault-uniform-keystore-both`,
+`agents-mid-rebuild`, `single-slot-clean`). Both event types live
+under the `master-key-*` namespace; review them with `agentsso
+audit | grep master-key-`.
 
 ### Exit codes
 
+`agentsso rotate-key` exits with one of:
+
 - **0** — rotation succeeded.
 - **3** — resource conflict (daemon running, brew-services
-  managing agentsso).
+  managing agentsso, vault lock held by another process).
 - **4** — auth / keystore failure (passphrase adapter,
-  `set_master_key` rejected, RNG failure).
-- **5** — rotation failure during the on-disk state machine
-  (rolled back when possible; re-run `agentsso rotate-key` to
-  resume if a `.rotation.in-progress` marker is on disk).
+  `set_master_key` rejected, RNG failure, `key_id` overflow at 255).
+- **5** — rotation failure during the forward pass (re-run
+  `agentsso rotate-key` to resume — the previous-key slot stays
+  populated through Phase F, and the rotation-state marker file at
+  `~/.agentsso/vault/.rotation-state` records the in-flight phase).
+
+Exit code **6** is emitted ONLY by `agentsso start`, not by
+`agentsso rotate-key`: it indicates the daemon detected an in-flight
+rotation (either via the marker file OR via mixed `key_id` values
+in the vault) and refused to boot. Re-run `agentsso rotate-key` to
+resume the rotation, or — if you intend to abandon a rotation that
+crashed at `pre-previous` or `pre-primary` — run `agentsso
+keystore-clear-previous` and remove the marker file before retrying.

@@ -116,6 +116,20 @@ async fn conformance_passphrase() {
     // `keystore/passphrase.state`.
     let del_err = ks2.delete_master_key().await.unwrap_err();
     assert!(matches!(del_err, KeyStoreError::PassphraseAdapterImmutable));
+
+    // Story 7.6b AC #17 (round-1 review: split into single-slot
+    // primitives): the rotation API is immutable on the passphrase
+    // adapter (rotation refuses early on the passphrase backend per
+    // AC #6).
+    let prev_key = [0xAAu8; MASTER_KEY_LEN];
+    let set_prev_err = ks2.set_previous_master_key(&prev_key).await.unwrap_err();
+    assert!(matches!(set_prev_err, KeyStoreError::PassphraseAdapterImmutable));
+
+    let prev_read_err = ks2.previous_master_key().await.unwrap_err();
+    assert!(matches!(prev_read_err, KeyStoreError::PassphraseAdapterImmutable));
+
+    let clear_err = ks2.clear_previous_master_key().await.unwrap_err();
+    assert!(matches!(clear_err, KeyStoreError::PassphraseAdapterImmutable));
 }
 
 #[tokio::test]
@@ -301,6 +315,272 @@ async fn native_conformance<K: KeyStore>(ks: &K) {
         DeleteOutcome::AlreadyAbsent,
         "delete_master_key on empty keychain must report AlreadyAbsent"
     );
+}
+
+// ================================================================
+// Story 7.6b AC #17 — transient previous-key slot conformance
+// ================================================================
+//
+// All native-adapter tests are gated behind
+// `AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1` because they manipulate the
+// shared `io.permitlayer.master-key/master(-previous)` keychain entry
+// — running these on a developer's machine would clobber their real
+// keystore state. The conformance suite already follows this pattern
+// for the destructive `delete_master_key` round-trip.
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn destructive_test_enabled() -> bool {
+    std::env::var("AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST").as_deref() == Ok("1")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+async fn open_native() -> Option<Box<dyn KeyStore>> {
+    #[cfg(target_os = "macos")]
+    {
+        use permitlayer_keystore::MacKeyStore;
+        match MacKeyStore::new() {
+            Ok(k) => Some(Box::new(k) as Box<dyn KeyStore>),
+            Err(KeyStoreError::BackendUnavailable { backend, source }) => {
+                eprintln!("skipping: backend '{backend}' unavailable: {source}");
+                None
+            }
+            Err(e) => panic!("unexpected error constructing MacKeyStore: {e}"),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use permitlayer_keystore::LinuxKeyStore;
+        match LinuxKeyStore::new() {
+            Ok(k) => Some(Box::new(k) as Box<dyn KeyStore>),
+            Err(KeyStoreError::BackendUnavailable { backend, source }) => {
+                eprintln!("skipping: backend '{backend}' unavailable: {source}");
+                None
+            }
+            Err(e) => panic!("unexpected error constructing LinuxKeyStore: {e}"),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use permitlayer_keystore::WindowsKeyStore;
+        match WindowsKeyStore::new() {
+            Ok(k) => Some(Box::new(k) as Box<dyn KeyStore>),
+            Err(KeyStoreError::BackendUnavailable { backend, source }) => {
+                eprintln!("skipping: backend '{backend}' unavailable: {source}");
+                None
+            }
+            Err(e) => panic!("unexpected error constructing WindowsKeyStore: {e}"),
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[tokio::test]
+async fn set_previous_master_key_persists_and_reads_back() {
+    if !destructive_test_enabled() {
+        eprintln!(
+            "skipping set_previous_master_key_persists_and_reads_back — \
+             set AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1 to enable"
+        );
+        return;
+    }
+    let Some(ks) = open_native().await else { return };
+
+    // Snapshot whatever's there now so we can restore at the end.
+    let original = ks.master_key().await.unwrap();
+    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+
+    let key_a = [0xAAu8; MASTER_KEY_LEN];
+    let key_b = [0xBBu8; MASTER_KEY_LEN];
+
+    // Story 7.6b round-1 review (Decision 1+2): the rotation
+    // orchestrator now drives the dual-slot install via single-slot
+    // primitives + a marker file. Each step is read-back-verified.
+    ks.set_master_key(&key_a).await.unwrap();
+    // Phase C' step 1: write the previous slot.
+    ks.set_previous_master_key(&key_a).await.unwrap();
+    let prev = ks.previous_master_key().await.unwrap().expect("previous slot must be Some");
+    assert_eq!(&*prev, &key_a, "previous slot must hold OLD after set_previous_master_key");
+    // Phase C' step 2: write the primary slot (existing API).
+    ks.set_master_key(&key_b).await.unwrap();
+    let primary = ks.master_key().await.unwrap();
+    assert_eq!(&*primary, &key_b, "primary slot must hold the new key after primary install");
+    // Re-confirm previous still holds OLD (primary write must not
+    // disturb previous).
+    let prev = ks.previous_master_key().await.unwrap().expect("previous still present");
+    assert_eq!(&*prev, &key_a, "primary write must not disturb previous slot");
+
+    // Cleanup: clear previous, restore original primary.
+    ks.clear_previous_master_key().await.unwrap();
+    ks.set_master_key(&original_bytes).await.unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[tokio::test]
+async fn set_previous_master_key_overwrites_prior_value() {
+    if !destructive_test_enabled() {
+        eprintln!(
+            "skipping set_previous_master_key_overwrites_prior_value — \
+             set AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1 to enable"
+        );
+        return;
+    }
+    let Some(ks) = open_native().await else { return };
+    let original = ks.master_key().await.unwrap();
+    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+
+    let key_a = [0x11u8; MASTER_KEY_LEN];
+    let key_b = [0x22u8; MASTER_KEY_LEN];
+
+    // First write A; then overwrite with B. There's exactly one
+    // previous slot, not a history stack.
+    ks.set_previous_master_key(&key_a).await.unwrap();
+    let after_a = ks.previous_master_key().await.unwrap().expect("Some after first set");
+    assert_eq!(&*after_a, &key_a);
+
+    ks.set_previous_master_key(&key_b).await.unwrap();
+    let after_b = ks.previous_master_key().await.unwrap().expect("Some after second set");
+    assert_eq!(&*after_b, &key_b, "single previous slot — overwrites, doesn't stack");
+
+    // Cleanup.
+    ks.clear_previous_master_key().await.unwrap();
+    ks.set_master_key(&original_bytes).await.unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[tokio::test]
+async fn set_previous_master_key_is_idempotent() {
+    // Story 7.6b round-1 review: the rotation resume path may re-call
+    // `set_previous_master_key` with the same bytes after a marker-
+    // staged crash; the second call must succeed (no error from the
+    // OS keychain on "value unchanged").
+    if !destructive_test_enabled() {
+        eprintln!(
+            "skipping set_previous_master_key_is_idempotent — \
+             set AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1 to enable"
+        );
+        return;
+    }
+    let Some(ks) = open_native().await else { return };
+    let original = ks.master_key().await.unwrap();
+    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+
+    let key_a = [0x77u8; MASTER_KEY_LEN];
+    ks.set_previous_master_key(&key_a).await.unwrap();
+    ks.set_previous_master_key(&key_a).await.unwrap();
+    let prev = ks.previous_master_key().await.unwrap().expect("Some after idempotent set");
+    assert_eq!(&*prev, &key_a);
+
+    // Cleanup.
+    ks.clear_previous_master_key().await.unwrap();
+    ks.set_master_key(&original_bytes).await.unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[tokio::test]
+async fn previous_master_key_returns_none_after_clear() {
+    if !destructive_test_enabled() {
+        eprintln!(
+            "skipping previous_master_key_returns_none_after_clear — \
+             set AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1 to enable"
+        );
+        return;
+    }
+    let Some(ks) = open_native().await else { return };
+    let original = ks.master_key().await.unwrap();
+    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+
+    let key_a = [0x44u8; MASTER_KEY_LEN];
+
+    ks.set_previous_master_key(&key_a).await.unwrap();
+    assert!(ks.previous_master_key().await.unwrap().is_some());
+
+    ks.clear_previous_master_key().await.unwrap();
+    assert!(
+        ks.previous_master_key().await.unwrap().is_none(),
+        "previous slot must be None after clear"
+    );
+
+    // Cleanup.
+    ks.set_master_key(&original_bytes).await.unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[tokio::test]
+async fn clear_previous_master_key_is_idempotent() {
+    if !destructive_test_enabled() {
+        eprintln!(
+            "skipping clear_previous_master_key_is_idempotent — \
+             set AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1 to enable"
+        );
+        return;
+    }
+    let Some(ks) = open_native().await else { return };
+
+    // Two clears in a row must both succeed regardless of slot state.
+    ks.clear_previous_master_key().await.unwrap();
+    ks.clear_previous_master_key().await.unwrap();
+    assert!(ks.previous_master_key().await.unwrap().is_none());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[tokio::test]
+async fn previous_master_key_zeroizes_on_drop() {
+    if !destructive_test_enabled() {
+        eprintln!(
+            "skipping previous_master_key_zeroizes_on_drop — \
+             set AGENTSSO_KEYCHAIN_DESTRUCTIVE_TEST=1 to enable"
+        );
+        return;
+    }
+    let Some(ks) = open_native().await else { return };
+    let original = ks.master_key().await.unwrap();
+    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+
+    let key_a = [0x66u8; MASTER_KEY_LEN];
+    ks.set_previous_master_key(&key_a).await.unwrap();
+
+    // The Zeroizing wrapper guarantees the underlying buffer is
+    // wiped on drop; we can't directly observe the wipe from outside
+    // the type, but exercising the read+drop path confirms the API
+    // surface returns a Zeroizing buffer (compile-time check on the
+    // type) and that the value is recoverable through the Zeroizing
+    // wrapper.
+    {
+        let prev = ks.previous_master_key().await.unwrap().expect("previous slot must be Some");
+        // Compile-time: the binding's type is Zeroizing<[u8; 32]>,
+        // exercise the Deref to confirm.
+        let bytes: &[u8; MASTER_KEY_LEN] = &prev;
+        assert_eq!(bytes, &key_a);
+    } // <- prev dropped here; the inner buffer is wiped by Zeroizing's Drop.
+
+    // Cleanup.
+    ks.clear_previous_master_key().await.unwrap();
+    ks.set_master_key(&original_bytes).await.unwrap();
+}
+
+#[tokio::test]
+async fn passphrase_keystore_refuses_set_previous_master_key() {
+    let home = TempDir::new().unwrap();
+    let ks = PassphraseKeyStore::from_passphrase(home.path(), TEST_PASSPHRASE).unwrap();
+    let prev_key = [0x99u8; MASTER_KEY_LEN];
+    let err = ks.set_previous_master_key(&prev_key).await.unwrap_err();
+    assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));
+}
+
+#[tokio::test]
+async fn passphrase_keystore_previous_master_key_returns_immutable() {
+    let home = TempDir::new().unwrap();
+    let ks = PassphraseKeyStore::from_passphrase(home.path(), TEST_PASSPHRASE).unwrap();
+    let err = ks.previous_master_key().await.unwrap_err();
+    assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));
+}
+
+#[tokio::test]
+async fn passphrase_keystore_clear_previous_master_key_refuses() {
+    let home = TempDir::new().unwrap();
+    let ks = PassphraseKeyStore::from_passphrase(home.path(), TEST_PASSPHRASE).unwrap();
+    let err = ks.clear_previous_master_key().await.unwrap_err();
+    assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));
 }
 
 // ================================================================
