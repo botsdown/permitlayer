@@ -78,6 +78,12 @@ impl std::error::Error for UninstallExitCode3 {}
 /// marker discoverable in `e.chain()`, we attach it via `Error::new`
 /// (where T is a real `std::error::Error`) and add the silent
 /// marker via `.context()`.
+///
+/// The brew-services pre-flight only fires on macOS (the call site
+/// at line ~187 is `#[cfg(target_os = "macos")]`-gated), so this
+/// helper is unused on Linux + Windows builds. The unit test at
+/// line ~1377 exercises it via `#[cfg(target_os = "macos")]` too.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn uninstall_brew_services_conflict() -> anyhow::Error {
     anyhow::Error::new(UninstallExitCode3).context(crate::cli::SilentCliError)
 }

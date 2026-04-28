@@ -137,14 +137,14 @@ where
     // behind that path check so we don't probe at all on the common
     // case.
     #[cfg(target_os = "linux")]
-    if exe.starts_with("/usr/bin") || exe.starts_with("/usr/local/bin") {
-        if let Some(pkg) = detect_distro_package_owner(&exe) {
-            return Ok(BinaryTarget::ManagedByPackageManager {
-                manager: pkg.manager,
-                path: exe,
-                remediation: pkg.remediation,
-            });
-        }
+    if (exe.starts_with("/usr/bin") || exe.starts_with("/usr/local/bin"))
+        && let Some(pkg) = detect_distro_package_owner(&exe)
+    {
+        return Ok(BinaryTarget::ManagedByPackageManager {
+            manager: pkg.manager,
+            path: exe,
+            remediation: pkg.remediation,
+        });
     }
 
     Ok(BinaryTarget::Owned(exe_resolved))

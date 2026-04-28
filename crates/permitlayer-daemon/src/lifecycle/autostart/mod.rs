@@ -126,6 +126,12 @@ pub enum AutostartStatus {
     /// fires for: (macOS) brew-services + dev.agentsso.daemon plist
     /// both present; (Windows) Task Scheduler entry AND a leftover
     /// Story-7.2 `agentsso.lnk` in the Startup folder.
+    ///
+    /// Constructed only by `macos.rs` and `windows.rs`; the Linux
+    /// systemd-user backend has no equivalent dual-mechanism state.
+    /// `#[cfg_attr]` silences clippy's dead-code lint on Linux
+    /// builds where neither construction site is compiled.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Conflict {
         /// Human-readable description of the dual-mechanism state.
         detail: String,
@@ -593,7 +599,10 @@ pub(crate) fn home_dir() -> std::io::Result<PathBuf> {
 ///
 /// **P16 (code review):** lifted into `super` so both macOS
 /// `parse_program_path` and Windows `parse_command_path` can call it
-/// without cfg-cross-import gymnastics.
+/// without cfg-cross-import gymnastics. Linux's systemd-user backend
+/// reads `ExecStart=` directly without XML decoding, so this helper
+/// is dead on Linux builds.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn xml_unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut bytes = s.as_bytes();
@@ -632,7 +641,9 @@ pub(crate) fn xml_unescape(s: &str) -> String {
 }
 
 /// UTF-8 leading-byte → char length. Used by [`xml_unescape`] to advance
-/// past whole chars on the non-`&` path.
+/// past whole chars on the non-`&` path. Dead on Linux for the same
+/// reason `xml_unescape` is.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn utf8_char_len(b: u8) -> usize {
     match b {
         0x00..=0x7F => 1,
