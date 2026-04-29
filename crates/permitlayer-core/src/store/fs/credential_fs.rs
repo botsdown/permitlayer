@@ -809,8 +809,16 @@ fn atomic_write_real(
     drop(file);
     std::fs::rename(tmp, target)?;
     std::mem::forget(guard);
-    let dir = std::fs::File::open(parent)?;
-    dir.sync_all()?;
+    // Unix-only: see atomic_write_bytes for rationale.
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
     Ok(())
 }
 
@@ -1262,8 +1270,18 @@ mod tests {
             std::fs::rename(tmp, target)
         }
         fn sync_parent_dir(&self, parent: &Path) -> std::io::Result<()> {
-            let dir = std::fs::File::open(parent)?;
-            dir.sync_all()
+            // Unix-only: see RealCredentialFsIo::sync_parent_dir for
+            // rationale (NTFS won't open dirs for read).
+            #[cfg(unix)]
+            {
+                let dir = std::fs::File::open(parent)?;
+                dir.sync_all()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = parent;
+                Ok(())
+            }
         }
     }
 
