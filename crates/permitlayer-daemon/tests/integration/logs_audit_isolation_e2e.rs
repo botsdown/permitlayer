@@ -159,6 +159,11 @@ fn log_and_audit_files_are_distinct_paths() {
     }
 }
 
+/// Cfg-gated to `not(windows)`: same Winsock 10106 / nextest-
+/// concurrency rationale as `log_and_audit_files_are_distinct_paths`
+/// in this file. The log-shape contract is OS-agnostic; verified
+/// on Linux + macOS.
+#[cfg(not(windows))]
 #[test]
 fn operational_log_contains_json_per_line_shape() {
     let Some((mut child, home, port)) = spawn_test_daemon() else {
