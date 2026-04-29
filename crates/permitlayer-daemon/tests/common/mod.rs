@@ -99,6 +99,34 @@ pub fn agentsso_bin() -> PathBuf {
     path
 }
 
+/// Forward Windows-required env vars to a `Command` whose env was
+/// stripped via `env_clear()`. Without these, Winsock initialization
+/// in the spawned process fails intermittently with
+/// `WSAEPROVIDERFAILEDINIT` (Win32 OS error 10106) — Winsock's LSP
+/// chain resolves DLL paths through `%SystemRoot%` / `%windir%` and
+/// returns a hard error if those env vars are missing.
+///
+/// See [openai/codex#3311](https://github.com/openai/codex/issues/3311)
+/// for the diagnosis. Forwarding the vars below is the standard
+/// fix used by other Rust subprocess test harnesses on Windows.
+///
+/// On Unix this is a no-op (returns an empty iterator).
+///
+/// Use via `cmd.envs(forward_windows_required_env())` mid-chain, OR
+/// call directly `for (k, v) in forward_windows_required_env() {
+/// cmd.env(k, v); }` for non-chained styles.
+pub fn forward_windows_required_env() -> impl Iterator<Item = (String, String)> {
+    // List per Microsoft's process env documentation + Codex#3311 root-
+    // cause analysis. SystemRoot is the load-bearing one for Winsock;
+    // the others avoid downstream surprises in tempfile / locale code.
+    const WINDOWS_REQUIRED: &[&str] =
+        &["SystemRoot", "windir", "SystemDrive", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"];
+    // The cfg below ensures Unix builds get a zero-iteration loop and
+    // no `cfg(windows)` warning fires on either side.
+    let vars: &[&str] = if cfg!(windows) { WINDOWS_REQUIRED } else { &[] };
+    vars.iter().filter_map(|&var| std::env::var(var).ok().map(|v| (var.to_owned(), v)))
+}
+
 /// Config for [`start_daemon`]. Constructed via struct-update syntax:
 ///
 /// ```ignore
@@ -222,6 +250,7 @@ pub fn start_daemon(config: DaemonTestConfig) -> DaemonHandle {
         cmd.env_clear();
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
         cmd.env("HOME", config.home.to_str().unwrap());
+        cmd.envs(forward_windows_required_env());
     }
 
     cmd.env("AGENTSSO_PATHS__HOME", config.home.to_str().unwrap());

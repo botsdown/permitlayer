@@ -88,6 +88,7 @@ async fn check_only_prints_version_delta_and_exits_zero() {
 
     let out = Command::new(agentsso_bin())
         .env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
@@ -144,6 +145,7 @@ async fn check_only_already_latest() {
 
     let out = Command::new(agentsso_bin())
         .env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
@@ -185,6 +187,7 @@ async fn check_only_network_failure_exits_four() {
 
     let out = Command::new(agentsso_bin())
         .env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
@@ -392,6 +395,7 @@ async fn apply_flow_signs_extracts_swaps_and_rolls_back_on_stub_binary() {
 
     let out = Command::new(agentsso_bin())
         .env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
@@ -522,6 +526,7 @@ async fn apply_non_tty_without_yes_refuses() {
 
     let out = Command::new(agentsso_bin())
         .env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())

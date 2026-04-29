@@ -31,6 +31,7 @@ use crate::common::{DaemonTestConfig, agentsso_bin, free_port, start_daemon, wai
 fn run_rotate_key(home: &std::path::Path, extra_env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(agentsso_bin());
     cmd.env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
@@ -205,6 +206,7 @@ fn rotate_key_refuses_non_interactive_without_yes() {
     let home = pre_seed_home();
     let mut cmd = Command::new(agentsso_bin());
     cmd.env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.path().to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.path().to_str().unwrap())

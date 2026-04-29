@@ -236,6 +236,7 @@ fn logs_help_mentions_all_flags() {
         .arg("logs")
         .arg("--help")
         .env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("AGENTSSO_PATHS__HOME", home.path().as_os_str())
         .env("NO_COLOR", "1")

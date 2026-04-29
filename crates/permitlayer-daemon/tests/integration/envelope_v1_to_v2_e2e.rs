@@ -82,6 +82,7 @@ fn write_v1_envelope_fixture(vault_dir: &std::path::Path, service: &str, plainte
 fn spawn_daemon_hermetic(home: &std::path::Path, port: u16, extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(agentsso_bin());
     cmd.env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())

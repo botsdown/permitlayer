@@ -27,6 +27,7 @@ use crate::common::agentsso_bin;
 fn run_uninstall(home: &Path, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(agentsso_bin());
     cmd.env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())

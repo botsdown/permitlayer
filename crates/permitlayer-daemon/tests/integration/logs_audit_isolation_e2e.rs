@@ -75,6 +75,7 @@ fn spawn_test_daemon() -> Option<(std::process::Child, tempfile::TempDir, u16)> 
         .arg("--bind-addr")
         .arg(&bind)
         .env_clear()
+        .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .env("AGENTSSO_PATHS__HOME", home.path().as_os_str())
