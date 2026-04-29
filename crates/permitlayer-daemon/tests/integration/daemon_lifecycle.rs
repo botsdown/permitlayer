@@ -206,6 +206,15 @@ fn test_cold_start_and_health() {
     let _ = child.wait();
 }
 
+/// Unix-only: tests POSIX SIGTERM graceful-shutdown semantics (the
+/// daemon's `tokio::signal::unix::SignalKind::terminate()` handler
+/// runs the cleanup sequence + exits 0). Windows `TerminateProcess`
+/// (what `std::process::Child::kill` does) is abrupt — process exits
+/// with a non-zero code without running shutdown hooks. The
+/// equivalent Windows lifecycle (Ctrl-C event via SCM / console
+/// control handler) is out of scope for this test scaffold; PID-file
+/// cleanup-on-shutdown is exercised on Unix only.
+#[cfg(unix)]
 #[test]
 fn test_graceful_shutdown() {
     let home = tempfile::TempDir::new().unwrap();
