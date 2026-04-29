@@ -143,15 +143,30 @@ fn parse_header(raw: &str, header_name: &str) -> Option<String> {
     None
 }
 
-/// Send SIGTERM to a process.
-#[cfg(unix)]
-fn send_sigterm(pid: u32) {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+/// Send SIGTERM (Unix) / TerminateProcess via Child::kill (Windows).
+///
+/// Story 7.7 cross-platform fix: pre-Story-7.7 the call sites had the
+/// shape `#[cfg(unix)] send_sigterm(&mut child); let _ = child.wait();`
+/// which on Windows skipped the kill entirely and then blocked
+/// indefinitely in `child.wait()` because the daemon was never told
+/// to exit. We now kill on every platform — Windows uses
+/// `Child::kill` (TerminateProcess), Unix uses POSIX SIGTERM via nix.
+fn send_sigterm(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
 }
 
-/// Send SIGHUP to a process.
+/// Send SIGHUP (Unix only — no Windows equivalent for the
+/// reload-config-via-signal pattern; Windows tests use the
+/// `/v1/control/reload` HTTP endpoint instead).
 #[cfg(unix)]
 fn send_sighup(pid: u32) {
     use nix::sys::signal::{Signal, kill};
@@ -187,8 +202,7 @@ fn test_cold_start_and_health() {
     assert!(pid_path.exists(), "PID file not created");
 
     // Clean up.
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -204,8 +218,7 @@ fn test_graceful_shutdown() {
     assert!(pid_path.exists());
 
     // Send SIGTERM (AC #2, #7).
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
 
     let status = child.wait().unwrap();
     assert!(status.success(), "daemon did not exit cleanly: {status}");
@@ -243,8 +256,7 @@ fn test_status_json() {
     assert!(parsed["bind_addr"].is_string());
 
     // Clean up.
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -300,8 +312,7 @@ fn test_config_from_toml() {
         "daemon did not start on TOML-configured port {port}"
     );
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -338,8 +349,7 @@ fn test_env_var_override() {
         "daemon did not bind to env var port {env_port}"
     );
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -387,8 +397,7 @@ fn test_stale_pid_recovery() {
         "daemon did not recover from stale PID file"
     );
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -413,8 +422,7 @@ fn test_double_start_fails() {
 
     assert!(!output.status.success(), "second start should fail when daemon already running");
 
-    #[cfg(unix)]
-    send_sigterm(child1.id());
+    send_sigterm(&mut child1);
     let _ = child1.wait();
 }
 
@@ -437,8 +445,7 @@ fn test_sighup_reload() {
     // Daemon should still be running.
     assert!(wait_for_health(port, Duration::from_secs(2)), "daemon not healthy after SIGHUP");
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -480,8 +487,7 @@ fn test_default_binds_localhost_3820() {
     assert!(!bind_addr.contains("3100"), "bind address should not reference 3100: {bind_addr}");
     assert!(bind_addr.starts_with("127.0.0.1:"), "bind address should be localhost: {bind_addr}");
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -503,8 +509,7 @@ fn test_request_id_header_echoed() {
     let id = request_id.unwrap();
     assert_eq!(id.len(), 26, "ULID should be 26 chars, got: {id}");
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -530,8 +535,7 @@ fn test_dns_rebind_blocked() {
     assert_eq!(json["error"]["code"], "dns_rebind.blocked");
     assert!(json["error"]["request_id"].is_null());
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -552,8 +556,7 @@ fn test_dns_rebind_allowed_localhost() {
     let status = parse_status_code(&raw);
     assert_eq!(status, 200, "expected 200 for allowed localhost Host header. raw response:\n{raw}");
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -575,8 +578,7 @@ fn test_dns_rebind_origin_blocked() {
     let status = parse_status_code(&raw);
     assert_eq!(status, 400, "expected 400 for disallowed Origin header. raw response:\n{raw}");
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -601,8 +603,7 @@ fn test_health_traverses_middleware() {
     let id = request_id.unwrap();
     assert_eq!(id.len(), 26, "ULID should be 26 chars");
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
@@ -615,7 +616,7 @@ fn test_non_localhost_warning() {
     let port = free_port();
 
     // Start with 0.0.0.0 binding — should emit the warning.
-    let child = Command::new(agentsso_bin())
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
         .arg(format!("0.0.0.0:{port}"))
@@ -626,15 +627,14 @@ fn test_non_localhost_warning() {
         .spawn()
         .unwrap();
 
-    #[cfg(unix)]
-    let child_id = child.id();
-
     // Wait for the daemon to start.
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
-    // Send SIGTERM and wait for clean exit, which flushes tracing output.
-    #[cfg(unix)]
-    send_sigterm(child_id);
+    // Send SIGTERM (Unix) / TerminateProcess (Windows) and wait for
+    // clean exit, which flushes tracing output. We need the kill on
+    // Windows too — without it `wait_with_output` blocks forever
+    // because the daemon never receives a shutdown signal.
+    send_sigterm(&mut child);
     let output = child.wait_with_output().unwrap();
 
     // tracing_subscriber::fmt() writes to stdout by default.
@@ -670,8 +670,7 @@ fn test_middleware_ordering() {
         assert_eq!(id.len(), 26, "route {route}: ULID should be 26 chars, got: {id}");
     }
 
-    #[cfg(unix)]
-    send_sigterm(child.id());
+    send_sigterm(&mut child);
     let _ = child.wait();
 }
 
