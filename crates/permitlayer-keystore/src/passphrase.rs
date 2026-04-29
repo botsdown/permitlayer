@@ -180,7 +180,10 @@ impl PassphraseKeyStore {
     }
 
     /// Test hook: report the keystore directory for perm-check tests.
-    #[cfg(test)]
+    /// Used only by the `#[cfg(unix)]` `keystore_dir_has_0700_mode`
+    /// perm-check test; gated to match so Windows builds don't trip
+    /// dead-code under `cargo clippy --all-targets`.
+    #[cfg(all(test, unix))]
     fn keystore_dir(&self) -> &Path {
         &self.keystore_dir
     }
