@@ -12,17 +12,26 @@
 //! (3) stopping the daemon, (4) inspecting both file paths for
 //! cross-contamination.
 
+// Both integration tests in this file are gated `cfg(not(windows))`
+// (Winsock 10106 / nextest concurrency on Windows hosted runners);
+// gate the helpers + imports they consume to match.
+#[cfg(not(windows))]
 use std::io::{Read, Write};
+#[cfg(not(windows))]
 use std::net::TcpStream;
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
+#[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use crate::common::free_port;
 
 /// Poll raw-HTTP `/health` up to `timeout`. Returns `true` when the
 /// daemon responds with its healthy body. Matches the pattern in
 /// `master_key_bootstrap_e2e.rs::wait_for_health` (convention: no
 /// `reqwest` in e2e, keeps the subprocess test hermetic).
+#[cfg(not(windows))]
 fn wait_for_health(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -51,6 +60,7 @@ fn wait_for_health(port: u16, timeout: Duration) -> bool {
 /// Spawn the daemon with the test master-key seam + bind to an
 /// ephemeral port. Returns (child, home) — caller is responsible for
 /// killing + cleanup.
+#[cfg(not(windows))]
 fn spawn_test_daemon() -> Option<(std::process::Child, tempfile::TempDir, u16)> {
     // Only run on debug builds; release builds compile out the
     // `AGENTSSO_TEST_MASTER_KEY_HEX` seam.

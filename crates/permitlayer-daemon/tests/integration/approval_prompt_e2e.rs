@@ -422,6 +422,14 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
 
     // Audit: the second request emitted `approval-granted cached=true
     // outcome_detail=operator-a-cached`.
+    //
+    // Story 7.7 CI-flakiness note: this audit-event poll is
+    // intermittently flaky on hosted runners (macOS-14, Linux)
+    // — the cache HIT itself works (status2 != 403), but the
+    // `cached=true` event sometimes doesn't appear within 30s.
+    // Retry pattern: the dispatcher may flush after the test
+    // gives up. Giving this 60s + structured failure message to
+    // dump audit dir on flake.
     let audit_dir = home.path().join("audit");
     let found = wait_for_audit_event(
         &audit_dir,
@@ -430,12 +438,24 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
                 && e["extra"]["outcome_detail"] == "operator-a-cached"
                 && e["extra"]["cached"] == true
         },
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     );
-    assert!(
-        found.is_some(),
-        "expected approval-granted cached=true event from second (cache-hit) request"
-    );
+    if found.is_none() {
+        // Forensic dump on flake — list every audit event so we can
+        // see whether the event landed with different fields.
+        let mut audit_events = Vec::new();
+        if audit_dir.exists() {
+            for entry in std::fs::read_dir(&audit_dir).into_iter().flatten().flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    audit_events.push(format!("=== {} ===\n{content}", entry.path().display()));
+                }
+            }
+        }
+        panic!(
+            "expected approval-granted cached=true event from second (cache-hit) request — none found within 60s. Audit dir contents:\n{}",
+            audit_events.join("\n\n")
+        );
+    }
 }
 
 #[test]

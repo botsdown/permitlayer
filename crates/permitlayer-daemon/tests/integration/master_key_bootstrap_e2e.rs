@@ -30,8 +30,13 @@
 //! into the canonical helper so future fixes (e.g., Windows clean
 //! shutdown) propagate without per-file maintenance.
 
+// Both integration tests in this file are gated `cfg(not(windows))`
+// (Winsock 10106 / Argon2id contention on Windows hosted runners);
+// gate the imports they consume to match.
+#[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use crate::common::{DaemonTestConfig, free_port, start_daemon, wait_for_health};
 
 /// AC #4: when `AGENTSSO_TEST_FORCE_KEYSTORE_ERROR=1` forces a
