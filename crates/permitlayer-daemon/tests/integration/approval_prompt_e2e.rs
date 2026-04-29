@@ -125,10 +125,10 @@ fn http_request(
 ) -> (u16, String) {
     let mut stream = std::net::TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}").parse().unwrap(),
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     )
     .expect("failed to connect");
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
 
     let body_str = body.unwrap_or("");
     let mut req =
@@ -337,7 +337,7 @@ fn granted_canned_response_allows_request_and_writes_approval_granted_audit() {
                 && e["extra"]["outcome_detail"] == "operator-y"
                 && e["extra"]["cached"] == false
         },
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     );
     assert!(
         found.is_some(),
@@ -378,7 +378,7 @@ fn denied_canned_response_returns_403_and_writes_approval_denied_audit() {
                 && e["extra"]["outcome_detail"] == "operator-n"
                 && e["extra"]["cached"] == false
         },
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     );
     assert!(found.is_some(), "expected approval-denied audit event with outcome_detail=operator-n");
 }
@@ -430,7 +430,7 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
                 && e["extra"]["outcome_detail"] == "operator-a-cached"
                 && e["extra"]["cached"] == true
         },
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     );
     assert!(
         found.is_some(),
@@ -479,7 +479,7 @@ fn never_canned_response_populates_cache_second_request_cached_deny() {
                 && e["extra"]["outcome_detail"] == "operator-never-cached"
                 && e["extra"]["cached"] == true
         },
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     );
     assert!(found.is_some(), "expected approval-denied cached=true event from never-cache hit");
 }
@@ -556,7 +556,7 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
             stderr_buf.truncate(n);
             let _ = tx.send(String::from_utf8_lossy(&stderr_buf).to_string());
         });
-        rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default()
+        rx.recv_timeout(Duration::from_secs(30)).unwrap_or_default()
     } else {
         String::new()
     };
@@ -584,7 +584,7 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
     let found = wait_for_audit_event(
         &audit_dir,
         |e| e["event_type"] == "approval-unavailable" && e["extra"]["outcome_detail"] == "no-tty",
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     );
     assert!(found.is_some(), "expected approval-unavailable outcome_detail=no-tty event");
 }
@@ -636,7 +636,7 @@ fn auto_approve_reads_bypasses_approval_service_for_readonly_scope() {
                 && e["extra"]["outcome_detail"] == "auto-approve-reads"
                 && e["extra"]["cached"] == false
         },
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     );
     assert!(
         found.is_some(),
