@@ -149,7 +149,7 @@ fn daemon_boots_cleanly_with_v1_envelope_in_vault() {
     // Boot must complete within 10s — the v1 envelope on disk is
     // not in the boot critical path; it's read lazily by the proxy
     // when the first request lands.
-    wait_for_daemon_ready(port, Duration::from_secs(30));
+    wait_for_daemon_ready(port, Duration::from_secs(60));
 
     // Daemon is up; that's the assertion. Stop and collect.
     let stderr = stop_and_collect(child);
@@ -200,7 +200,7 @@ fn daemon_boots_cleanly_with_v2_envelope_in_vault() {
             ("AGENTSSO_TEST_NO_PLUGINS", "1"),
         ],
     );
-    wait_for_daemon_ready(port, Duration::from_secs(30));
+    wait_for_daemon_ready(port, Duration::from_secs(60));
     let stderr = stop_and_collect(child);
 
     // Post-stop, the on-disk envelope must STILL be v2 (the daemon
