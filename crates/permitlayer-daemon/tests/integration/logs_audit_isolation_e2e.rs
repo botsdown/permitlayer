@@ -230,6 +230,13 @@ fn operational_log_contains_json_per_line_shape() {
 /// pattern tests) plus the `redacting_writer_round_trip_agt_v1_token`
 /// test in `telemetry::tests`. Those exercise the subscriber-layer
 /// redactor directly and do not need a daemon boot.
+/// Cfg-gated to `not(windows)`: same Winsock 10106 / nextest-
+/// concurrency rationale as the other tests in this file. Coverage
+/// for the redaction subscriber-layer behavior is preserved by
+/// `telemetry::filter::tests` and
+/// `telemetry::tests::redacting_writer_round_trip_agt_v1_token`
+/// which run on every platform (no daemon boot required).
+#[cfg(not(windows))]
 #[test]
 fn redacted_marker_survives_end_to_end_through_logs_pipeline() {
     let home = tempfile::tempdir().unwrap();
