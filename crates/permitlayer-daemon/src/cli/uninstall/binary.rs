@@ -322,32 +322,32 @@ fn detect_distro_package_owner(exe: &Path) -> Option<DistroPackage> {
     let exe_os = exe.as_os_str();
 
     // dpkg first — Debian/Ubuntu majority on the supported matrix.
-    if let Ok(out) = run_with_timeout("dpkg", &[std::ffi::OsStr::new("-S"), exe_os], timeout) {
-        if out.status.success() {
-            // Output shape: `<package>: <path>`. Take the package
-            // name for the remediation.
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let pkg = stdout
-                .lines()
-                .next()
-                .and_then(|line| line.split(':').next())
-                .map(|s| s.trim())
-                .unwrap_or("agentsso")
-                .to_owned();
-            return Some(DistroPackage {
-                manager: "dpkg",
-                remediation: format!("apt remove {pkg}"),
-            });
-        }
+    if let Ok(out) = run_with_timeout("dpkg", &[std::ffi::OsStr::new("-S"), exe_os], timeout)
+        && out.status.success()
+    {
+        // Output shape: `<package>: <path>`. Take the package
+        // name for the remediation.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let pkg = stdout
+            .lines()
+            .next()
+            .and_then(|line| line.split(':').next())
+            .map(|s| s.trim())
+            .unwrap_or("agentsso")
+            .to_owned();
+        return Some(DistroPackage {
+            manager: "dpkg",
+            remediation: format!("apt remove {pkg}"),
+        });
     }
 
     // rpm — Fedora / RHEL.
-    if let Ok(out) = run_with_timeout("rpm", &[std::ffi::OsStr::new("-qf"), exe_os], timeout) {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let pkg = stdout.lines().next().map(|s| s.trim()).unwrap_or("agentsso").to_owned();
-            return Some(DistroPackage { manager: "rpm", remediation: format!("rpm -e {pkg}") });
-        }
+    if let Ok(out) = run_with_timeout("rpm", &[std::ffi::OsStr::new("-qf"), exe_os], timeout)
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let pkg = stdout.lines().next().map(|s| s.trim()).unwrap_or("agentsso").to_owned();
+        return Some(DistroPackage { manager: "rpm", remediation: format!("rpm -e {pkg}") });
     }
 
     None

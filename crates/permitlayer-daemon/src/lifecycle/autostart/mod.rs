@@ -368,13 +368,13 @@ pub fn current_daemon_path() -> std::io::Result<PathBuf> {
             // If argv[0] is a bare command name (no slashes), look it
             // up on PATH — the discovered path is what shells used to
             // invoke us, which is what we want embedded.
-            if !arg0_path.to_string_lossy().contains('/') {
-                if let Some(paths) = std::env::var_os("PATH") {
-                    for dir in std::env::split_paths(&paths) {
-                        let candidate = dir.join(&arg0_path);
-                        if candidate.exists() {
-                            return Ok(candidate);
-                        }
+            if !arg0_path.to_string_lossy().contains('/')
+                && let Some(paths) = std::env::var_os("PATH")
+            {
+                for dir in std::env::split_paths(&paths) {
+                    let candidate = dir.join(&arg0_path);
+                    if candidate.exists() {
+                        return Ok(candidate);
                     }
                 }
             }

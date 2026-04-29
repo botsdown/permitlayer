@@ -204,7 +204,10 @@ function Resolve-Version {
     if ($RequestedVersion) {
         # P10: .Trim() defensively — `'v0.3.0 '` would otherwise produce
         # a broken URL with a trailing space inside the path segment.
-        $candidate = ($RequestedVersion -replace '^v','').Trim()
+        # Trim BEFORE the v-strip so leading whitespace doesn't prevent
+        # `^v` from matching (the `^` anchor is position-0 only, so
+        # `'  v0.3.0  '` -replace '^v',''` is a no-op without the trim).
+        $candidate = $RequestedVersion.Trim() -replace '^v',''
         Test-SemverShape $candidate
         return $candidate
     }

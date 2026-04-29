@@ -117,7 +117,12 @@ fn drain_child_streams(child: &mut Child) -> ChildStreams {
 
 /// Send SIGTERM to the subprocess. Caller must still call
 /// `shutdown_and_join` to enforce the shutdown deadline.
-fn send_sigterm(child: &Child) {
+///
+/// Takes `&mut Child` because the Windows fallback (`Child::kill`) is
+/// `&mut self`. The Unix branch only needs the PID (read-only) so
+/// the mutability is purely a Windows requirement; on Unix this
+/// reduces to a no-op constraint.
+fn send_sigterm(child: &mut Child) {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, kill};
@@ -255,7 +260,7 @@ fn audit_follow_renders_scrub_inline_for_v2_sample() {
     // Gracefully shut down regardless of whether we saw the marker.
     // `shutdown_and_join` enforces a bounded deadline and escalates
     // SIGTERM → SIGKILL if the child doesn't respond.
-    send_sigterm(&child);
+    send_sigterm(&mut child);
     shutdown_and_join(&mut child, stdout_handle, stderr_handle);
 
     let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
@@ -411,7 +416,7 @@ fn follow_streams_new_events_via_notify_watcher() {
     // Wait for the event to render.
     let seen = wait_for_stdout(&stdout_buf, |s| s.contains("gmail") && s.contains("api-call"));
 
-    send_sigterm(&child);
+    send_sigterm(&mut child);
     shutdown_and_join(&mut child, stdout_handle, stderr_handle);
 
     let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
@@ -462,7 +467,7 @@ fn follow_filter_service_narrows_stream() {
     // assertion requires letting the watcher drain).
     std::thread::sleep(Duration::from_millis(500));
 
-    send_sigterm(&child);
+    send_sigterm(&mut child);
     shutdown_and_join(&mut child, stdout_handle, stderr_handle);
 
     let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
@@ -527,7 +532,7 @@ fn follow_handles_rotation_mid_stream() {
     append_event(&audit_dir, "gmail", "ok", "api-call", "post-rotate");
     let seen_post = wait_for_stdout(&stdout_buf, |s| s.contains("post-rotate"));
 
-    send_sigterm(&child);
+    send_sigterm(&mut child);
     shutdown_and_join(&mut child, stdout_handle, stderr_handle);
 
     let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
@@ -599,7 +604,7 @@ fn follow_rotation_with_nonzero_preroll_offset_catches_postroll_events() {
     append_event(&audit_dir, "gmail", "ok", "api-call", "postroll-only");
     let seen_postroll = wait_for_stdout(&stdout_buf, |s| s.contains("postroll-only"));
 
-    send_sigterm(&child);
+    send_sigterm(&mut child);
     shutdown_and_join(&mut child, stdout_handle, stderr_handle);
 
     let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
@@ -703,7 +708,7 @@ fn follow_anomaly_hint_fires_after_warmup_and_spike() {
         s.contains("anomaly:") && s.contains("gmail") && s.contains("baseline")
     });
 
-    send_sigterm(&child);
+    send_sigterm(&mut child);
     shutdown_and_join(&mut child, stdout_handle, stderr_handle);
 
     let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
@@ -833,7 +838,7 @@ fn follow_since_replays_then_tails() {
     append_event(&audit_dir, "gmail", "ok", "api-call", "live-tail");
     let seen_live = wait_for_stdout(&stdout_buf, |s| s.contains("live-tail"));
 
-    send_sigterm(&child);
+    send_sigterm(&mut child);
     shutdown_and_join(&mut child, stdout_handle, stderr_handle);
 
     let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
