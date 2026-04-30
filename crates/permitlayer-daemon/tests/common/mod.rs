@@ -456,10 +456,8 @@ impl Drop for DaemonHandle {
 pub fn wait_for_bound_addr(child: &mut Child, timeout: Duration) -> SocketAddr {
     use std::io::BufRead;
 
-    let stdout = child
-        .stdout
-        .take()
-        .expect("child.stdout must be Stdio::piped() for wait_for_bound_addr");
+    let stdout =
+        child.stdout.take().expect("child.stdout must be Stdio::piped() for wait_for_bound_addr");
     let mut reader = std::io::BufReader::new(stdout);
     let deadline = Instant::now() + timeout;
     let mut line = String::new();
@@ -480,11 +478,15 @@ pub fn wait_for_bound_addr(child: &mut Child, timeout: Duration) -> SocketAddr {
                         .parse()
                         .unwrap_or_else(|e| panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}"));
                     // Drain the remaining stdout to /dev/null so the
-                    // daemon never blocks on a full kernel pipe. The
-                    // background thread exits when the daemon does.
+                    // daemon never blocks on a full kernel pipe. Use
+                    // `io::sink()` (zero-alloc, swallows everything)
+                    // instead of a `Vec` — a chatty daemon would
+                    // otherwise grow the buffer unboundedly. The
+                    // background thread exits when the daemon's stdout
+                    // pipe closes, which DaemonHandle::Drop guarantees
+                    // via child.kill().
                     std::thread::spawn(move || {
-                        let mut sink = Vec::with_capacity(8 * 1024);
-                        let _ = std::io::copy(&mut reader, &mut sink);
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
                     });
                     return addr;
                 }
@@ -518,8 +520,7 @@ pub fn assert_daemon_pid_matches(handle: &DaemonHandle) {
         .unwrap_or_else(|| panic!("/health response missing numeric pid field: {body}"));
     let expected_pid = u64::from(handle.child_pid());
     assert_eq!(
-        reported_pid,
-        expected_pid,
+        reported_pid, expected_pid,
         "free_port TOCTOU: /health on port {} reported pid {reported_pid} but our \
          spawned daemon is pid {expected_pid}. Another test's daemon stole this port \
          between free_port() pre-allocation and our daemon's bind. See Story 7.7 \

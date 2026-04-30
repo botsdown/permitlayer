@@ -19,6 +19,10 @@
 //!
 //! Crash-resume coverage lives in `rotate_key_crash_resume_e2e.rs`.
 
+// Read/Write are only used by the cfg(not(windows))-gated http_request
+// helper below; gating the import too keeps Windows builds free of
+// the -D unused-imports failure surfaced by run 25145066833.
+#[cfg(not(windows))]
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
