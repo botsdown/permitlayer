@@ -116,9 +116,9 @@ fn start_daemon_with_env_zero_port(
             Ok(0) => panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker"),
             Ok(_) => {
                 if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
-                    let addr: std::net::SocketAddr = rest.parse().unwrap_or_else(|e| {
-                        panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}")
-                    });
+                    let addr: std::net::SocketAddr = rest
+                        .parse()
+                        .unwrap_or_else(|e| panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}"));
                     port = Some(addr.port());
                     break;
                 }

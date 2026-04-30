@@ -155,10 +155,47 @@ fn is_process_alive(pid: u32) -> bool {
             None => false, // Invalid PID range — treat as not alive.
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // On non-Unix, we can't easily check. Assume alive if PID file exists.
-        // This is a best-effort check; the integration test covers Unix.
+        // Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetExitCodeProcess.
+        // PROCESS_QUERY_LIMITED_INFORMATION is granted across most ACL boundaries
+        // (deliberately weaker than PROCESS_QUERY_INFORMATION) so we can probe
+        // foreign-user processes without elevating. If OpenProcess fails the
+        // process is either gone or unqueryable; treat both as "not alive" so
+        // the stale-PID branch can claim the file.
+        //
+        // GetExitCodeProcess returns STILL_ACTIVE (259) for a running process.
+        // A process that's exited cleanly with that exact code (rare but legal)
+        // would be misclassified as alive — acceptable since the worst case is
+        // we refuse to start, which is the safe failure mode for a liveness
+        // check. The PID was about to be reused by Windows anyway after exit.
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: OpenProcess is a thread-safe Win32 syscall; arguments are
+        // documented as primitive-safe.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        // SAFETY: handle is non-null per the check above; exit_code is a
+        // stack-resident u32 owned by this frame.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code as *mut u32) };
+        // SAFETY: handle came from a successful OpenProcess; CloseHandle
+        // accepts any non-null process handle.
+        unsafe { CloseHandle(handle) };
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No supported liveness probe on this platform; conservatively
+        // treat the PID as alive so we never claim a stale file we can't
+        // verify is actually stale.
         let _ = pid;
         true
     }
