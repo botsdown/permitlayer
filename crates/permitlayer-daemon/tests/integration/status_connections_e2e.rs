@@ -108,13 +108,12 @@ fn wait_for_connection_recorded(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let (status, body) = http_get_loopback(port, "/v1/control/connections", &[]);
-        if status == 200 {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
-                && let Some(arr) = json.get("connections").and_then(|c| c.as_array())
-                && !arr.is_empty()
-            {
-                return true;
-            }
+        if status == 200
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(arr) = json.get("connections").and_then(|c| c.as_array())
+            && !arr.is_empty()
+        {
+            return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
