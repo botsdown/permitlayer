@@ -1417,20 +1417,26 @@ jobs:
 
   # permitlayer-custom (Story 7.7 Task 8 / AC #9): minimum-OS smoke
   # tests per NFR49. Runs AFTER `host` (we need a real GitHub Release
-  # to install from) on the lowest hosted runners that meet NFR49:
-  # macos-13 (Ventura), ubuntu-22.04 (glibc 2.31+), windows-2022
+  # to install from) on the lowest hosted runners that meet NFR49.
+  # Originally targeted macos-13 (Ventura); GitHub retired macos-13
+  # on 2025-12-04 (brownouts began 2025-09-22 — see
+  # actions/runner-images#13046). Pivoted to macos-15-intel as the
+  # closest like-for-like for x86_64 macOS coverage. Intel macOS
+  # itself is scheduled for retirement in Fall 2027 — re-evaluate
+  # the minimum-supported-macOS gate before then.
+  # Other legs unchanged: ubuntu-22.04 (glibc 2.31+), windows-2022
   # (Windows 10 v2004+ equivalent). Each leg installs from the
   # just-published release, asserts version + `rotate-key --help`
   # smoke, runs uninstall --yes --keep-binary. Partial-failure issue
   # pattern mirrors homebrew-publish; smoke-fail does NOT roll back
   # the release (the artifacts are still valid; smoke caught a
   # downstream issue).
-  smoke-min-os-macos-13:
+  smoke-min-os-macos-15-intel:
     needs:
       - plan
       - host
     if: ${{ always() && needs.host.result == 'success' && !github.event.pull_request }}
-    runs-on: macos-13
+    runs-on: macos-15-intel
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.plan.outputs.tag }}
@@ -1468,8 +1474,8 @@ jobs:
       - name: Partial-failure issue on error
         if: failure()
         run: |
-          TITLE="Release ${TAG}: macos-13 smoke failed"
-          BODY="The smoke-min-os-macos-13 job for tag \`${TAG}\` failed. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TITLE="Release ${TAG}: macos-15-intel smoke failed"
+          BODY="The smoke-min-os-macos-15-intel job for tag \`${TAG}\` failed. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           EXISTING="$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number' 2>/dev/null || true)"
           if [ -n "$EXISTING" ]; then
             echo "::notice::Existing issue #$EXISTING already open; not duplicating"
