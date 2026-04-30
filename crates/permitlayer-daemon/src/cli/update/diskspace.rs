@@ -36,16 +36,30 @@ fn available_disk_space_impl(path: &Path) -> Option<u64> {
 fn available_disk_space_impl(path: &Path) -> Option<u64> {
     // Walk parents to find a drive root we can query. PowerShell's
     // Get-PSDrive takes the drive letter (without colon).
+    //
+    // On Windows, `Path::new("C:\\").parent()` returns `None` (NOT
+    // `Some(C:\\)`), so the previous `probe == parent` self-check
+    // never fired — we always fell into the `else { return None }`
+    // branch and the disk-space pre-flight reported `None` for every
+    // path. Surfaced by the Story 7.7 four-OS matrix on
+    // windows-latest. The fix: when `parent()` returns `None`, we've
+    // reached the root — extract the drive letter from `probe` (the
+    // last successful path) and break.
     let mut probe = path.to_path_buf();
     let drive_letter = loop {
-        if let Some(parent) = probe.parent() {
-            if probe == parent {
-                // Hit the filesystem root. Extract the drive prefix.
+        match probe.parent() {
+            Some(parent) if probe == parent => {
+                // Defensive: some path forms self-loop at root rather
+                // than returning `None`. Treat the same as None.
                 break extract_windows_drive_letter(&probe)?;
             }
-            probe = parent.to_path_buf();
-        } else {
-            return None;
+            Some(parent) => {
+                probe = parent.to_path_buf();
+            }
+            None => {
+                // Reached the root — `probe` is `C:\` (or similar).
+                break extract_windows_drive_letter(&probe)?;
+            }
         }
     };
 

@@ -1220,6 +1220,54 @@ pub(crate) async fn register_agent_handler(
         );
     }
 
+    // TODO(story-7.7): delete this block once the register-then-auth
+    // flake root cause is proven (either by this firing in CI, or by
+    // many flake-free CI runs that elevate the free_port TOCTOU
+    // hypothesis by elimination). Forensic instrumentation only — no
+    // production behavior depends on it.
+    //
+    // Self-lookup assertion: we just wrote `identity` to disk and
+    // called `replace_with` on the in-memory registry. The very next
+    // thing the test will do is auth with the bearer token we're
+    // about to return, which goes through
+    // `snapshot.lookup_by_key(&compute_lookup_key(name))` in
+    // permitlayer-proxy::middleware::auth. That HMAC computation uses
+    // the same `state.agent_lookup_key` we used to derive `lookup_key`
+    // above, so a successful self-lookup here is a strict pre-
+    // condition for the bearer token to validate on its first use.
+    //
+    // Note on the race vector this catches: `RegistrySnapshot` is a
+    // single struct (containing both `by_name` and `by_lookup_key`
+    // HashMaps) installed via a single `ArcSwap::store` — there is no
+    // two-write window between the agent record and the lookup-key
+    // index. The narrow race that COULD fire this assertion is
+    // concurrent `rotate-key` rotating `state.agent_lookup_key`
+    // between our `compute_lookup_key` call above and the registry's
+    // own recompute inside `from_agents_checked` during `replace_with`
+    // — under that race, `from_agents_checked` would skip the agent
+    // (HMAC mismatch) and the snapshot would be missing it.
+    //
+    // Log-not-fail so the agent file (already on disk) stays valid
+    // and the next SIGHUP / control reload heals the registry; the
+    // forensic log is the value here.
+    {
+        let snapshot = state.agent_registry.snapshot();
+        if snapshot.lookup_by_key(&lookup_key).is_none() {
+            tracing::error!(
+                agent_name = %identity.name(),
+                lookup_key_first_4 = ?&lookup_key[..4],
+                registry_len = snapshot.len(),
+                "REGISTER-VISIBILITY-RACE: agent stored to disk + replace_with completed, \
+                 but snapshot.lookup_by_key returned None for the lookup_key we just \
+                 computed. Most likely cause: a concurrent `rotate-key` rotated the \
+                 daemon subkey between our compute_lookup_key call and the registry's \
+                 internal recompute. If that's NOT the case (no rotate-key in flight), \
+                 this is a previously-undocumented register-then-auth visibility race \
+                 — Story 7.7 smoking gun."
+            );
+        }
+    }
+
     // 6. Audit event (best-effort).
     //
     // Story 4.4 review fix (B7): use the `scope="-", resource=<action>`

@@ -348,6 +348,24 @@ fn status_help_mentions_new_flags() {
 fn health_active_connections_reflects_tracker_count() {
     // Verify the AC #5 invariant end-to-end: `/health` reports the
     // tracker's live count, not the pre-Story-5.5 hardcoded 0.
+    //
+    // Story 7.7 review patch (2026-04-29): macos-15-intel surfaces
+    // intermittent failures where the post-request `/health` poll
+    // reports `active_connections == 0` instead of `1`. Initial
+    // hypothesis (tracker decrement-on-disconnect race) was refuted
+    // by reading conn_track.rs — the tracker has NO decrement path;
+    // entries persist for `idle_timeout_secs` (default 300s) and are
+    // removed only by background sweep. The likely actual cause is
+    // that the proxied request below failed at AuthLayer (401), so
+    // ConnTrackLayer never recorded the AgentId and the DashMap
+    // stayed empty. The previous version of this test discarded the
+    // proxied response status and surfaced auth failures only as a
+    // downstream `active_connections == 0` mismatch — confusing.
+    //
+    // The assertion below now PINS the proxied response to "not
+    // auth.invalid_token" so the next macos-15-intel failure tells
+    // us unambiguously whether it's auth (Story 7.7 register-then-
+    // auth flake) or tracker (genuine bug we'd need to investigate).
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
@@ -362,10 +380,24 @@ fn health_active_connections_reflects_tracker_count() {
 
     // Register + fire one request → one entry.
     let token = register_agent(port, "health-agent", "policy-readonly");
-    let (_status, _body) = http_get_loopback(
+    let (status, body) = http_get_loopback(
         port,
         "/v1/tools/gmail/users/me/messages",
         &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
+    );
+    // Pre-condition: the request reached at least the policy layer.
+    // If THIS assert fires (status == 401), the proxied request
+    // never made it past AuthLayer → ConnTrackLayer didn't record →
+    // the active_connections check below would spuriously fail.
+    // Surfacing the auth result here makes the test self-diagnosing.
+    let auth_failure_body = if status == 401 { Some(body.clone()) } else { None };
+    assert!(
+        auth_failure_body.is_none(),
+        "auth-flake guard: proxied request returned 401 BEFORE the tracker recorded — \
+         this is the Story 7.7 register-then-auth visibility race. \
+         The active_connections=0 symptom below is downstream of this. \
+         Response body: {}",
+        auth_failure_body.unwrap_or_default()
     );
 
     let (_, body) = http_get_loopback(port, "/health", &[]);
