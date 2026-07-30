@@ -563,7 +563,7 @@ fn build_query_string(params: &[(&str, Option<String>)]) -> String {
     if parts.is_empty() { String::new() } else { format!("?{}", parts.join("&")) }
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl GmailMcpServer {
     #[tool(
         name = "gmail.messages.list",
@@ -1255,7 +1255,7 @@ impl GmailMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for GmailMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1472,7 +1472,7 @@ impl CalendarMcpServer {
     }
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl CalendarMcpServer {
     #[tool(
         name = "calendar.calendars.list",
@@ -1774,7 +1774,7 @@ impl CalendarMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for CalendarMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
@@ -1968,7 +1968,7 @@ impl DriveMcpServer {
     }
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl DriveMcpServer {
     #[tool(
         name = "drive.files.list",
@@ -2154,7 +2154,7 @@ impl DriveMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for DriveMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
