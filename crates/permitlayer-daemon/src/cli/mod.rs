@@ -13,6 +13,7 @@ pub mod connection;
 pub mod connectors;
 pub mod credentials;
 pub mod doctor;
+pub mod drive;
 pub mod kill;
 pub mod logs;
 pub mod migrations;

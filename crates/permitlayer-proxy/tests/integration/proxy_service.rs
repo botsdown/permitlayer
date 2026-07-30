@@ -14,7 +14,7 @@ use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
 use permitlayer_credential::{ConnectionId, OAuthToken, SealedCredential, Slot};
 use permitlayer_proxy::error::ProxyError;
 use permitlayer_proxy::request::ProxyRequest;
-use permitlayer_proxy::service::ProxyService;
+use permitlayer_proxy::service::{DriveUploadChunkResult, DriveUploadStart, ProxyService};
 use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
@@ -693,6 +693,90 @@ async fn drive_scrub_fires_on_response() {
     assert_eq!(events[0].outcome, "ok");
 
     mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn drive_resumable_upload_reconciles_ambiguous_chunk_failure() {
+    let mut server = mockito::Server::new_async().await;
+    let generate = server
+        .mock("GET", "/files/generateIds")
+        .match_query(mockito::Matcher::Any)
+        .match_header("authorization", "Bearer drive-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"ids":["generated-file-id"]}"#)
+        .create_async()
+        .await;
+    let location = format!("{}/upload/drive/v3/files?upload_id=daemon-secret", server.url());
+    let initiate = server
+        .mock("POST", "/upload/drive/v3/files")
+        .match_query(mockito::Matcher::Any)
+        .match_header("authorization", "Bearer drive-token")
+        .match_header("x-upload-content-type", "application/pdf")
+        .match_header("x-upload-content-length", "3")
+        .with_status(200)
+        .with_header("location", &location)
+        .create_async()
+        .await;
+    let ambiguous_put = server
+        .mock("PUT", "/upload/drive/v3/files")
+        .match_query(mockito::Matcher::Any)
+        .match_header("content-range", "bytes 0-2/3")
+        .match_body("pdf")
+        .with_status(500)
+        .create_async()
+        .await;
+    let status_probe = server
+        .mock("PUT", "/upload/drive/v3/files")
+        .match_query(mockito::Matcher::Any)
+        .match_header("content-range", "bytes */3")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"generated-file-id","name":"folio.pdf","mimeType":"application/pdf","size":"3","md5Checksum":"ac6f755f5f2503d5886d4e3f1129ef38"}"#,
+        )
+        .create_async()
+        .await;
+
+    let url = format!("{}/", server.url());
+    let (service, audit_store) = build_service_multi(&[("drive", &url, b"drive-token")]).await;
+    let started = service
+        .drive_upload_start(
+            "agent-integration-test".to_owned(),
+            "drive".to_owned(),
+            ulid::Ulid::new().to_string(),
+            DriveUploadStart {
+                name: "folio.pdf".to_owned(),
+                mime_type: "application/pdf".to_owned(),
+                size_bytes: 3,
+                parent_id: Some("receipts-folder".to_owned()),
+                idempotency_key: Some("upload-key".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let result = service
+        .drive_upload_chunk(
+            "agent-integration-test".to_owned(),
+            "drive".to_owned(),
+            ulid::Ulid::new().to_string(),
+            &started.upload_id,
+            "bytes 0-2/3",
+            Bytes::from_static(b"pdf"),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        DriveUploadChunkResult::Complete { ref file }
+            if file["id"] == "generated-file-id" && file["size"] == "3"
+    ));
+    assert!(audit_store.events().iter().all(|event| event.scope == "drive.file"));
+    generate.assert_async().await;
+    initiate.assert_async().await;
+    ambiguous_put.assert_async().await;
+    status_probe.assert_async().await;
 }
 
 #[tokio::test]

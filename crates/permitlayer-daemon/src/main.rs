@@ -57,6 +57,9 @@ enum Commands {
     /// the retired `connect <service> --agent` verb (FR23) — bind an
     /// agent to a connection with `agentsso bind` (Story 11.14).
     Connection(cli::connection::ConnectionArgs),
+    /// Upload local binary files to Google Drive through PermitLayer's
+    /// authenticated, policy-checked resumable transfer path.
+    Drive(cli::drive::DriveArgs),
     /// Grant an agent use of a connection at a tier, with an optional
     /// policy + selector alias (Epic 11, Story 11.14). One agent may hold
     /// many bindings. Bearer-immutable — never touches the agent's token.
@@ -305,6 +308,7 @@ async fn main() -> ExitCode {
         Some(Commands::Connection(args)) => {
             connection_to_exit_code(cli::connection::run(args).await)
         }
+        Some(Commands::Drive(args)) => anyhow_to_exit_code(cli::drive::run(args).await),
         // `bind`/`unbind` share the connection exit taxonomy (operator-
         // correctable → 2; conflict/system → 3) via `cli::oauth_seal`.
         Some(Commands::Bind(args)) => connection_to_exit_code(cli::bind::run_bind(args).await),

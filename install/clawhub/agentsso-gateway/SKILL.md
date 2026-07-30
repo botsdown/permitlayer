@@ -157,6 +157,26 @@ resource into its user-owned document cache automatically.
    The client controls retention of its cached copy; use its cache cleanup
    policy for sensitive attachments.
 
+### Uploading binary files to Drive
+
+`drive.files.create` creates metadata only. Use it for folders and empty
+files. Never pass `media_body`, base64, `content`, `data`, or a local path to
+that MCP tool; PermitLayer rejects those fields instead of creating a
+misleading zero-byte file.
+
+For PDFs, spreadsheets, images, and other client-owned files, use the local
+terminal:
+
+```sh
+agentsso drive upload /path/to/file.pdf --parent <drive-folder-id>
+```
+
+Use `--connection <alias-or-name>` when necessary. The command streams
+bounded chunks through PermitLayer and verifies the final Drive size and MD5.
+If interrupted, reconcile the reported upload ID with
+`agentsso drive upload-status <id>`, then rerun the same upload command to
+resume the live session at its acknowledged offset.
+
 ### `format` on messages/threads/drafts
 
 `gmail.messages.get`, `gmail.threads.get`, `gmail.drafts.get` all take a

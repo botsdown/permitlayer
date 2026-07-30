@@ -26,6 +26,33 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.3.3] - 2026-07-30 — `agentsso` binary
+
+Patch release. Adds policy-checked binary uploads to Google Drive and an
+in-place connection reauthorization command. Workspace / binary bump 1.3.2 →
+1.3.3; plugin host-API surface unchanged (still `1.0.0-rc.1`).
+
+### Added
+
+- **Bounded Drive binary uploads.** `agentsso drive upload` reads a local file
+  as the invoking user, streams 8 MiB chunks through the authenticated daemon,
+  and verifies Drive's final size and MD5 checksum. Google resumable-session
+  capabilities remain daemon-owned and memory-only; uploads are capped at
+  250 MiB with bounded concurrency and 30-minute inactivity expiry.
+- **Safe resume and retry.** Start requests are idempotent for identical file
+  content and Drive metadata. Ambiguous upstream failures are reconciled with
+  Drive status probes before resending, and rerunning an interrupted command
+  resumes at the last acknowledged offset.
+- **Connection reauthorization.** `agentsso connection reauth <connection>`
+  repeats OAuth consent while preserving the connection ID and agent bindings,
+  including `--headless` and device-flow modes.
+
+### Fixed
+
+- **Drive binary misuse now fails loudly.** The MCP `drive.files.create` tool
+  remains metadata-only and rejects content, base64, `media_body`, and local
+  path fields instead of silently creating an empty Drive file.
+
 ## [1.3.2] - 2026-07-30 — `agentsso` binary
 
 Patch release. Makes Gmail attachments readable by unprivileged MCP clients

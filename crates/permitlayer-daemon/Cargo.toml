@@ -116,6 +116,10 @@ unicode-width.workspace = true
 async-trait.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
+md5.workspace = true
+mime_guess.workspace = true
+mime.workspace = true
+urlencoding.workspace = true
 # Story 7.27 Round-2 review fix: HMAC-SHA256 for master-key
 # fingerprinting in `master_key_fingerprint_first8`. macOS path
 # mirrors `permitlayer_keystore::FINGERPRINT_DOMAIN_SEP` so the

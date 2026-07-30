@@ -134,7 +134,7 @@ pub enum RefreshOutcome {
     /// entry is missing (graceful-degradation case for older installs
     /// predating Story 1.6, architecture invariant #7). Proxy returns
     /// the original 401 unchanged; CLI tells the user to re-run
-    /// `agentsso setup <service>`.
+    /// `agentsso connection reauth <selector>`.
     Skipped,
 }
 
@@ -166,7 +166,7 @@ pub enum RefreshFlowError {
     /// The refresh token was revoked server-side (`invalid_grant`).
     /// Audit outcome: `invalid_grant`. Proxy returns
     /// `ProxyError::CredentialRevoked`; CLI prints a remediation
-    /// message pointing at `agentsso setup <service>`.
+    /// message pointing at `agentsso connection reauth <selector>`.
     #[error("refresh token for service '{service}' was revoked server-side")]
     CredentialRevoked { service: String },
 
