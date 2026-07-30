@@ -26,6 +26,28 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.3.2] - 2026-07-30 — `agentsso` binary
+
+Patch release. Makes Gmail attachments readable by unprivileged MCP clients
+and updates dependencies affected by newly disclosed RustSec advisories.
+Workspace / binary bump 1.3.1 → 1.3.2; plugin host-API surface unchanged
+(still `1.0.0-rc.1`).
+
+### Fixed
+
+- **Gmail attachments are returned as MCP embedded resources.**
+  `gmail.attachments.get` now returns the attachment bytes, MIME type, and
+  sanitized filename to the caller instead of returning a path inside the
+  privileged PermitLayer state directory. Hermes v2026.7.20 and newer can
+  materialize the resource into its own user-readable document cache.
+- **Legacy daemon-owned attachment storage is removed.** The obsolete media
+  path, permission, and expiry plumbing has been deleted. On startup, the
+  daemon removes the old transient media directory; credentials, policy,
+  configuration, and audit data are unaffected.
+- **Security advisory remediation.** Updated `rmcp`, `quinn-proto`,
+  `crossbeam-epoch`, and `anyhow` to patched releases, retaining explicit
+  instance-backed MCP tool routing under the newer `rmcp` macro API.
+
 ## [1.3.1] - 2026-06-10 — `agentsso` binary
 
 Patch release. Onboarding UX fixes from the first real SSH onboarding
