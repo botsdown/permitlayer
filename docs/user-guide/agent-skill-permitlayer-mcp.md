@@ -65,10 +65,12 @@ to SSE, the daemon will reject the connection.
 These are the flows that aren't in the tool schemas — get them right or
 you'll fail in confusing ways.
 
-### Gmail attachments: read the manifest, then fetch the file path
+### Gmail attachments: read the manifest, then fetch the resource
 
-You do **not** decode base64 anymore. The proxy shapes the read and writes
-attachment bytes to a local file for you.
+You do **not** decode base64. The proxy shapes the message read and returns the
+attachment as an MCP embedded resource. Your MCP client owns file placement.
+Hermes v2026.7.20+ automatically materializes the resource in its user-owned
+document cache and gives its file/PDF tools a readable local path.
 
 1. **Call `gmail.messages.get`** (default `format`). You get a compact
    shaped object — headers, the prioritized text body, and an
@@ -89,21 +91,33 @@ attachment bytes to a local file for you.
    the raw upstream Gmail JSON instead of the shaped object.)
 
 2. **Call `gmail.attachments.get`** with the `message_id` and the
-   `attachmentId` from the manifest. It writes the decoded bytes to a
-   local file and returns a **path** — no base64:
+   `attachmentId` from the manifest. The result contains structured metadata
+   and one embedded resource:
    ```json
    {
-     "messageId": "18f...", "attachmentId": "ANGjdJ...",
-     "size": 718000, "mimeType": "application/pdf",
-     "filename": "handbook.pdf",
-     "path": "/Library/Application Support/permitlayer/media/<...>/handbook.pdf"
+     "content": [{
+       "type": "resource",
+       "resource": {
+         "uri": "permitlayer://attachment/<unique-id>/handbook.pdf",
+         "mimeType": "application/pdf",
+         "blob": "<protocol-managed base64>"
+       }
+     }],
+     "structuredContent": {
+       "messageId": "18f...", "attachmentId": "ANGjdJ...",
+       "size": 718000, "mimeType": "application/pdf",
+       "filename": "handbook.pdf"
+     }
    }
    ```
 
-3. **Hand `path` straight to your file/PDF tool.** Read the local file;
-   do not try to fetch it over HTTP and do not expect base64 in the tool
-   result. The file is transient (cleaned up automatically after ~1 hour),
-   so use it within the session.
+3. **Use the client-materialized file with your file/PDF tool.** In Hermes the
+   tool result reports the cache path. Do not fetch the `permitlayer://` URI;
+   it is an identifier, not a downloadable URL. Do not manually decode the
+   resource blob. If the client does not materialize embedded resources,
+   upgrade it; PermitLayer does not return a daemon-local fallback path. The
+   client controls retention of its cached copy, so follow the client's cache
+   cleanup policy when the attachment is sensitive.
 
 ### `format` on messages/threads/drafts
 
@@ -231,7 +245,8 @@ audit log doesn't match your story.
 3. Access is binary and immediate — a denied scope won't become allowed by
    waiting or retrying.
 4. Surface error codes verbatim when explaining failures.
-5. For Gmail attachments, make TWO calls and decode base64url, not base64.
+5. For Gmail attachments, make TWO calls and let the MCP client materialize
+   the embedded resource.
 6. For `calendar.events.update`, fetch-then-update (PUT replaces everything)
    or use `events.patch`.
 7. Be honest in summaries — the audit log is the ground truth.

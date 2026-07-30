@@ -518,7 +518,6 @@ async fn make_test_service_full(
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         tempdir.path().to_path_buf(),
-        tempdir.path().join("media"),
         overrides,
     ));
 

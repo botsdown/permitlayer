@@ -281,7 +281,7 @@ details.
   Desktop, Linux/Windows hosts). ClawHub/OpenClaw users get the same skill
   via `clawhub install agentsso-gateway`. Covers policy semantics, scrub
   placeholders, error retry rules, audit expectations, and the non-obvious
-  tool flows (Gmail two-step attachments, base64url decoding, etc.)
+  tool flows (Gmail two-step attachments, embedded-resource delivery, etc.)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — dev workflow, test gates,
   CODEOWNERS policy
 - [SECURITY.md](SECURITY.md) — vulnerability reporting

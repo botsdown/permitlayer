@@ -14,9 +14,9 @@ pub const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
 
 /// Maximum upstream response body for the attachment-fetch path (50 MiB).
 /// Gmail attachment `data` is base64 (~33% inflation), so this bounds a
-/// raw attachment of roughly ~37 MiB. The bytes are decoded and written
-/// to disk server-side (never streamed through an MCP text result), so
-/// the larger cap does not enlarge any model-visible payload.
+/// raw attachment of roughly ~37 MiB. The bytes are decoded and returned
+/// in an MCP embedded resource (never ordinary MCP text); compatible clients
+/// materialize that resource without exposing the base64 to the model.
 pub const MAX_ATTACHMENT_BODY: usize = 50 * 1024 * 1024;
 
 /// Response from an upstream API call.

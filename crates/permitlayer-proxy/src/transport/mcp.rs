@@ -15,9 +15,12 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method};
+use base64::Engine as _;
 use rmcp::handler::server::tool::{Extension, ToolRouter};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, Content, Implementation, ResourceContents, ServerCapabilities, ServerInfo,
+};
 use rmcp::{tool, tool_handler, tool_router};
 use tracing::debug;
 
@@ -285,6 +288,9 @@ pub struct GmailSettingsGetParams {}
 #[derive(Clone)]
 pub struct GmailMcpServer {
     proxy_service: Arc<ProxyService>,
+    /// Attachment materialization temporarily holds multiple encodings of the
+    /// payload. Serialize these calls to bound their aggregate peak memory.
+    attachment_gate: Arc<tokio::sync::Semaphore>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -294,7 +300,11 @@ impl GmailMcpServer {
     pub fn new(proxy_service: Arc<ProxyService>) -> Self {
         let mut tool_router = Self::tool_router();
         strip_meta_schema(&mut tool_router);
-        Self { proxy_service, tool_router }
+        Self {
+            proxy_service,
+            attachment_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            tool_router,
+        }
     }
 
     /// Dispatch a proxy request and return the upstream response body as a
@@ -381,14 +391,14 @@ fn validate_resource_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Sanitize an attachment filename for safe use as a path component.
+/// Sanitize an attachment filename for safe use as a resource URI component
+/// and client-side filename hint.
 ///
-/// Strips directory separators (incl. Unicode), control chars, NTFS
-/// alternate-data-stream `:`, leading dots, and bounds the length. Falls
-/// back to `att-<short attachment-id>.bin` when the result is empty or no
-/// filename was provided. The agent + message-id path components are
-/// `validate_resource_id`-checked by the caller; this guards the one
-/// attacker-influenced component (the MIME filename header).
+/// Strips cross-platform reserved characters, control/bidirectional display
+/// characters, leading/trailing dots, and Windows device names, then bounds
+/// the length. Falls back to `att-<short attachment-id>.bin` when the result
+/// is empty or no filename was provided. This guards the attacker-influenced
+/// MIME filename header before it is included in the resource identifier.
 fn sanitize_filename(filename: Option<&str>, attachment_id: &str) -> String {
     const MAX_LEN: usize = 128;
     let fallback = || {
@@ -400,7 +410,10 @@ fn sanitize_filename(filename: Option<&str>, attachment_id: &str) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| {
-            if c == '/' || c == '\\' || c == ':' || c.is_control() || c == std::path::MAIN_SEPARATOR
+            if matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+                || c.is_control()
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
             {
                 '_'
             } else {
@@ -410,25 +423,34 @@ fn sanitize_filename(filename: Option<&str>, attachment_id: &str) -> String {
         .collect();
     // Strip leading dots (no `.`/`..`/hidden-file traversal) and surrounding
     // whitespace.
-    let trimmed = cleaned.trim().trim_start_matches('.').trim();
+    let trimmed = cleaned.trim().trim_start_matches('.').trim().trim_end_matches('.');
     if trimmed.is_empty() {
         return fallback();
     }
+    let stem = trimmed.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"));
+    let portable = if reserved { format!("_{trimmed}") } else { trimmed.to_owned() };
     // Bound length at a char boundary.
-    if trimmed.len() <= MAX_LEN {
-        trimmed.to_owned()
+    if portable.len() <= MAX_LEN {
+        portable
     } else {
-        let end = (0..=MAX_LEN).rev().find(|&i| trimmed.is_char_boundary(i)).unwrap_or(0);
-        trimmed[..end].to_owned()
+        let end = (0..=MAX_LEN).rev().find(|&i| portable.is_char_boundary(i)).unwrap_or(0);
+        portable[..end].to_owned()
     }
 }
 
-/// Short hex digest (first 16 bytes of SHA-256) for filesystem-safe,
-/// non-reversible path components (per-agent dir + per-fetch nonce).
-fn short_hex_hash(input: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(input);
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+/// Return a syntactically valid media type for the MCP resource. Gmail MIME
+/// metadata originates in sender-controlled message headers, so malformed
+/// values must not reach client handler selection.
+fn normalize_mime_type(mime_type: Option<String>) -> String {
+    mime_type
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_owned())
 }
 
 /// Validate a Calendar ID (calendar or event ID).
@@ -541,7 +563,7 @@ fn build_query_string(params: &[(&str, Option<String>)]) -> String {
     if parts.is_empty() { String::new() } else { format!("?{}", parts.join("&")) }
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl GmailMcpServer {
     #[tool(
         name = "gmail.messages.list",
@@ -570,8 +592,8 @@ impl GmailMcpServer {
         name = "gmail.messages.get",
         description = "Get a Gmail message by ID. By default returns a compact shaped object \
             (headers, prioritized text body, and an attachment manifest) with attachment bytes \
-            stripped — fetch attachment bytes via `gmail.attachments.get`, which returns a local \
-            file path. Pass format=metadata/minimal/raw for the unshaped upstream Gmail JSON."
+            stripped — fetch attachment bytes via `gmail.attachments.get`, which returns an MCP \
+            embedded resource. Pass format=metadata/minimal/raw for the unshaped upstream Gmail JSON."
     )]
     async fn messages_get(
         &self,
@@ -685,111 +707,104 @@ impl GmailMcpServer {
 
     #[tool(
         name = "gmail.attachments.get",
-        description = "Fetch a Gmail attachment's bytes and write them to a local file, returning \
-            JSON { messageId, attachmentId, size, mimeType, filename, path }. The `path` is a \
-            local file the agent's file/pdf tools can read directly — NO base64 is returned. \
-            Files are transient (cleaned up automatically)."
+        description = "Fetch a Gmail attachment as an MCP embedded resource with structured \
+            metadata { messageId, attachmentId, size, mimeType, filename }. Compatible clients \
+            materialize the resource into their own document cache; Hermes requires v2026.7.20+."
     )]
     async fn attachments_get(
         &self,
         Parameters(params): Parameters<AttachmentsGetParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
-    ) -> Result<String, String> {
-        debug!(
-            tool = "gmail.attachments.get",
-            message_id = %params.message_id,
-            attachment_id = %params.attachment_id,
-            "MCP tool call"
-        );
-        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
-        validate_resource_id(&params.message_id)?;
-        validate_resource_id(&params.attachment_id)?;
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result: Result<CallToolResult, String> = async {
+            debug!(
+                tool = "gmail.attachments.get",
+                message_id = %params.message_id,
+                attachment_id = %params.attachment_id,
+                "MCP tool call"
+            );
+            let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+            validate_resource_id(&params.message_id)?;
+            validate_resource_id(&params.attachment_id)?;
+            let _attachment_permit = self
+                .attachment_gate
+                .acquire()
+                .await
+                .map_err(|_| "attachment concurrency gate is unavailable".to_owned())?;
 
-        // 1. Fetch the attachment bytes via the un-scrubbed raw path
-        //    (scrubbing base64 would corrupt the decoded file).
-        let att_path =
-            format!("users/me/messages/{}/attachments/{}", params.message_id, params.attachment_id);
-        let att_req = Self::gmail_request(
-            att_path,
-            "gmail.readonly",
-            Method::GET,
-            Bytes::new(),
-            agent_id.clone(),
-        );
-        let att_resp = self.proxy_service.fetch_raw(att_req).await.map_err(|e| e.to_string())?;
-        let att_json: serde_json::Value = serde_json::from_slice(&att_resp.body)
-            .map_err(|e| format!("attachment JSON parse error: {e}"))?;
-        let data = att_json
-            .get("data")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "attachment response missing `data`".to_owned())?;
-        let bytes = permitlayer_core::files::decode_base64url_maybe_padded(data)
-            .ok_or_else(|| "attachment data is not valid base64url".to_owned())?;
-        let size = att_json.get("size").and_then(serde_json::Value::as_u64);
+            // 1. Fetch the attachment bytes via the un-scrubbed raw path
+            //    (scrubbing base64 would corrupt the decoded file).
+            let att_path = format!(
+                "users/me/messages/{}/attachments/{}",
+                params.message_id, params.attachment_id
+            );
+            let att_req = Self::gmail_request(
+                att_path,
+                "gmail.readonly",
+                Method::GET,
+                Bytes::new(),
+                agent_id.clone(),
+            );
+            let att_resp =
+                self.proxy_service.fetch_raw(att_req).await.map_err(|e| e.to_string())?;
+            let att_json: serde_json::Value = serde_json::from_slice(&att_resp.body)
+                .map_err(|e| format!("attachment JSON parse error: {e}"))?;
+            let data = att_json
+                .get("data")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "attachment response missing `data`".to_owned())?;
+            let bytes = permitlayer_core::files::decode_base64url_maybe_padded(data)
+                .ok_or_else(|| "attachment data is not valid base64url".to_owned())?;
+            let size = bytes.len() as u64;
 
-        // 2. Resolve mimeType + filename via a metadata message lookup
-        //    (attachments.get returns neither).
-        let meta_req = Self::gmail_request(
-            format!("users/me/messages/{}?format=full", params.message_id),
-            "gmail.readonly",
-            Method::GET,
-            Bytes::new(),
-            agent_id.clone(),
-        );
-        let (filename, mime_type) = match self.dispatch_json(meta_req).await {
-            Ok(msg) => {
-                gmail_shape::part_lookup(&msg, &params.attachment_id).unwrap_or((None, None))
-            }
-            // Metadata lookup is best-effort; fall back to defaults so the
-            // bytes are still delivered.
-            Err(_) => (None, None),
-        };
-        let filename = sanitize_filename(filename.as_deref(), &params.attachment_id);
-        let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_owned());
+            // 2. Resolve mimeType + filename via a metadata message lookup
+            //    (attachments.get returns neither).
+            let meta_req = Self::gmail_request(
+                format!("users/me/messages/{}?format=full", params.message_id),
+                "gmail.readonly",
+                Method::GET,
+                Bytes::new(),
+                agent_id.clone(),
+            );
+            let (filename, mime_type) = match self.dispatch_json(meta_req).await {
+                Ok(msg) => {
+                    gmail_shape::part_lookup(&msg, &params.attachment_id).unwrap_or((None, None))
+                }
+                // Metadata lookup is best-effort; fall back to defaults so the
+                // bytes are still delivered.
+                Err(_) => (None, None),
+            };
+            let filename = sanitize_filename(filename.as_deref(), &params.attachment_id);
+            let mime_type = normalize_mime_type(mime_type);
 
-        // 3. Write the bytes to a per-agent, unguessable media path.
-        let path = self
-            .write_attachment(&agent_id, &params.message_id, &filename, &bytes)
-            .map_err(|e| format!("failed to write attachment: {e}"))?;
+            // 3. Return the bytes as an MCP embedded resource. MCP represents
+            //    binary content as standard base64 on the JSON wire; compatible
+            //    clients (Hermes v2026.7.20+) decode and materialize it before
+            //    the model sees the tool result, so the base64 never consumes
+            //    model context. The URI is an opaque identifier + filename hint,
+            //    not a fetchable URL and contains no Gmail identifiers.
+            let descriptor = serde_json::json!({
+                "messageId": params.message_id,
+                "attachmentId": params.attachment_id,
+                "size": size,
+                "mimeType": mime_type,
+                "filename": filename,
+            });
+            let resource_uri = format!(
+                "permitlayer://attachment/{}/{}",
+                ulid::Ulid::new(),
+                urlencoding::encode(&filename)
+            );
+            let blob = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let resource = ResourceContents::blob(blob, resource_uri).with_mime_type(mime_type);
 
-        let descriptor = serde_json::json!({
-            "messageId": params.message_id,
-            "attachmentId": params.attachment_id,
-            "size": size.unwrap_or(bytes.len() as u64),
-            "mimeType": mime_type,
-            "filename": filename,
-            "path": path.to_string_lossy(),
-        });
-        Ok(descriptor.to_string())
-    }
+            let mut result = CallToolResult::success(vec![Content::resource(resource)]);
+            result.structured_content = Some(descriptor);
+            Ok(result)
+        }
+        .await;
 
-    /// Write decoded attachment bytes to a per-agent, unguessable path
-    /// under the media dir, returning the absolute path. The unguessable
-    /// component bounds cross-agent disclosure within the
-    /// `permitlayer-clients` group (the file is group-readable on macOS so
-    /// the operator-user agent can read it — see the media-trust-boundary
-    /// ADR). The agent-name and message-id components are
-    /// `validate_resource_id`-checked by the caller; the filename is
-    /// sanitized. Returns the path for the descriptor.
-    fn write_attachment(
-        &self,
-        agent_id: &str,
-        message_id: &str,
-        filename: &str,
-        bytes: &[u8],
-    ) -> Result<std::path::PathBuf, String> {
-        // Hash the agent name so the directory component is filesystem-safe
-        // and doesn't leak the raw agent id; add an unguessable random
-        // segment per fetch.
-        let agent_hash = short_hex_hash(agent_id.as_bytes());
-        let nonce = short_hex_hash(
-            format!("{agent_id}:{message_id}:{filename}:{}", bytes.len()).as_bytes(),
-        );
-        let dir = self.proxy_service.media_dir().join(agent_hash).join(nonce);
-        let path = dir.join(filename);
-        permitlayer_core::files::write_client_readable_file(&path, bytes)
-            .map_err(|e| e.to_string())?;
-        Ok(path)
+        Ok(result.unwrap_or_else(|error| CallToolResult::error(vec![Content::text(error)])))
     }
 
     #[tool(
@@ -1240,7 +1255,7 @@ impl GmailMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for GmailMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -1457,7 +1472,7 @@ impl CalendarMcpServer {
     }
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl CalendarMcpServer {
     #[tool(
         name = "calendar.calendars.list",
@@ -1759,7 +1774,7 @@ impl CalendarMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for CalendarMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
@@ -1953,7 +1968,7 @@ impl DriveMcpServer {
     }
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl DriveMcpServer {
     #[tool(
         name = "drive.files.list",
@@ -2139,7 +2154,7 @@ impl DriveMcpServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for DriveMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -2382,6 +2397,21 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_filename_handles_portable_client_boundaries() {
+        assert_eq!(sanitize_filename(Some("CON.pdf"), "X"), "_CON.pdf");
+        assert_eq!(sanitize_filename(Some("report. "), "X"), "report");
+        assert_eq!(sanitize_filename(Some("a<b>|c?.pdf"), "X"), "a_b__c_.pdf");
+        assert_eq!(sanitize_filename(Some("safe\u{202e}fdp.exe"), "X"), "safe_fdp.exe");
+    }
+
+    #[test]
+    fn normalize_mime_type_rejects_malformed_values() {
+        assert_eq!(normalize_mime_type(Some("application/pdf".to_owned())), "application/pdf");
+        assert_eq!(normalize_mime_type(Some("not a mime".to_owned())), "application/octet-stream");
+        assert_eq!(normalize_mime_type(None), "application/octet-stream");
+    }
+
+    #[test]
     fn sanitize_filename_falls_back_when_absent_or_empty() {
         assert_eq!(sanitize_filename(None, "ABCDEF0123456789XYZ"), "att-ABCDEF0123456789.bin");
         // Becomes empty after stripping → fallback.
@@ -2393,17 +2423,6 @@ mod tests {
         let long = "a".repeat(500);
         let out = sanitize_filename(Some(&long), "X");
         assert!(out.len() <= 128);
-    }
-
-    #[test]
-    fn short_hex_hash_is_stable_and_hex() {
-        let a = short_hex_hash(b"agent-one");
-        let b = short_hex_hash(b"agent-one");
-        let c = short_hex_hash(b"agent-two");
-        assert_eq!(a, b, "deterministic");
-        assert_ne!(a, c, "distinct inputs differ");
-        assert_eq!(a.len(), 32, "16 bytes → 32 hex chars");
-        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]

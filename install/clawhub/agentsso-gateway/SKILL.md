@@ -104,10 +104,12 @@ document is the non-obvious stuff the schemas don't capture.
 These are the flows agents most commonly get wrong. None of them is in the
 tool schema; you need this guidance to use the catalog correctly.
 
-### Gmail attachments: read the manifest, then fetch the file path
+### Gmail attachments: read the manifest, then fetch the resource
 
-You do **not** decode base64. The proxy shapes the message read and writes
-attachment bytes to a local file for you.
+You do **not** decode base64. The proxy shapes the message read and returns the
+attachment as an MCP embedded resource. The MCP client, rather than the
+PermitLayer daemon, owns file placement. Hermes v2026.7.20+ materializes the
+resource into its user-owned document cache automatically.
 
 1. **Call `gmail.messages.get`** (default `format`). You get a compact
    shaped object — headers, the prioritized text body, and an
@@ -128,20 +130,32 @@ attachment bytes to a local file for you.
    Gmail JSON instead of the shaped object.)
 
 2. **Call `gmail.attachments.get`** with the `message_id` and the
-   `attachmentId` from the manifest. It writes the decoded bytes to a
-   local file and returns a **path** (no base64):
+   `attachmentId` from the manifest. It returns structured metadata plus one
+   MCP embedded resource:
    ```json
    {
-     "messageId": "18f...", "attachmentId": "ANGjdJ...",
-     "size": 718000, "mimeType": "application/pdf",
-     "filename": "handbook.pdf",
-     "path": "/Library/Application Support/permitlayer/media/<...>/handbook.pdf"
+     "content": [{
+       "type": "resource",
+       "resource": {
+         "uri": "permitlayer://attachment/<unique-id>/handbook.pdf",
+         "mimeType": "application/pdf",
+         "blob": "<protocol-managed base64>"
+       }
+     }],
+     "structuredContent": {
+       "messageId": "18f...", "attachmentId": "ANGjdJ...",
+       "size": 718000, "mimeType": "application/pdf",
+       "filename": "handbook.pdf"
+     }
    }
    ```
 
-3. **Hand `path` to your file/PDF tool** and read the local file. Don't
-   fetch it over HTTP; don't expect base64. The file is transient (swept
-   after ~1 hour), so use it within the session.
+3. **Use the client-materialized file with your file/PDF tool.** Do not fetch
+   the `permitlayer://` URI; it is an identifier, not a downloadable URL. Do
+   not manually decode the resource blob. Clients without embedded-resource
+   materialization must be upgraded; there is no daemon-local path fallback.
+   The client controls retention of its cached copy; use its cache cleanup
+   policy for sensitive attachments.
 
 ### `format` on messages/threads/drafts
 
@@ -316,8 +330,8 @@ load directly.
   things don't work, the policy is wrong — fix the policy.
 - Do **not** invent an approval flow. There is none. A denied call won't
   become allowed by waiting or retrying.
-- Do **not** decode Gmail attachment `data` as standard base64. It's
-  base64url. (Yes, this catches everyone.)
+- Do **not** manually decode the embedded Gmail attachment resource. Let the
+  MCP client materialize it into client-owned storage.
 
 ## Audit is ground truth
 
