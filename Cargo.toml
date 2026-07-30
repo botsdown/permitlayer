@@ -82,6 +82,8 @@ argon2 = { version = "0.5", features = ["std"] }
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+base64 = "0.22"
+mime = "0.3"
 rpassword = "7.3"
 async-trait = "0.1"
 tempfile = "3.14"

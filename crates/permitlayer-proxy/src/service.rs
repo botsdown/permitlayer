@@ -104,11 +104,6 @@ pub struct ProxyService {
     /// unseals the `Client` slot here to reconstruct the `OAuthClient` on
     /// demand. Typically `~/.agentsso/vault`.
     vault_dir: PathBuf,
-    /// Directory where decoded inbound attachments are materialized for
-    /// the MCP agent to read by local path (Gmail `attachments.get`). Per
-    /// `permitlayer_core::paths::media_dir`. Files are written
-    /// client-readable + TTL-swept by the daemon.
-    media_dir: PathBuf,
     /// Test-only OAuth client override map.
     ///
     /// `None` in production. When `Some(map)`,
@@ -151,7 +146,6 @@ impl ProxyService {
     /// The refresh path unseals the connection's `Client` slot on demand to
     /// reconstruct the correct `OAuthClient` (Story 11.16 — no `-meta.json`).
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // wiring constructor: all deps + vault_dir + media_dir.
     #[allow(clippy::too_many_arguments)] // service wiring: all collaborators injected.
     pub fn new(
         credential_store: Arc<dyn CredentialStore>,
@@ -162,7 +156,6 @@ impl ProxyService {
         audit_store: Arc<dyn AuditStore>,
         scrub_engine: Arc<ScrubEngine>,
         vault_dir: PathBuf,
-        media_dir: PathBuf,
     ) -> Self {
         Self {
             credential_store,
@@ -174,7 +167,6 @@ impl ProxyService {
             audit_store,
             scrub_engine,
             vault_dir,
-            media_dir,
             oauth_client_overrides: None,
             binding_store: None,
             connection_store: None,
@@ -405,12 +397,6 @@ impl ProxyService {
         ))
     }
 
-    /// The directory where attachment bytes are materialized for the agent.
-    #[must_use]
-    pub fn media_dir(&self) -> &std::path::Path {
-        &self.media_dir
-    }
-
     /// Construct a `ProxyService` with a pre-populated OAuth client
     /// override map.
     ///
@@ -452,7 +438,6 @@ impl ProxyService {
         audit_store: Arc<dyn AuditStore>,
         scrub_engine: Arc<ScrubEngine>,
         vault_dir: PathBuf,
-        media_dir: PathBuf,
         oauth_client_overrides: HashMap<String, Arc<OAuthClient>>,
     ) -> Self {
         Self {
@@ -465,7 +450,6 @@ impl ProxyService {
             audit_store,
             scrub_engine,
             vault_dir,
-            media_dir,
             oauth_client_overrides: Some(oauth_client_overrides),
             binding_store: None,
             connection_store: None,
@@ -1626,7 +1610,6 @@ mod tests {
             Arc::clone(&audit_store) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             tempdir.path().to_path_buf(),
-            tempdir.path().join("media"),
         ));
 
         (service, audit_store, tempdir)
@@ -1697,7 +1680,6 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
-            _tempdir.path().join("media"),
         );
 
         let req = test_request("gmail", "users/me/messages");
@@ -1724,7 +1706,6 @@ mod tests {
             Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             dir.to_path_buf(),
-            dir.join("media"),
         )
     }
 
@@ -1849,7 +1830,6 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
-            _tempdir.path().join("media"),
         );
 
         let req = test_request("gmail", "users/me/messages");
@@ -1881,7 +1861,6 @@ mod tests {
             Arc::clone(&audit_store) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
-            _tempdir.path().join("media"),
         );
 
         let req = test_request("gmail", "users/me/messages");
@@ -2181,7 +2160,6 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
-            _tempdir.path().join("media"),
         );
 
         assert!(
@@ -2233,7 +2211,6 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             tempdir.path().to_path_buf(),
-            tempdir.path().join("media"),
             overrides,
         );
 

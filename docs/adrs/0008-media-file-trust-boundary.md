@@ -1,6 +1,6 @@
 # ADR 0008 — Media-file trust boundary for attachment delivery
 
-**Status:** Accepted
+**Status:** Superseded by ADR-0009
 
 **Date:** 2026-05-29
 

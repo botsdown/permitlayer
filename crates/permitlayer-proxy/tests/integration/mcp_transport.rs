@@ -146,7 +146,6 @@ async fn build_service(server_url: &str) -> (Arc<ProxyService>, Arc<MockAuditSto
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     (service, audit_store)
@@ -171,7 +170,6 @@ fn mcp_tool_listing_returns_five_gmail_tools() {
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     let server = GmailMcpServer::new(proxy);
@@ -216,7 +214,6 @@ fn mcp_tool_input_schemas_have_no_meta_schema_declaration() {
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     let gmail = GmailMcpServer::new(Arc::clone(&proxy));
@@ -283,7 +280,6 @@ fn connector_mcp_service_resolves_builtins_and_rejects_unknown() {
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     // Selector vocabulary maps to canonical ids.
@@ -328,7 +324,6 @@ fn mcp_server_info_has_correct_name_and_version() {
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     let server = GmailMcpServer::new(proxy);
@@ -441,7 +436,6 @@ async fn mcp_tool_error_returns_error_string_not_transport_error() {
         Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     let mcp_server = GmailMcpServer::new(proxy);

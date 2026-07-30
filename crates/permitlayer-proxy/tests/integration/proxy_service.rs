@@ -156,7 +156,6 @@ async fn build_service_multi(
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     (service, audit_store)
@@ -313,7 +312,6 @@ async fn missing_credentials_returns_503() {
         audit_store,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     );
 
     let req = make_request("gmail", "users/me/messages");
@@ -346,7 +344,6 @@ async fn upstream_unreachable_returns_503_with_audit() {
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
     );
 
     let req = make_request("gmail", "users/me/messages");
@@ -522,7 +519,6 @@ async fn scrub_before_log_otp_never_in_audit_file() {
         audit_store as Arc<dyn AuditStore>,
         scrub_engine,
         tmp.path().to_path_buf(),
-        tmp.path().join("media"),
     ));
 
     let req = make_request("gmail", "users/me/messages");

@@ -161,7 +161,6 @@ fn build_poc_service(
             Arc::clone(&audit_store) as Arc<dyn AuditStore>,
             scrub,
             home.join("vault"),
-            home.join("media"),
         )
         .with_binding_resolution(binding_store, connection_store),
     );

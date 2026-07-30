@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
+use base64::Engine as _;
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
@@ -116,15 +117,19 @@ impl AuditStore for MockAuditStore {
 ///
 /// `agent_name` is the synthetic AgentId injected by the test middleware.
 /// Production gets this from AuthLayer; we stand in for it.
-async fn start_mcp_server(upstream_url: &str) -> (String, tokio::task::JoinHandle<()>) {
-    let (base_url, handle, _audit) = start_mcp_server_with_agent(upstream_url, "test-agent").await;
-    (base_url, handle)
+async fn start_mcp_server(
+    upstream_url: &str,
+) -> (String, tokio::task::JoinHandle<()>, tempfile::TempDir) {
+    let (base_url, handle, _audit, state_dir) =
+        start_mcp_server_with_agent(upstream_url, "test-agent").await;
+    (base_url, handle, state_dir)
 }
 
 async fn start_mcp_server_with_agent(
     upstream_url: &str,
     agent_name: &'static str,
-) -> (String, tokio::task::JoinHandle<()>, Arc<MockAuditStore>) {
+) -> (String, tokio::task::JoinHandle<()>, Arc<MockAuditStore>, tempfile::TempDir) {
+    let state_dir = tempfile::tempdir().unwrap();
     let mut cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
     cred_store.add_service("gmail", b"test-oauth-access-token");
 
@@ -144,8 +149,7 @@ async fn start_mcp_server_with_agent(
         connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         Arc::new(ScrubEngine::new(builtin_rules().to_vec()).unwrap()),
-        std::env::temp_dir(),
-        std::env::temp_dir().join("permitlayer-test-media"),
+        state_dir.path().join("vault"),
     ));
 
     let mcp = mcp_service(proxy);
@@ -172,7 +176,7 @@ async fn start_mcp_server_with_agent(
     // Give the server a moment to bind.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    (base_url, handle, audit_store)
+    (base_url, handle, audit_store, state_dir)
 }
 
 #[tokio::test]
@@ -185,7 +189,7 @@ async fn mcp_initialize_handshake_succeeds() {
         .create_async()
         .await;
 
-    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
 
     // Send MCP initialize request via raw HTTP POST.
     let client = reqwest::Client::new();
@@ -238,7 +242,7 @@ async fn bare_mcp_returns_404() {
         .create_async()
         .await;
 
-    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
     let client = reqwest::Client::new();
     let init_request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -280,7 +284,7 @@ async fn mcp_tools_list_returns_five_tools() {
         .create_async()
         .await;
 
-    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
     let client = reqwest::Client::new();
 
     // Step 1: Initialize to get a session.
@@ -376,7 +380,7 @@ async fn mcp_tools_call_gmail_messages_list_returns_valid_response() {
         .create_async()
         .await;
 
-    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
     let client = reqwest::Client::new();
 
     // Initialize session.
@@ -473,7 +477,7 @@ async fn mcp_tool_call_attributes_audit_event_to_real_agent() {
         .create_async()
         .await;
 
-    let (base_url, handle, audit_store) =
+    let (base_url, handle, audit_store, _state_dir) =
         start_mcp_server_with_agent(&format!("{}/", upstream.url()), "real-agent").await;
     let client = reqwest::Client::new();
 
@@ -629,21 +633,25 @@ async fn call_tool(
     resp.text().await.unwrap()
 }
 
-/// Extract a string field's value from an SSE-framed MCP tool result
-/// where the descriptor JSON is escaped inside the `text` content (so
-/// `"path":"..."` appears as `\"path\":\"...\"`). Returns the unescaped
-/// value. Test-only convenience — not a general JSON parser.
-fn extract_json_string_field(body: &str, field: &str) -> Option<String> {
-    // Try escaped form first (inside MCP text content), then plain.
-    for needle in [format!("\\\"{field}\\\":\\\""), format!("\"{field}\":\"")] {
-        if let Some(start) = body.find(&needle) {
-            let rest = &body[start + needle.len()..];
-            // Terminator is the matching closing quote (escaped or plain).
-            let end = rest.find("\\\"").or_else(|| rest.find('"'))?;
-            return Some(rest[..end].to_owned());
+/// Parse a Streamable HTTP MCP response, accepting either the JSON response
+/// form or the SSE framing selected by rmcp.
+fn parse_mcp_response(body: &str) -> serde_json::Value {
+    if let Ok(value) = serde_json::from_str(body.trim()) {
+        return value;
+    }
+    for event in body.split("\n\n") {
+        let payload = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !payload.is_empty()
+            && let Ok(value) = serde_json::from_str(&payload)
+        {
+            return value;
         }
     }
-    None
+    panic!("MCP response must contain a valid JSON or SSE JSON event; body: {body}")
 }
 
 #[tokio::test]
@@ -655,7 +663,7 @@ async fn mcp_tools_list_returns_twenty_six_gmail_tools() {
         .with_body(r#"{"messages":[]}"#)
         .create_async()
         .await;
-    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
     let (client, session_id) = init_session(&base_url).await;
 
     let list_tools = serde_json::json!({
@@ -726,14 +734,15 @@ async fn mcp_tools_list_returns_twenty_six_gmail_tools() {
 }
 
 #[tokio::test]
-async fn mcp_attachments_get_writes_file_and_returns_path() {
+async fn mcp_attachments_get_returns_embedded_resource() {
     let mut upstream = mockito::Server::new_async().await;
-    // attachments.get returns { size, data } (base64url). The proxy
-    // decodes it, writes the bytes to a local file, and returns a path
-    // descriptor — NOT the base64.
+    // attachments.get returns { size, data } (base64url). The proxy decodes
+    // it and returns an MCP embedded resource plus structured metadata.
     // "hello-world-receipt-pdf" → base64url below.
     let decoded = b"hello-world-receipt-pdf";
-    let upstream_body = r#"{"size":23,"data":"aGVsbG8td29ybGQtcmVjZWlwdC1wZGY"}"#;
+    // Deliberately advertise the wrong upstream size; the result must use the
+    // authoritative decoded length.
+    let upstream_body = r#"{"size":999,"data":"aGVsbG8td29ybGQtcmVjZWlwdC1wZGY"}"#;
     let _att_mock = upstream
         .mock("GET", "/users/me/messages/MSG1/attachments/ATT1")
         .with_status(200)
@@ -753,7 +762,7 @@ async fn mcp_attachments_get_writes_file_and_returns_path() {
         )
         .create_async()
         .await;
-    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (base_url, handle, state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
     let (client, session_id) = init_session(&base_url).await;
 
     let body = call_tool(
@@ -765,24 +774,133 @@ async fn mcp_attachments_get_writes_file_and_returns_path() {
     )
     .await;
 
-    // The tool result must NOT contain the base64 (no bytes in context).
-    assert!(
-        !body.contains("aGVsbG8td29ybGQtcmVjZWlwdC1wZGY"),
-        "attachment base64 must NOT appear in the tool result, got: {body}"
-    );
-    // It returns a descriptor with the resolved mime/filename + a path.
-    assert!(body.contains("application/pdf"), "mimeType resolved from metadata: {body}");
-    assert!(body.contains("receipt.pdf"), "filename resolved from metadata: {body}");
+    let response = parse_mcp_response(&body);
+    let result = &response["result"];
+    assert_eq!(result["isError"], false, "attachment call succeeds: {body}");
+    let descriptor = &result["structuredContent"];
+    assert_eq!(descriptor["messageId"], "MSG1");
+    assert_eq!(descriptor["attachmentId"], "ATT1");
+    assert_eq!(descriptor["size"], 23);
+    assert_eq!(descriptor["mimeType"], "application/pdf");
+    assert_eq!(descriptor["filename"], "receipt.pdf");
+    assert!(descriptor.get("path").is_none(), "daemon path must not be returned: {body}");
 
-    // Extract the `path` from the tool result (SSE-framed JSON-in-text;
-    // the descriptor is escaped inside the MCP text content). Pull the
-    // value of the `path` field directly and verify the file exists with
-    // the decoded bytes.
-    let path = extract_json_string_field(&body, "path")
-        .unwrap_or_else(|| panic!("descriptor has a path field; got: {body}"));
-    let written = std::fs::read(&path).expect("attachment file exists at returned path");
-    assert_eq!(written, decoded, "written file holds the decoded attachment bytes");
-    let _ = std::fs::remove_file(&path);
+    let content = result["content"].as_array().expect("result content is an array");
+    assert_eq!(content.len(), 1, "only the embedded resource is returned: {body}");
+    assert_eq!(content[0]["type"], "resource");
+    let resource = &content[0]["resource"];
+    assert_eq!(resource["mimeType"], "application/pdf");
+    assert!(
+        resource["uri"].as_str().is_some_and(|uri| {
+            uri.starts_with("permitlayer://attachment/") && uri.ends_with("/receipt.pdf")
+        }),
+        "resource URI is opaque and retains the filename hint: {body}"
+    );
+    let encoded = resource["blob"].as_str().expect("resource contains a blob");
+    let materialized = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("resource blob uses standard base64");
+    assert_eq!(materialized, decoded, "embedded resource preserves exact bytes");
+    assert!(
+        content.iter().all(|item| item["type"] != "text"),
+        "attachment bytes must not be returned as model-visible text: {body}"
+    );
+    assert!(
+        !descriptor.to_string().contains(encoded),
+        "structured metadata must not duplicate attachment bytes: {body}"
+    );
+    assert!(
+        !state_dir.path().join("media").exists(),
+        "attachment delivery must not create daemon-side media storage"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mcp_attachments_get_uses_metadata_fallbacks() {
+    let mut upstream = mockito::Server::new_async().await;
+    let decoded = b"attachment-without-metadata";
+    let encoded = permitlayer_core::agent::base64_url_no_pad_encode(decoded);
+    let _att_mock = upstream
+        .mock("GET", "/users/me/messages/MSG1/attachments/ATT1")
+        .with_status(200)
+        .with_body(serde_json::json!({ "data": encoded }).to_string())
+        .create_async()
+        .await;
+    let _meta_mock = upstream
+        .mock("GET", "/users/me/messages/MSG1")
+        .match_query(mockito::Matcher::Any)
+        .with_status(500)
+        .with_body(r#"{"error":"metadata unavailable"}"#)
+        .create_async()
+        .await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (client, session_id) = init_session(&base_url).await;
+
+    let body = call_tool(
+        &client,
+        &base_url,
+        &session_id,
+        "gmail.attachments.get",
+        serde_json::json!({ "message_id": "MSG1", "attachment_id": "ATT1" }),
+    )
+    .await;
+    let response = parse_mcp_response(&body);
+    let result = &response["result"];
+    let descriptor = &result["structuredContent"];
+    assert_eq!(descriptor["filename"], "att-ATT1.bin");
+    assert_eq!(descriptor["mimeType"], "application/octet-stream");
+    assert_eq!(descriptor["size"], decoded.len());
+    assert!(descriptor.get("path").is_none());
+    let resource = &result["content"][0]["resource"];
+    assert_eq!(resource["mimeType"], "application/octet-stream");
+    let blob = resource["blob"].as_str().expect("fallback still returns a blob");
+    assert_eq!(base64::engine::general_purpose::STANDARD.decode(blob).unwrap(), decoded);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mcp_attachments_get_rejects_malformed_base64url() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _att_mock = upstream
+        .mock("GET", "/users/me/messages/MSG1/attachments/ATT1")
+        .with_status(200)
+        .with_body(r#"{"size":3,"data":"!!!"}"#)
+        .create_async()
+        .await;
+    let _meta_guard = upstream
+        .mock("GET", "/users/me/messages/MSG1")
+        .match_query(mockito::Matcher::Any)
+        .expect(0)
+        .create_async()
+        .await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (client, session_id) = init_session(&base_url).await;
+
+    let body = call_tool(
+        &client,
+        &base_url,
+        &session_id,
+        "gmail.attachments.get",
+        serde_json::json!({ "message_id": "MSG1", "attachment_id": "ATT1" }),
+    )
+    .await;
+    let response = parse_mcp_response(&body);
+    let result = &response["result"];
+    assert_eq!(result["isError"], true, "invalid bytes produce a tool error: {body}");
+    assert!(result.get("structuredContent").is_none());
+    let content = result["content"].as_array().expect("error content is an array");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    assert!(
+        content[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("attachment data is not valid base64url")),
+        "decode error is explained: {body}"
+    );
+    assert!(content.iter().all(|item| item["type"] != "resource"));
 
     handle.abort();
 }
@@ -794,7 +912,7 @@ async fn mcp_history_list_rejects_missing_start_history_id() {
     // BEFORE dispatching, so the upstream is never hit.
     let _guard =
         upstream.mock("GET", "/users/me/history").with_status(500).expect(0).create_async().await;
-    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (base_url, handle, _state_dir) = start_mcp_server(&format!("{}/", upstream.url())).await;
     let (client, session_id) = init_session(&base_url).await;
 
     let body = call_tool(
@@ -824,7 +942,7 @@ async fn mcp_new_read_tool_emits_audit_event_for_real_agent() {
         .with_body(r#"{"labels":[{"id":"INBOX","name":"INBOX"}]}"#)
         .create_async()
         .await;
-    let (base_url, handle, audit_store) =
+    let (base_url, handle, audit_store, _state_dir) =
         start_mcp_server_with_agent(&format!("{}/", upstream.url()), "receipt-agent").await;
     let (client, session_id) = init_session(&base_url).await;
 
@@ -858,7 +976,7 @@ async fn mcp_messages_send_posts_body_and_audits_send_scope() {
         .with_body(r#"{"id":"sent-msg-1","labelIds":["SENT"]}"#)
         .create_async()
         .await;
-    let (base_url, handle, audit_store) =
+    let (base_url, handle, audit_store, _state_dir) =
         start_mcp_server_with_agent(&format!("{}/", upstream.url()), "sender-agent").await;
     let (client, session_id) = init_session(&base_url).await;
 
