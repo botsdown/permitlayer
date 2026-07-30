@@ -534,6 +534,23 @@ fn coerce_and_validate_json_object_body(
     Ok(())
 }
 
+/// Refuse content-bearing fields on the metadata-only Drive create tool.
+/// Otherwise Google ignores the unknown metadata and creates a zero-byte
+/// placeholder that looks like a successful binary upload.
+fn reject_drive_create_content_fields(value: &serde_json::Value) -> Result<(), String> {
+    const CONTENT_FIELDS: &[&str] =
+        &["media_body", "content", "content_base64", "data", "path", "file_path"];
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(field) = CONTENT_FIELDS.iter().find(|field| object.contains_key(**field)) {
+        return Err(format!(
+            "file.{field} is not supported by metadata-only drive.files.create; run `agentsso drive upload <path> --parent <folder-id>` through the terminal"
+        ));
+    }
+    Ok(())
+}
+
 fn json_type_name(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Null => "null",
@@ -1853,6 +1870,7 @@ pub struct FilesSearchParams {
 /// this tool — that requires the `upload/drive/v3/files` endpoint and is
 /// out of scope for Story 2.5.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FileCreateParams {
     /// File resource as a JSON object.
     /// Common fields: `name` (required), `mimeType` (e.g., `application/vnd.google-apps.folder`),
@@ -2040,7 +2058,7 @@ impl DriveMcpServer {
 
     #[tool(
         name = "drive.files.create",
-        description = "Create a new file in Google Drive (metadata-only — does not upload content). Pass a JSON file resource with at minimum a 'name'. Use 'mimeType': 'application/vnd.google-apps.folder' to create a folder. Limited to files owned by the app per the drive.file scope."
+        description = "Create a metadata-only file or folder in Google Drive; this tool never uploads file bytes. Pass a JSON file resource with at minimum a 'name'. Use 'mimeType': 'application/vnd.google-apps.folder' to create a folder. For PDF, Excel, image, or other local binary content, run `agentsso drive upload <path> --parent <folder-id>` through the terminal. Do not pass media_body, content, base64, data, or a local path."
     )]
     async fn files_create(
         &self,
@@ -2050,6 +2068,7 @@ impl DriveMcpServer {
         debug!(tool = "drive.files.create", "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         coerce_and_validate_json_object_body(&mut params.file, "file")?;
+        reject_drive_create_content_fields(&params.file)?;
         let body =
             serde_json::to_vec(&params.file).map_err(|e| format!("invalid file JSON: {e}"))?;
         let qs = build_query_string(&[("fields", params.fields)]);
@@ -2492,6 +2511,25 @@ mod tests {
         assert!(coerce_and_validate_json_object_body(&mut n, "f").is_err());
         let mut b = serde_json::json!(true);
         assert!(coerce_and_validate_json_object_body(&mut b, "f").is_err());
+    }
+
+    #[test]
+    fn drive_create_rejects_nested_content_fields() {
+        for field in ["media_body", "content", "content_base64", "data", "path", "file_path"] {
+            let mut object = serde_json::Map::new();
+            object.insert("name".to_owned(), serde_json::json!("receipt.pdf"));
+            object.insert(field.to_owned(), serde_json::json!("payload"));
+            let error =
+                reject_drive_create_content_fields(&serde_json::Value::Object(object)).unwrap_err();
+            assert!(error.contains("agentsso drive upload"));
+        }
+        assert!(
+            reject_drive_create_content_fields(&serde_json::json!({
+                "name":"Receipts",
+                "mimeType":"application/vnd.google-apps.folder"
+            }))
+            .is_ok()
+        );
     }
 
     // ── Arg coercion: stringified-JSON-object args (Fix A) ─────────

@@ -38,6 +38,17 @@ use crate::response::ProxyResponse;
 use crate::token::ScopedTokenIssuer;
 use crate::upstream::UpstreamClient;
 
+mod drive_upload;
+pub use drive_upload::{
+    DriveUploadChunkResult, DriveUploadError, DriveUploadSessionInfo, DriveUploadStart,
+    DriveUploadStatus,
+};
+
+#[must_use]
+pub const fn drive_upload_chunk_limit() -> usize {
+    drive_upload::DRIVE_UPLOAD_CHUNK_BYTES
+}
+
 /// Cloned copies of a `ProxyRequest`'s transport-level fields, captured
 /// up-front in [`ProxyService::handle`] so the refresh hook can replay
 /// the original upstream call after a successful token refresh.
@@ -136,6 +147,10 @@ pub struct ProxyService {
     binding_store: Option<Arc<dyn permitlayer_core::store::BindingStore>>,
     /// Story 11.10: connection metadata store. See `binding_store`.
     connection_store: Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
+    /// Ephemeral, memory-only Google Drive resumable upload sessions.
+    /// Google session URIs never leave this process and are discarded on
+    /// daemon restart or after the inactivity deadline.
+    drive_uploads: drive_upload::DriveUploadSessions,
 }
 
 impl ProxyService {
@@ -170,6 +185,7 @@ impl ProxyService {
             oauth_client_overrides: None,
             binding_store: None,
             connection_store: None,
+            drive_uploads: drive_upload::DriveUploadSessions::default(),
         }
     }
 
@@ -453,6 +469,7 @@ impl ProxyService {
             oauth_client_overrides: Some(oauth_client_overrides),
             binding_store: None,
             connection_store: None,
+            drive_uploads: drive_upload::DriveUploadSessions::default(),
         }
     }
 

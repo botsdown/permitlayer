@@ -162,10 +162,10 @@ pub enum ProxyError {
 
     /// Upstream refresh token was rejected server-side (revoked, expired, or
     /// otherwise invalid per RFC 6749 `invalid_grant`). The user must re-run
-    /// `agentsso setup <service>` to mint a fresh refresh token — no amount
+    /// `agentsso connection reauth` to mint a fresh refresh token — no amount
     /// of retrying will recover this credential. See architecture.md
     /// "Credential Lifecycle and OAuth Refresh" invariant #5 (Story 1.14a).
-    #[error("Credential for {service} was revoked server-side; re-run `agentsso setup {service}`")]
+    #[error("Credential for {service} was revoked server-side; reauthorize its connection")]
     CredentialRevoked { service: String },
 
     /// Upstream API returned HTTP 429 (rate limited).
@@ -474,7 +474,9 @@ impl ProxyError {
             Self::CredentialRevoked { service } => (
                 Some(service.clone()),
                 None,
-                Some(format!("Re-run `agentsso setup {service}` to reconnect this account.")),
+                Some(format!(
+                    "Run `agentsso connection reauth <{service}-connection> --oauth-client <client_secret.json> --headless` to reconnect this account while preserving its bindings. Use `agentsso connection list` to find the connection name."
+                )),
                 None,
             ),
             Self::UpstreamRateLimited { service, retry_after } => {
@@ -1023,7 +1025,7 @@ mod tests {
     async fn credential_revoked_produces_401_with_upstream_service_and_remediation() {
         // Story 1.14a AC 3: when refresh_with_retry returns OAuthError::InvalidGrant,
         // the proxy surfaces `credential.revoked` with 401 status, the service name
-        // in `upstream_service`, and a remediation pointing at `agentsso setup`.
+        // in `upstream_service`, and a remediation pointing at connection reauth.
         let err = ProxyError::CredentialRevoked { service: "gmail".to_owned() };
 
         assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
@@ -1039,10 +1041,10 @@ mod tests {
         assert_eq!(json["error"]["code"], "credential.revoked");
         assert_eq!(json["error"]["upstream_service"], "gmail");
         assert_eq!(json["error"]["request_id"], "01TESTULID");
-        // Remediation must point at `agentsso setup` with the specific service name
-        // so operators can act on the error without consulting documentation.
+        // Remediation must point at the binding-preserving reauth command.
         let remediation = json["error"]["remediation"].as_str().unwrap();
-        assert!(remediation.contains("agentsso setup gmail"));
+        assert!(remediation.contains("agentsso connection reauth"));
+        assert!(remediation.contains("gmail"));
         // The error message itself mentions the service (from the thiserror
         // #[error(...)] format).
         assert!(json["error"]["message"].as_str().unwrap().contains("gmail"));

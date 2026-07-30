@@ -35,6 +35,8 @@ pub enum ConnectionCommand {
     /// Create a per-account connection: run the OAuth dance and seal a
     /// fresh connection under a new ULID.
     Add(AddArgs),
+    /// Reauthorize an existing connection without changing its ID or bindings.
+    Reauth(ReauthArgs),
     /// List every connection (name, connector, account, tier, status).
     List,
     /// Show one connection's full detail incl. granted scopes + the
@@ -91,14 +93,112 @@ pub struct RevokeArgs {
     pub selector: String,
 }
 
+#[derive(Args, Debug)]
+pub struct ReauthArgs {
+    /// Existing connection alias, name, or ID.
+    pub selector: String,
+    /// Path to a Google Desktop OAuth client JSON.
+    #[arg(long = "oauth-client", value_name = "PATH")]
+    pub oauth_client: Option<PathBuf>,
+    /// Skip browser launch and paste the final redirect URL.
+    #[arg(long, conflicts_with = "non_interactive", conflicts_with = "device_flow")]
+    pub headless: bool,
+    /// Use Google's device authorization flow.
+    #[arg(long)]
+    pub device_flow: bool,
+    #[arg(long, default_value = "120", requires = "device_flow")]
+    pub device_flow_timeout: u64,
+    #[arg(long)]
+    pub non_interactive: bool,
+    #[arg(long)]
+    pub allow_root: bool,
+}
+
 /// Run the `connection` subcommand.
 pub async fn run(args: ConnectionArgs) -> Result<()> {
     match args.command {
         ConnectionCommand::Add(a) => add(a).await,
+        ConnectionCommand::Reauth(a) => reauth(a).await,
         ConnectionCommand::List => list().await,
         ConnectionCommand::Inspect(a) => inspect(a).await,
         ConnectionCommand::Revoke(a) => revoke(a).await,
     }
+}
+
+async fn reauth(args: ReauthArgs) -> Result<()> {
+    use anyhow::Context as _;
+
+    let _guards =
+        crate::telemetry::init_tracing("warn", None, 30).context("tracing init failed")?;
+    #[cfg(unix)]
+    crate::cli::root_guard::ensure_not_sudo_root_shell_with(
+        "connection reauth",
+        &format!("agentsso connection reauth {}", args.selector),
+        args.allow_root,
+        nix::unistd::geteuid().as_raw(),
+        std::env::var("SUDO_USER").ok().as_deref(),
+    )?;
+
+    let home = crate::cli::agentsso_home()?;
+    oauth_seal::probe_daemon_kill_state_or_exit().await?;
+    let handle = crate::cli::connect_uds::require_daemon_running(&home)
+        .await
+        .context("connection reauth: daemon not reachable")?;
+    let Some(existing) = resolve_selector_cp(&handle, &args.selector).await? else {
+        eprint!(
+            "{}",
+            render::error_block(
+                "connection.not_found",
+                &format!("no connection matching '{}'", args.selector),
+                "list connections: agentsso connection list",
+                None,
+            )
+        );
+        return Err(oauth_seal::exit2());
+    };
+    let registry = permitlayer_connectors::ConnectorRegistry::load(Some(
+        &permitlayer_core::paths::connectors_dir(
+            permitlayer_core::paths::home_override().as_deref(),
+        ),
+    ))
+    .context("connector registry load failed")?;
+    let connector = registry
+        .get(&existing.connector_id)
+        .context("connection references a connector that is no longer installed")?;
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let interactive = !args.non_interactive && stdin_is_tty && stdout_is_tty;
+    let theme = crate::design::theme::Theme::load(&home);
+    let oauth_config = oauth_seal::resolve_oauth_client(
+        args.oauth_client.as_deref(),
+        &existing.connector_id,
+        &existing.name,
+        &theme,
+        interactive,
+    )
+    .await?;
+    let record = oauth_seal::oauth_dance_and_seal(
+        &handle,
+        oauth_seal::OAuthSealInputs {
+            connector: &connector,
+            connector_id: &existing.connector_id,
+            name: &existing.name,
+            read_write: existing.tier == ConnectionTier::ReadWrite,
+            oauth_config,
+            connection_id: existing.id,
+            interactive,
+            headless: args.headless,
+            device_flow: args.device_flow,
+            device_flow_timeout: args.device_flow_timeout,
+        },
+    )
+    .await?;
+    println!();
+    println!("✓ connection '{}' reauthorized", record.name);
+    println!("  id:       {} (unchanged)", record.id);
+    println!("  bindings: preserved");
+    println!();
+    Ok(())
 }
 
 // ── add ─────────────────────────────────────────────────────────────

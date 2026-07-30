@@ -6,9 +6,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-#[cfg(debug_assertions)]
-use axum::routing::post;
-use axum::routing::{any, get};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 
@@ -552,6 +550,207 @@ async fn dynamic_proxy_handler(
     match service.handle(proxy_req).await {
         Ok(resp) => resp.into_response(),
         Err(err) => err.into_response_with_request_id(Some(request_id)),
+    }
+}
+
+#[derive(Serialize)]
+struct DriveUploadErrorEnvelope {
+    error: DriveUploadErrorBody,
+}
+
+#[derive(Serialize)]
+struct DriveUploadErrorBody {
+    code: &'static str,
+    message: String,
+    request_id: String,
+}
+
+fn drive_upload_error_response(
+    error: permitlayer_proxy::service::DriveUploadError,
+    request_id: String,
+) -> Response {
+    let status = error.status_code();
+    (
+        status,
+        Json(DriveUploadErrorEnvelope {
+            error: DriveUploadErrorBody {
+                code: error.code(),
+                message: error.to_string(),
+                request_id,
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn upload_request_identity(request: &Request) -> Result<(String, String), Box<Response>> {
+    let request_id =
+        request.extensions().get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default();
+    let agent_id = match request.extensions().get::<AgentId>() {
+        Some(agent) => agent.0.clone(),
+        None => {
+            return Err(Box::new(
+                ProxyError::AuthMissingAgentId.into_response_with_request_id(Some(request_id)),
+            ));
+        }
+    };
+    let declared_scope =
+        request.headers().get("x-agentsso-scope").and_then(|value| value.to_str().ok());
+    match declared_scope {
+        Some("drive.file") => Ok((agent_id, request_id)),
+        None => Err(Box::new(
+            ProxyError::MissingScopeHeader.into_response_with_request_id(Some(request_id)),
+        )),
+        Some(_) => Err(Box::new(
+            ProxyError::PolicyDenied {
+                policy_name: "drive-upload".to_owned(),
+                rule_id: "fixed-write-scope".to_owned(),
+                denied_scope: Some("non-drive.file".to_owned()),
+                denied_resource: None,
+                message: "Drive upload endpoints require X-Agentsso-Scope: drive.file".to_owned(),
+            }
+            .into_response_with_request_id(Some(request_id)),
+        )),
+    }
+}
+
+async fn dynamic_drive_upload_start_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path(selector): Path<String>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else {
+        return not_implemented_handler(request).await;
+    };
+    let (agent_id, request_id) = match upload_request_identity(&request) {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+    let body = match axum::body::to_bytes(request.into_body(), 64 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            return drive_upload_error_response(
+                permitlayer_proxy::service::DriveUploadError::Invalid(format!(
+                    "invalid upload session request: {error}"
+                )),
+                request_id,
+            );
+        }
+    };
+    let start = match serde_json::from_slice(&body) {
+        Ok(start) => start,
+        Err(error) => {
+            return drive_upload_error_response(
+                permitlayer_proxy::service::DriveUploadError::Invalid(format!(
+                    "invalid upload session JSON: {error}"
+                )),
+                request_id,
+            );
+        }
+    };
+    match service.drive_upload_start(agent_id, selector, request_id.clone(), start).await {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(error) => drive_upload_error_response(error, request_id),
+    }
+}
+
+async fn dynamic_drive_upload_chunk_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path((selector, upload_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else {
+        return not_implemented_handler(request).await;
+    };
+    let (agent_id, request_id) = match upload_request_identity(&request) {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+    let content_range = match request.headers().get("content-range").and_then(|v| v.to_str().ok()) {
+        Some(value) => value.to_owned(),
+        None => {
+            return drive_upload_error_response(
+                permitlayer_proxy::service::DriveUploadError::Invalid(
+                    "Content-Range header is required".to_owned(),
+                ),
+                request_id,
+            );
+        }
+    };
+    let body = match axum::body::to_bytes(
+        request.into_body(),
+        permitlayer_proxy::service::drive_upload_chunk_limit(),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_) => {
+            return drive_upload_error_response(
+                permitlayer_proxy::service::DriveUploadError::TooLarge,
+                request_id,
+            );
+        }
+    };
+    match service
+        .drive_upload_chunk(
+            agent_id,
+            selector,
+            request_id.clone(),
+            &upload_id,
+            &content_range,
+            body,
+        )
+        .await
+    {
+        Ok(permitlayer_proxy::service::DriveUploadChunkResult::Incomplete {
+            acknowledged_bytes,
+        }) => (
+            StatusCode::PERMANENT_REDIRECT,
+            [("Range", format!("bytes=0-{}", acknowledged_bytes.saturating_sub(1)))],
+            Json(serde_json::json!({
+                "state": "incomplete",
+                "acknowledged_bytes": acknowledged_bytes,
+            })),
+        )
+            .into_response(),
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(error) => drive_upload_error_response(error, request_id),
+    }
+}
+
+async fn dynamic_drive_upload_status_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path((selector, upload_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else {
+        return not_implemented_handler(request).await;
+    };
+    let (agent_id, request_id) = match upload_request_identity(&request) {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+    match service.drive_upload_status(&agent_id, &selector, &upload_id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => drive_upload_error_response(error, request_id),
+    }
+}
+
+async fn dynamic_drive_upload_cancel_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path((selector, upload_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else {
+        return not_implemented_handler(request).await;
+    };
+    let (agent_id, request_id) = match upload_request_identity(&request) {
+        Ok(identity) => identity,
+        Err(response) => return *response,
+    };
+    match service.drive_upload_cancel(&agent_id, &selector, &upload_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => drive_upload_error_response(error, request_id),
     }
 }
 
@@ -3593,6 +3792,14 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         #[cfg(debug_assertions)]
         let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(debug_assertions)]
+        let upload_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let upload_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let upload_status_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let upload_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
         let mut protected = Router::new()
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
@@ -3603,6 +3810,24 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
                 }),
             )
             .route(
+                "/v1/tools/{selector}/uploads",
+                post(move |path, req| {
+                    dynamic_drive_upload_start_handler(Arc::clone(&upload_start_slot), path, req)
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/uploads/{upload_id}",
+                put(move |path, req| {
+                    dynamic_drive_upload_chunk_handler(Arc::clone(&upload_chunk_slot), path, req)
+                })
+                .merge(get(move |path, req| {
+                    dynamic_drive_upload_status_handler(Arc::clone(&upload_status_slot), path, req)
+                }))
+                .merge(delete(move |path, req| {
+                    dynamic_drive_upload_cancel_handler(Arc::clone(&upload_cancel_slot), path, req)
+                })),
+            )
+            .route(
                 "/v1/tools/{service}/{*path}",
                 any(move |path, req| dynamic_proxy_handler(Arc::clone(&proxy_slot), path, req)),
             );
@@ -3610,6 +3835,14 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         let connectors_slot = Arc::clone(&proxy_route_slots.connectors);
         #[cfg(not(debug_assertions))]
         let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let upload_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let upload_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let upload_status_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let upload_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(not(debug_assertions))]
         let protected = Router::new()
             .route("/health", get(health_handler))
@@ -3619,6 +3852,24 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
                 any(move |path, req| {
                     dynamic_connector_mcp_handler(Arc::clone(&connectors_slot), path, req)
                 }),
+            )
+            .route(
+                "/v1/tools/{selector}/uploads",
+                post(move |path, req| {
+                    dynamic_drive_upload_start_handler(Arc::clone(&upload_start_slot), path, req)
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/uploads/{upload_id}",
+                put(move |path, req| {
+                    dynamic_drive_upload_chunk_handler(Arc::clone(&upload_chunk_slot), path, req)
+                })
+                .merge(get(move |path, req| {
+                    dynamic_drive_upload_status_handler(Arc::clone(&upload_status_slot), path, req)
+                }))
+                .merge(delete(move |path, req| {
+                    dynamic_drive_upload_cancel_handler(Arc::clone(&upload_cancel_slot), path, req)
+                })),
             )
             .route(
                 "/v1/tools/{service}/{*path}",
@@ -4402,6 +4653,29 @@ mod tests {
 
     use permitlayer_core::store::fs::credential_fs::encode_envelope;
     use permitlayer_credential::{KeyId, SealedCredential};
+
+    #[test]
+    fn drive_upload_identity_requires_fixed_write_scope() {
+        let mut allowed = Request::builder()
+            .header("x-agentsso-scope", "drive.file")
+            .body(Body::empty())
+            .unwrap();
+        allowed.extensions_mut().insert(AgentId("agent".to_owned()));
+        assert!(upload_request_identity(&allowed).is_ok());
+
+        let mut downgraded = Request::builder()
+            .header("x-agentsso-scope", "drive.readonly")
+            .body(Body::empty())
+            .unwrap();
+        downgraded.extensions_mut().insert(AgentId("agent".to_owned()));
+        let denied = upload_request_identity(&downgraded).unwrap_err();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let mut missing = Request::builder().body(Body::empty()).unwrap();
+        missing.extensions_mut().insert(AgentId("agent".to_owned()));
+        let denied = upload_request_identity(&missing).unwrap_err();
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn start_refuses_when_launchdaemon_plist_present_unless_allowed() {

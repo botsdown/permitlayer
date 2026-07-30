@@ -147,6 +147,17 @@ keeps tokens scoped to your Google account, not a shared app.
    agentsso audit --follow
    ```
 
+To upload a local PDF, spreadsheet, image, or other binary file to Drive,
+use the unprivileged streaming helper rather than the metadata-only
+`drive.files.create` MCP tool:
+
+```sh
+agentsso drive upload ./receipt.pdf --parent <drive-folder-id>
+```
+
+The helper reads the file as the invoking user, sends policy-checked 8 MiB
+chunks through the daemon, and verifies Drive's returned size and MD5.
+
 ### Connect over SSH or under `su`
 
 If `agentsso quickstart` cannot reach a usable browser (SSH session,
