@@ -46,11 +46,12 @@ fn load_default_policy_set() -> PolicySet {
 #[test]
 fn default_fixture_compiles() {
     let set = load_default_policy_set();
-    // Six per-service tier policies plus two retained originals
+    // Six per-service tier policies, two retained originals, and the
+    // separate Drive full-control policy.
     // (gmail-read-only + drive-research-scope-restricted). The legacy
     // `calendar-prompt-on-write` example was deleted with the
-    // headless `prompt`-purge → 8 policies total.
-    assert_eq!(set.len(), 8);
+    // headless `prompt`-purge → 9 policies total.
+    assert_eq!(set.len(), 9);
     // Retained originals.
     assert!(set.get("gmail-read-only").is_some());
     assert!(set.get("drive-research-scope-restricted").is_some());
@@ -65,6 +66,7 @@ fn default_fixture_compiles() {
         "calendar-read-write",
         "drive-read-only",
         "drive-read-write",
+        "drive-sharing-full-control",
         "gmail-read-only-tier",
     ] {
         assert!(set.get(name).is_some(), "tier policy {name} must be present");

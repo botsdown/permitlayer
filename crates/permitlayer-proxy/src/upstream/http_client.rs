@@ -129,7 +129,7 @@ impl UpstreamClient {
             }
         }
 
-        let response = request.send().await.map_err(|e| {
+        let mut response = request.send().await.map_err(|e| {
             if e.is_connect() || e.is_timeout() {
                 ProxyError::UpstreamUnreachable {
                     service: service.to_owned(),
@@ -184,19 +184,19 @@ impl UpstreamClient {
                 ),
             });
         }
-        let resp_body = response.bytes().await.map_err(|e| ProxyError::Internal {
+        let mut resp_body = Vec::with_capacity(content_length.min(max_body as u64) as usize);
+        while let Some(chunk) = response.chunk().await.map_err(|e| ProxyError::Internal {
             message: format!("failed to read upstream response body: {e}"),
-        })?;
-        if resp_body.len() > max_body {
-            return Err(ProxyError::Internal {
-                message: format!(
-                    "upstream response body too large: {} bytes (max {max_body})",
-                    resp_body.len()
-                ),
-            });
+        })? {
+            if resp_body.len().saturating_add(chunk.len()) > max_body {
+                return Err(ProxyError::Internal {
+                    message: format!("upstream response body exceeds max {max_body} bytes"),
+                });
+            }
+            resp_body.extend_from_slice(&chunk);
         }
 
-        Ok(UpstreamResponse { status, headers: resp_headers, body: resp_body })
+        Ok(UpstreamResponse { status, headers: resp_headers, body: Bytes::from(resp_body) })
     }
 }
 

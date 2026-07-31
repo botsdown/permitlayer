@@ -583,7 +583,22 @@ fn drive_upload_error_response(
         .into_response()
 }
 
-fn upload_request_identity(request: &Request) -> Result<(String, String), Box<Response>> {
+fn upload_request_identity(
+    request: &Request,
+    expected_replace: bool,
+) -> Result<(String, String), Box<Response>> {
+    if expected_replace {
+        transfer_request_identity(request, "drive.full", "drive-replace")
+    } else {
+        transfer_request_identity(request, "drive.file", "drive-upload")
+    }
+}
+
+fn transfer_request_identity(
+    request: &Request,
+    required_scope: &'static str,
+    policy_name: &'static str,
+) -> Result<(String, String), Box<Response>> {
     let request_id =
         request.extensions().get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default();
     let agent_id = match request.extensions().get::<AgentId>() {
@@ -597,32 +612,146 @@ fn upload_request_identity(request: &Request) -> Result<(String, String), Box<Re
     let declared_scope =
         request.headers().get("x-agentsso-scope").and_then(|value| value.to_str().ok());
     match declared_scope {
-        Some("drive.file") => Ok((agent_id, request_id)),
+        Some(scope) if scope == required_scope => Ok((agent_id, request_id)),
         None => Err(Box::new(
             ProxyError::MissingScopeHeader.into_response_with_request_id(Some(request_id)),
         )),
         Some(_) => Err(Box::new(
             ProxyError::PolicyDenied {
-                policy_name: "drive-upload".to_owned(),
+                policy_name: policy_name.to_owned(),
                 rule_id: "fixed-write-scope".to_owned(),
                 denied_scope: Some("non-drive.file".to_owned()),
                 denied_resource: None,
-                message: "Drive upload endpoints require X-Agentsso-Scope: drive.file".to_owned(),
+                message: format!(
+                    "Drive transfer endpoint requires X-Agentsso-Scope: {required_scope}"
+                ),
             }
             .into_response_with_request_id(Some(request_id)),
         )),
     }
 }
 
+fn drive_transfer_error_response(
+    error: permitlayer_proxy::service::DriveTransferError,
+    request_id: String,
+) -> Response {
+    let status = error.status_code();
+    (
+        status,
+        Json(DriveUploadErrorEnvelope {
+            error: DriveUploadErrorBody {
+                code: error.code(),
+                message: error.to_string(),
+                request_id,
+            },
+        }),
+    )
+        .into_response()
+}
+
+async fn dynamic_drive_transfer_start_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path(selector): Path<String>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else { return not_implemented_handler(request).await };
+    let (agent, request_id) =
+        match transfer_request_identity(&request, "drive.readonly", "drive-download") {
+            Ok(identity) => identity,
+            Err(response) => return *response,
+        };
+    let body = match axum::body::to_bytes(request.into_body(), 64 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            return drive_transfer_error_response(
+                permitlayer_proxy::service::DriveTransferError::Invalid(error.to_string()),
+                request_id,
+            );
+        }
+    };
+    let start = match serde_json::from_slice(&body) {
+        Ok(start) => start,
+        Err(error) => {
+            return drive_transfer_error_response(
+                permitlayer_proxy::service::DriveTransferError::Invalid(format!(
+                    "invalid transfer JSON: {error}"
+                )),
+                request_id,
+            );
+        }
+    };
+    match service.drive_transfer_start(agent, selector, request_id.clone(), start).await {
+        Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
+        Err(error) => drive_transfer_error_response(error, request_id),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TransferChunkQuery {
+    #[serde(default)]
+    offset: u64,
+}
+
+async fn dynamic_drive_transfer_chunk_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path((selector, transfer_id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<TransferChunkQuery>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else { return not_implemented_handler(request).await };
+    let (agent, request_id) =
+        match transfer_request_identity(&request, "drive.readonly", "drive-download") {
+            Ok(identity) => identity,
+            Err(response) => return *response,
+        };
+    match service
+        .drive_transfer_chunk(&agent, &selector, request_id.clone(), &transfer_id, query.offset)
+        .await
+    {
+        Ok(chunk) => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .header("x-permitlayer-offset", chunk.offset)
+                .header("x-permitlayer-complete", if chunk.complete { "true" } else { "false" });
+            if let Some(total) = chunk.total_size {
+                response = response.header("x-permitlayer-total-size", total);
+            }
+            response
+                .body(axum::body::Body::from(chunk.bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(error) => drive_transfer_error_response(error, request_id),
+    }
+}
+
+async fn dynamic_drive_transfer_cancel_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path((selector, transfer_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else { return not_implemented_handler(request).await };
+    let (agent, request_id) =
+        match transfer_request_identity(&request, "drive.readonly", "drive-download") {
+            Ok(identity) => identity,
+            Err(response) => return *response,
+        };
+    match service.drive_transfer_cancel(&agent, &selector, &transfer_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => drive_transfer_error_response(error, request_id),
+    }
+}
+
 async fn dynamic_drive_upload_start_handler(
     slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    expected_replace: bool,
     Path(selector): Path<String>,
     request: Request,
 ) -> Response {
     let Some(service) = slot.load_full() else {
         return not_implemented_handler(request).await;
     };
-    let (agent_id, request_id) = match upload_request_identity(&request) {
+    let (agent_id, request_id) = match upload_request_identity(&request, expected_replace) {
         Ok(identity) => identity,
         Err(response) => return *response,
     };
@@ -648,7 +777,10 @@ async fn dynamic_drive_upload_start_handler(
             );
         }
     };
-    match service.drive_upload_start(agent_id, selector, request_id.clone(), start).await {
+    match service
+        .drive_upload_start(agent_id, selector, request_id.clone(), expected_replace, start)
+        .await
+    {
         Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
         Err(error) => drive_upload_error_response(error, request_id),
     }
@@ -656,13 +788,14 @@ async fn dynamic_drive_upload_start_handler(
 
 async fn dynamic_drive_upload_chunk_handler(
     slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    expected_replace: bool,
     Path((selector, upload_id)): Path<(String, String)>,
     request: Request,
 ) -> Response {
     let Some(service) = slot.load_full() else {
         return not_implemented_handler(request).await;
     };
-    let (agent_id, request_id) = match upload_request_identity(&request) {
+    let (agent_id, request_id) = match upload_request_identity(&request, expected_replace) {
         Ok(identity) => identity,
         Err(response) => return *response,
     };
@@ -697,6 +830,7 @@ async fn dynamic_drive_upload_chunk_handler(
             selector,
             request_id.clone(),
             &upload_id,
+            expected_replace,
             &content_range,
             body,
         )
@@ -720,17 +854,18 @@ async fn dynamic_drive_upload_chunk_handler(
 
 async fn dynamic_drive_upload_status_handler(
     slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    expected_replace: bool,
     Path((selector, upload_id)): Path<(String, String)>,
     request: Request,
 ) -> Response {
     let Some(service) = slot.load_full() else {
         return not_implemented_handler(request).await;
     };
-    let (agent_id, request_id) = match upload_request_identity(&request) {
+    let (agent_id, request_id) = match upload_request_identity(&request, expected_replace) {
         Ok(identity) => identity,
         Err(response) => return *response,
     };
-    match service.drive_upload_status(&agent_id, &selector, &upload_id).await {
+    match service.drive_upload_status(&agent_id, &selector, &upload_id, expected_replace).await {
         Ok(status) => Json(status).into_response(),
         Err(error) => drive_upload_error_response(error, request_id),
     }
@@ -738,17 +873,18 @@ async fn dynamic_drive_upload_status_handler(
 
 async fn dynamic_drive_upload_cancel_handler(
     slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    expected_replace: bool,
     Path((selector, upload_id)): Path<(String, String)>,
     request: Request,
 ) -> Response {
     let Some(service) = slot.load_full() else {
         return not_implemented_handler(request).await;
     };
-    let (agent_id, request_id) = match upload_request_identity(&request) {
+    let (agent_id, request_id) = match upload_request_identity(&request, expected_replace) {
         Ok(identity) => identity,
         Err(response) => return *response,
     };
-    match service.drive_upload_cancel(&agent_id, &selector, &upload_id).await {
+    match service.drive_upload_cancel(&agent_id, &selector, &upload_id, expected_replace).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => drive_upload_error_response(error, request_id),
     }
@@ -3782,23 +3918,116 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         let upload_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
         let upload_status_slot = Arc::clone(&proxy_route_slots.proxy);
         let upload_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        let replace_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        let replace_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        let replace_status_slot = Arc::clone(&proxy_route_slots.proxy);
+        let replace_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        let transfer_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        let transfer_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        let transfer_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
         let routes = Router::new()
             .route(
                 "/v1/tools/{selector}/uploads",
                 post(move |path, req| {
-                    dynamic_drive_upload_start_handler(Arc::clone(&upload_start_slot), path, req)
+                    dynamic_drive_upload_start_handler(
+                        Arc::clone(&upload_start_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 }),
+            )
+            .route(
+                "/v1/tools/{selector}/replacements",
+                post(move |path, req| {
+                    dynamic_drive_upload_start_handler(
+                        Arc::clone(&replace_start_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/replacements/{upload_id}",
+                put(move |path, req| {
+                    dynamic_drive_upload_chunk_handler(
+                        Arc::clone(&replace_chunk_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                })
+                .merge(get(move |path, req| {
+                    dynamic_drive_upload_status_handler(
+                        Arc::clone(&replace_status_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                }))
+                .merge(delete(move |path, req| {
+                    dynamic_drive_upload_cancel_handler(
+                        Arc::clone(&replace_cancel_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                })),
             )
             .route(
                 "/v1/tools/{selector}/uploads/{upload_id}",
                 put(move |path, req| {
-                    dynamic_drive_upload_chunk_handler(Arc::clone(&upload_chunk_slot), path, req)
+                    dynamic_drive_upload_chunk_handler(
+                        Arc::clone(&upload_chunk_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 })
                 .merge(get(move |path, req| {
-                    dynamic_drive_upload_status_handler(Arc::clone(&upload_status_slot), path, req)
+                    dynamic_drive_upload_status_handler(
+                        Arc::clone(&upload_status_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 }))
                 .merge(delete(move |path, req| {
-                    dynamic_drive_upload_cancel_handler(Arc::clone(&upload_cancel_slot), path, req)
+                    dynamic_drive_upload_cancel_handler(
+                        Arc::clone(&upload_cancel_slot),
+                        false,
+                        path,
+                        req,
+                    )
+                })),
+            )
+            .route(
+                "/v1/tools/{selector}/downloads",
+                post(move |path, req| {
+                    dynamic_drive_transfer_start_handler(
+                        Arc::clone(&transfer_start_slot),
+                        path,
+                        req,
+                    )
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/downloads/{transfer_id}",
+                get(move |path, query, req| {
+                    dynamic_drive_transfer_chunk_handler(
+                        Arc::clone(&transfer_chunk_slot),
+                        path,
+                        query,
+                        req,
+                    )
+                })
+                .merge(delete(move |path, req| {
+                    dynamic_drive_transfer_cancel_handler(
+                        Arc::clone(&transfer_cancel_slot),
+                        path,
+                        req,
+                    )
                 })),
             )
             .with_state(state.clone());
@@ -3860,6 +4089,20 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         #[cfg(debug_assertions)]
         let upload_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(debug_assertions)]
+        let replace_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let replace_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let replace_status_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let replace_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let transfer_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let transfer_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let transfer_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
         let mut protected = Router::new()
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
@@ -3872,19 +4115,105 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             .route(
                 "/v1/tools/{selector}/uploads",
                 post(move |path, req| {
-                    dynamic_drive_upload_start_handler(Arc::clone(&upload_start_slot), path, req)
+                    dynamic_drive_upload_start_handler(
+                        Arc::clone(&upload_start_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 }),
             )
             .route(
                 "/v1/tools/{selector}/uploads/{upload_id}",
                 put(move |path, req| {
-                    dynamic_drive_upload_chunk_handler(Arc::clone(&upload_chunk_slot), path, req)
+                    dynamic_drive_upload_chunk_handler(
+                        Arc::clone(&upload_chunk_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 })
                 .merge(get(move |path, req| {
-                    dynamic_drive_upload_status_handler(Arc::clone(&upload_status_slot), path, req)
+                    dynamic_drive_upload_status_handler(
+                        Arc::clone(&upload_status_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 }))
                 .merge(delete(move |path, req| {
-                    dynamic_drive_upload_cancel_handler(Arc::clone(&upload_cancel_slot), path, req)
+                    dynamic_drive_upload_cancel_handler(
+                        Arc::clone(&upload_cancel_slot),
+                        false,
+                        path,
+                        req,
+                    )
+                })),
+            )
+            .route(
+                "/v1/tools/{selector}/replacements",
+                post(move |path, req| {
+                    dynamic_drive_upload_start_handler(
+                        Arc::clone(&replace_start_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/replacements/{upload_id}",
+                put(move |path, req| {
+                    dynamic_drive_upload_chunk_handler(
+                        Arc::clone(&replace_chunk_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                })
+                .merge(get(move |path, req| {
+                    dynamic_drive_upload_status_handler(
+                        Arc::clone(&replace_status_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                }))
+                .merge(delete(move |path, req| {
+                    dynamic_drive_upload_cancel_handler(
+                        Arc::clone(&replace_cancel_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                })),
+            )
+            .route(
+                "/v1/tools/{selector}/downloads",
+                post(move |path, req| {
+                    dynamic_drive_transfer_start_handler(
+                        Arc::clone(&transfer_start_slot),
+                        path,
+                        req,
+                    )
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/downloads/{transfer_id}",
+                get(move |path, query, req| {
+                    dynamic_drive_transfer_chunk_handler(
+                        Arc::clone(&transfer_chunk_slot),
+                        path,
+                        query,
+                        req,
+                    )
+                })
+                .merge(delete(move |path, req| {
+                    dynamic_drive_transfer_cancel_handler(
+                        Arc::clone(&transfer_cancel_slot),
+                        path,
+                        req,
+                    )
                 })),
             )
             .route(
@@ -3904,6 +4233,20 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         #[cfg(not(debug_assertions))]
         let upload_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(not(debug_assertions))]
+        let replace_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let replace_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let replace_status_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let replace_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let transfer_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let transfer_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let transfer_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
         let protected = Router::new()
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
@@ -3916,19 +4259,105 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             .route(
                 "/v1/tools/{selector}/uploads",
                 post(move |path, req| {
-                    dynamic_drive_upload_start_handler(Arc::clone(&upload_start_slot), path, req)
+                    dynamic_drive_upload_start_handler(
+                        Arc::clone(&upload_start_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 }),
             )
             .route(
                 "/v1/tools/{selector}/uploads/{upload_id}",
                 put(move |path, req| {
-                    dynamic_drive_upload_chunk_handler(Arc::clone(&upload_chunk_slot), path, req)
+                    dynamic_drive_upload_chunk_handler(
+                        Arc::clone(&upload_chunk_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 })
                 .merge(get(move |path, req| {
-                    dynamic_drive_upload_status_handler(Arc::clone(&upload_status_slot), path, req)
+                    dynamic_drive_upload_status_handler(
+                        Arc::clone(&upload_status_slot),
+                        false,
+                        path,
+                        req,
+                    )
                 }))
                 .merge(delete(move |path, req| {
-                    dynamic_drive_upload_cancel_handler(Arc::clone(&upload_cancel_slot), path, req)
+                    dynamic_drive_upload_cancel_handler(
+                        Arc::clone(&upload_cancel_slot),
+                        false,
+                        path,
+                        req,
+                    )
+                })),
+            )
+            .route(
+                "/v1/tools/{selector}/replacements",
+                post(move |path, req| {
+                    dynamic_drive_upload_start_handler(
+                        Arc::clone(&replace_start_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/replacements/{upload_id}",
+                put(move |path, req| {
+                    dynamic_drive_upload_chunk_handler(
+                        Arc::clone(&replace_chunk_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                })
+                .merge(get(move |path, req| {
+                    dynamic_drive_upload_status_handler(
+                        Arc::clone(&replace_status_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                }))
+                .merge(delete(move |path, req| {
+                    dynamic_drive_upload_cancel_handler(
+                        Arc::clone(&replace_cancel_slot),
+                        true,
+                        path,
+                        req,
+                    )
+                })),
+            )
+            .route(
+                "/v1/tools/{selector}/downloads",
+                post(move |path, req| {
+                    dynamic_drive_transfer_start_handler(
+                        Arc::clone(&transfer_start_slot),
+                        path,
+                        req,
+                    )
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/downloads/{transfer_id}",
+                get(move |path, query, req| {
+                    dynamic_drive_transfer_chunk_handler(
+                        Arc::clone(&transfer_chunk_slot),
+                        path,
+                        query,
+                        req,
+                    )
+                })
+                .merge(delete(move |path, req| {
+                    dynamic_drive_transfer_cancel_handler(
+                        Arc::clone(&transfer_cancel_slot),
+                        path,
+                        req,
+                    )
                 })),
             )
             .route(
@@ -4758,20 +5187,31 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         allowed.extensions_mut().insert(AgentId("agent".to_owned()));
-        assert!(upload_request_identity(&allowed).is_ok());
+        assert!(upload_request_identity(&allowed, false).is_ok());
 
         let mut downgraded = Request::builder()
             .header("x-agentsso-scope", "drive.readonly")
             .body(Body::empty())
             .unwrap();
         downgraded.extensions_mut().insert(AgentId("agent".to_owned()));
-        let denied = upload_request_identity(&downgraded).unwrap_err();
+        let denied = upload_request_identity(&downgraded, false).unwrap_err();
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
         let mut missing = Request::builder().body(Body::empty()).unwrap();
         missing.extensions_mut().insert(AgentId("agent".to_owned()));
-        let denied = upload_request_identity(&missing).unwrap_err();
+        let denied = upload_request_identity(&missing, false).unwrap_err();
         assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+
+        let mut replacement = Request::builder()
+            .header("x-agentsso-scope", "drive.full")
+            .body(Body::empty())
+            .unwrap();
+        replacement.extensions_mut().insert(AgentId("agent".to_owned()));
+        assert!(upload_request_identity(&replacement, true).is_ok());
+        assert_eq!(
+            upload_request_identity(&allowed, true).unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]

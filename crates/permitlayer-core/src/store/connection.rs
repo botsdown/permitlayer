@@ -127,6 +127,9 @@ pub enum ConnectionTier {
     Read,
     /// Read + write access.
     ReadWrite,
+    /// Explicit restricted-scope authority for arbitrary existing Drive
+    /// files and sharing. It is never inferred from `ReadWrite`.
+    FullControl,
 }
 
 /// Lifecycle status of a connection (Story 11.9). `connection revoke`

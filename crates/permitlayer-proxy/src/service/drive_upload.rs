@@ -52,6 +52,7 @@ struct DriveUploadSession {
     acknowledged: u64,
     updated_at: Instant,
     completed: Option<serde_json::Value>,
+    replace_file_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +63,8 @@ pub struct DriveUploadStart {
     pub size_bytes: u64,
     pub parent_id: Option<String>,
     pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub replace_file_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,9 +148,15 @@ impl ProxyService {
         agent_id: String,
         selector: String,
         request_id: String,
+        expected_replace: bool,
         start: DriveUploadStart,
     ) -> Result<DriveUploadSessionInfo, DriveUploadError> {
         validate_start(&start)?;
+        if start.replace_file_id.is_some() != expected_replace {
+            return Err(DriveUploadError::Invalid(
+                "upload route does not match requested transfer kind".to_owned(),
+            ));
+        }
         // Serializing starts makes the idempotency lookup and insertion atomic
         // across the two upstream requests needed to create a resumable upload.
         let _start_guard = self.drive_uploads.starts.lock().await;
@@ -163,43 +172,65 @@ impl ProxyService {
         // integration tests and future connector definitions can supply their
         // own allowed Google-compatible origin. Production's built-in Drive
         // connector resolves to https://www.googleapis.com/drive/v3/.
+        let required_scope =
+            if start.replace_file_id.is_some() { "drive.full" } else { "drive.file" };
         let (_, resolved_connector_id) =
-            self.resolve_connection(&agent_id, &selector, "drive.file").await?;
+            self.resolve_connection(&agent_id, &selector, required_scope).await?;
         let (mut initiation_url, _, _) =
             self.resolve_upstream(&selector, resolved_connector_id.as_deref())?;
-        initiation_url.set_path("/upload/drive/v3/files");
+        let initiation_path = start.replace_file_id.as_ref().map_or_else(
+            || "/upload/drive/v3/files".to_owned(),
+            |id| format!("/upload/drive/v3/files/{id}"),
+        );
+        initiation_url.set_path(&initiation_path);
         initiation_url.set_query(Some(&format!(
             "uploadType=resumable&supportsAllDrives=true&fields={}",
             urlencoding::encode("id,name,mimeType,size,md5Checksum,parents,webViewLink")
         )));
 
-        let file_id_response = self
-            .drive_upload_proxy_call(
-                &agent_id,
-                &selector,
-                &request_id,
-                "uploads/generate-id",
-                "files/generateIds?count=1&space=drive&type=files".to_owned(),
-                Method::GET,
-                HeaderMap::new(),
-                Bytes::new(),
-            )
-            .await?;
-        ensure_success(file_id_response.status, &file_id_response.body, "generate Drive file ID")?;
-        let generated: serde_json::Value = serde_json::from_slice(&file_id_response.body)
-            .map_err(|e| DriveUploadError::Invalid(format!("invalid generateIds response: {e}")))?;
-        let file_id = generated["ids"]
-            .as_array()
-            .and_then(|ids| ids.first())
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                DriveUploadError::Invalid("Google returned no generated file ID".to_owned())
-            })?
-            .to_owned();
+        let file_id = if let Some(file_id) = &start.replace_file_id {
+            file_id.clone()
+        } else {
+            let file_id_response = self
+                .drive_upload_proxy_call(
+                    &agent_id,
+                    &selector,
+                    &request_id,
+                    "uploads/generate-id",
+                    "files/generateIds?count=1&space=drive&type=files".to_owned(),
+                    Method::GET,
+                    HeaderMap::new(),
+                    Bytes::new(),
+                )
+                .await?;
+            ensure_success(
+                file_id_response.status,
+                &file_id_response.body,
+                "generate Drive file ID",
+            )?;
+            let generated: serde_json::Value = serde_json::from_slice(&file_id_response.body)
+                .map_err(|e| {
+                    DriveUploadError::Invalid(format!("invalid generateIds response: {e}"))
+                })?;
+            generated["ids"]
+                .as_array()
+                .and_then(|ids| ids.first())
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    DriveUploadError::Invalid("Google returned no generated file ID".to_owned())
+                })?
+                .to_owned()
+        };
 
-        let mut metadata = serde_json::json!({ "id": file_id, "name": start.name.clone() });
-        if let Some(parent) = &start.parent_id {
+        let mut metadata = if start.replace_file_id.is_some() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "id": file_id, "name": start.name.clone() })
+        };
+        if start.replace_file_id.is_none()
+            && let Some(parent) = &start.parent_id
+        {
             metadata["parents"] = serde_json::json!([parent]);
         }
         let body = serde_json::to_vec(&metadata)
@@ -225,7 +256,7 @@ impl ProxyService {
                 &request_id,
                 "uploads/initiate",
                 path,
-                Method::POST,
+                if start.replace_file_id.is_some() { Method::PATCH } else { Method::POST },
                 headers,
                 body,
             )
@@ -246,6 +277,7 @@ impl ProxyService {
                     &request_id,
                     location,
                     &start.mime_type,
+                    required_scope,
                 )
                 .await?,
             )
@@ -265,6 +297,7 @@ impl ProxyService {
             acknowledged: 0,
             updated_at: Instant::now(),
             completed: completed.clone(),
+            replace_file_id: start.replace_file_id,
         };
         self.drive_uploads
             .inner
@@ -293,6 +326,7 @@ impl ProxyService {
         selector: String,
         request_id: String,
         upload_id: &str,
+        expected_replace: bool,
         content_range: &str,
         body: Bytes,
     ) -> Result<DriveUploadChunkResult, DriveUploadError> {
@@ -306,6 +340,7 @@ impl ProxyService {
         let session = self.drive_uploads.get(upload_id).await?;
         let mut session = session.lock().await;
         session.ensure_owner(&agent_id, &selector)?;
+        session.ensure_transfer_kind(expected_replace)?;
         session.ensure_live()?;
         if let Some(file) = &session.completed {
             return Ok(DriveUploadChunkResult::Complete { file: file.clone() });
@@ -425,10 +460,12 @@ impl ProxyService {
         agent_id: &str,
         selector: &str,
         upload_id: &str,
+        expected_replace: bool,
     ) -> Result<DriveUploadStatus, DriveUploadError> {
         let session = self.drive_uploads.get(upload_id).await?;
         let mut session = session.lock().await;
         session.ensure_owner(agent_id, selector)?;
+        session.ensure_transfer_kind(expected_replace)?;
         session.ensure_live()?;
         session.updated_at = Instant::now();
         Ok(DriveUploadStatus {
@@ -446,11 +483,13 @@ impl ProxyService {
         agent_id: &str,
         selector: &str,
         upload_id: &str,
+        expected_replace: bool,
     ) -> Result<(), DriveUploadError> {
         let session = self.drive_uploads.get(upload_id).await?;
         {
             let session = session.lock().await;
             session.ensure_owner(agent_id, selector)?;
+            session.ensure_transfer_kind(expected_replace)?;
         }
         self.drive_uploads.inner.lock().await.remove(upload_id);
         Ok(())
@@ -468,9 +507,36 @@ impl ProxyService {
         headers: HeaderMap,
         body: Bytes,
     ) -> Result<crate::ProxyResponse, DriveUploadError> {
+        self.drive_upload_proxy_call_with_scope(
+            agent_id,
+            selector,
+            request_id,
+            resource,
+            path,
+            method,
+            headers,
+            body,
+            "drive.file",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_upload_proxy_call_with_scope(
+        &self,
+        agent_id: &str,
+        selector: &str,
+        request_id: &str,
+        resource: &str,
+        path: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+        required_scope: &str,
+    ) -> Result<crate::ProxyResponse, DriveUploadError> {
         self.fetch_raw(ProxyRequest {
             service: selector.to_owned(),
-            scope: "drive.file".to_owned(),
+            scope: required_scope.to_owned(),
             resource: resource.to_owned(),
             method,
             path,
@@ -490,6 +556,7 @@ impl ProxyService {
         request_id: &str,
         uri: &str,
         mime_type: &str,
+        required_scope: &str,
     ) -> Result<serde_json::Value, DriveUploadError> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -501,7 +568,7 @@ impl ProxyService {
         let mut attempts = 0;
         loop {
             match self
-                .drive_upload_proxy_call(
+                .drive_upload_proxy_call_with_scope(
                     agent_id,
                     selector,
                     request_id,
@@ -510,6 +577,7 @@ impl ProxyService {
                     Method::PUT,
                     headers.clone(),
                     Bytes::new(),
+                    required_scope,
                 )
                 .await
             {
@@ -558,7 +626,7 @@ impl ProxyService {
             HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
                 .map_err(|_| DriveUploadError::Invalid("invalid Content-Range".to_owned()))?,
         );
-        self.drive_upload_proxy_call(
+        self.drive_upload_proxy_call_with_scope(
             agent_id,
             selector,
             request_id,
@@ -567,6 +635,7 @@ impl ProxyService {
             Method::PUT,
             headers,
             body,
+            if session.replace_file_id.is_some() { "drive.full" } else { "drive.file" },
         )
         .await
     }
@@ -586,7 +655,7 @@ impl ProxyService {
             HeaderValue::from_str(&format!("bytes */{}", session.size_bytes))
                 .map_err(|_| DriveUploadError::Invalid("invalid stored upload size".to_owned()))?,
         );
-        self.drive_upload_proxy_call(
+        self.drive_upload_proxy_call_with_scope(
             agent_id,
             selector,
             request_id,
@@ -595,6 +664,7 @@ impl ProxyService {
             Method::PUT,
             headers,
             Bytes::new(),
+            if session.replace_file_id.is_some() { "drive.full" } else { "drive.file" },
         )
         .await
     }
@@ -629,6 +699,7 @@ impl DriveUploadSessions {
                 || session.mime_type != start.mime_type
                 || session.size_bytes != start.size_bytes
                 || session.parent_id != start.parent_id
+                || session.replace_file_id != start.replace_file_id
             {
                 return Err(DriveUploadError::Conflict(
                     "idempotency key was already used for different upload metadata".to_owned(),
@@ -727,6 +798,13 @@ impl DriveUploadSessions {
 }
 
 impl DriveUploadSession {
+    fn ensure_transfer_kind(&self, expected_replace: bool) -> Result<(), DriveUploadError> {
+        if self.replace_file_id.is_some() != expected_replace {
+            return Err(DriveUploadError::NotFound);
+        }
+        Ok(())
+    }
+
     fn ensure_owner(&self, agent_id: &str, selector: &str) -> Result<(), DriveUploadError> {
         if self.agent_id != agent_id || self.selector != selector {
             return Err(DriveUploadError::NotFound);
@@ -767,6 +845,18 @@ fn validate_start(start: &DriveUploadStart) -> Result<(), DriveUploadError> {
             || !parent.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
     {
         return Err(DriveUploadError::Invalid("invalid Drive parent ID".to_owned()));
+    }
+    if start.replace_file_id.is_some() && start.parent_id.is_some() {
+        return Err(DriveUploadError::Invalid(
+            "replacement cannot change a file's parent".to_owned(),
+        ));
+    }
+    if let Some(file_id) = &start.replace_file_id
+        && (file_id.is_empty()
+            || file_id.len() > 256
+            || !file_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+    {
+        return Err(DriveUploadError::Invalid("invalid replacement Drive file ID".to_owned()));
     }
     if let Some(key) = &start.idempotency_key
         && (key.is_empty() || key.len() > 128 || key.chars().any(char::is_control))
@@ -966,6 +1056,7 @@ mod tests {
             size_bytes: MAX_DRIVE_UPLOAD_BYTES,
             parent_id: None,
             idempotency_key: None,
+            replace_file_id: None,
         };
         assert!(validate_start(&request).is_ok());
         request.size_bytes += 1;
@@ -994,6 +1085,32 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn upload_session_kind_cannot_cross_route_capabilities() {
+        let mut session = DriveUploadSession {
+            agent_id: "agent".to_owned(),
+            selector: "drive".to_owned(),
+            name: "report.pdf".to_owned(),
+            parent_id: None,
+            idempotency_key: None,
+            file_id: "file-id".to_owned(),
+            google_session_uri: Zeroizing::new(
+                "https://www.googleapis.com/upload/drive/v3/files?upload_id=secret".to_owned(),
+            ),
+            mime_type: "application/pdf".to_owned(),
+            size_bytes: 1,
+            acknowledged: 0,
+            updated_at: Instant::now(),
+            completed: None,
+            replace_file_id: None,
+        };
+        assert!(session.ensure_transfer_kind(false).is_ok());
+        assert!(matches!(session.ensure_transfer_kind(true), Err(DriveUploadError::NotFound)));
+        session.replace_file_id = Some("target".to_owned());
+        assert!(session.ensure_transfer_kind(true).is_ok());
+        assert!(matches!(session.ensure_transfer_kind(false), Err(DriveUploadError::NotFound)));
+    }
+
     #[tokio::test]
     async fn idempotent_start_reuses_only_identical_metadata() {
         let sessions = DriveUploadSessions::default();
@@ -1014,6 +1131,7 @@ mod tests {
                 acknowledged: 8,
                 updated_at: Instant::now(),
                 completed: None,
+                replace_file_id: None,
             })),
         );
         let mut start = DriveUploadStart {
@@ -1022,6 +1140,7 @@ mod tests {
             size_bytes: 10,
             parent_id: Some("folder".to_owned()),
             idempotency_key: Some("key".to_owned()),
+            replace_file_id: None,
         };
         let existing = sessions.find_idempotent("agent", "drive", &start).await;
         assert!(matches!(
@@ -1061,6 +1180,7 @@ mod tests {
                     acknowledged: 1,
                     updated_at: Instant::now(),
                     completed: Some(serde_json::json!({"id": format!("file-{index}")})),
+                    replace_file_id: None,
                 })),
             );
         }

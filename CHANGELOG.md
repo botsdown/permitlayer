@@ -26,6 +26,22 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.4.0] - 2026-07-31 — `agentsso` binary
+
+### Added
+
+- Secretless, integrity-checked Drive download, export, revision download,
+  and content replacement commands, including cross-invocation resume for
+  blob/revision downloads and daemon-contained Google Vids LRO handling.
+- Bounded Drive MCP resources, shared-drive support, reversible trash/restore,
+  permissions, revisions, and change listing.
+- Explicit local transfer capabilities and an isolated full-control Drive tier.
+
+### Changed
+
+- `drive.files.get` is metadata-only; binary content no longer crosses lossy
+  UTF-8 conversion.
+
 ## [1.3.4] - 2026-07-31 — `agentsso` binary
 
 Security patch release. Adds secretless, kernel-authenticated local Drive

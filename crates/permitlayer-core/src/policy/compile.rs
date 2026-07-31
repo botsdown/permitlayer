@@ -2402,14 +2402,14 @@ mod tests {
     // ── Story 9.4: per-service tier templates ────────────────────────
 
     /// The shipped test fixture (`test-fixtures/policies/default.toml`)
-    /// and the bundled seed (`default_policy.toml`) after Epic 9.
+    /// and the bundled seed (`default_policy.toml`).
     const FIXTURE_DEFAULT_TOML: &str =
         include_str!("../../../../test-fixtures/policies/default.toml");
     const BUNDLED_DEFAULT_TOML: &str =
         include_str!("../../../permitlayer-daemon/src/cli/default_policy.toml");
 
-    /// The shipped fixture compiles and contains exactly the 2
-    /// retained originals + 6 per-service tier policies = 8. The
+    /// The shipped fixture compiles and contains the retained policies,
+    /// per-service tiers, and the explicit Drive full-control policy. The
     /// legacy `calendar-prompt-on-write` example was deleted with the
     /// headless `prompt`-purge (it could only 503 on a headless
     /// daemon).
@@ -2425,6 +2425,7 @@ mod tests {
             "calendar-read-write",
             "drive-read-only",
             "drive-read-write",
+            "drive-sharing-full-control",
             "gmail-read-only-tier",
         ] {
             assert!(set.get(name).is_some(), "policy {name} must be present");
@@ -2433,7 +2434,7 @@ mod tests {
             set.get("calendar-prompt-on-write").is_none(),
             "the legacy prompt-on-write example must NOT ship — the daemon is headless"
         );
-        assert_eq!(set.len(), 8, "expected exactly 8 policies in the shipped default.toml");
+        assert_eq!(set.len(), 9, "expected exactly 9 policies in the shipped default.toml");
     }
 
     /// AC #2: every `{svc}-read-only` tier denies its service's write
@@ -2523,6 +2524,7 @@ mod tests {
             "calendar-read-write",
             "drive-read-only",
             "drive-read-write",
+            "drive-sharing-full-control",
             "gmail-read-only-tier",
         ];
         for name in names {

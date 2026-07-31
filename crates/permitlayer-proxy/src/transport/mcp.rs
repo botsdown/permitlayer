@@ -26,7 +26,7 @@ use tracing::debug;
 
 use crate::error::{AgentId, ProxyError};
 use crate::request::ProxyRequest;
-use crate::service::ProxyService;
+use crate::service::{DriveTransferStart, ProxyService};
 use crate::transport::gmail_shape;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -451,6 +451,60 @@ fn normalize_mime_type(mime_type: Option<String>) -> String {
         .and_then(|value| value.parse::<mime::Mime>().ok())
         .map(|value| value.to_string())
         .unwrap_or_else(|| "application/octet-stream".to_owned())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn drive_transfer_cli_command(
+    file_id: &str,
+    export_mime: Option<&str>,
+    revision_id: Option<&str>,
+) -> String {
+    if let Some(revision_id) = revision_id {
+        format!("agentsso drive revision-download {file_id} {revision_id} --output <path>")
+    } else if let Some(mime_type) = export_mime {
+        format!(
+            "agentsso drive export {file_id} --mime-type {} --output <path>",
+            shell_single_quote(mime_type)
+        )
+    } else {
+        format!("agentsso drive download {file_id} --output <path>")
+    }
+}
+
+fn validate_permission_principal_for_mutation(value: &serde_json::Value) -> Result<(), String> {
+    if !matches!(value.get("type").and_then(serde_json::Value::as_str), Some("user" | "group")) {
+        return Err("public and domain permissions cannot be mutated".to_owned());
+    }
+    Ok(())
+}
+
+fn permission_is_inherited(value: &serde_json::Value) -> bool {
+    value.get("permissionDetails").and_then(serde_json::Value::as_array).is_some_and(|details| {
+        details.iter().any(|detail| {
+            detail.get("inherited").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+    })
+}
+
+fn validate_drive_corpora(corpora: Option<&str>, drive_id: Option<&str>) -> Result<(), String> {
+    if let Some(corpora) = corpora {
+        if !matches!(corpora, "user" | "domain" | "drive" | "allDrives") {
+            return Err("corpora must be user, domain, drive, or allDrives".to_owned());
+        }
+        if corpora == "drive" && drive_id.is_none_or(str::is_empty) {
+            return Err("drive_id is required when corpora is drive".to_owned());
+        }
+    }
+    if let Some(drive_id) = drive_id {
+        validate_resource_id(drive_id)?;
+        if corpora != Some("drive") {
+            return Err("drive_id is only valid when corpora is drive".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Validate a Calendar ID (calendar or event ID).
@@ -1835,6 +1889,10 @@ pub struct FilesListParams {
     pub order_by: Option<String>,
     /// Fields to include in the response (e.g., "files(id,name,mimeType)").
     pub fields: Option<String>,
+    pub corpora: Option<String>,
+    pub drive_id: Option<String>,
+    pub spaces: Option<String>,
+    pub include_items_from_all_drives: Option<bool>,
 }
 
 /// Parameters for `drive.files.get`.
@@ -1844,8 +1902,23 @@ pub struct FileGetParams {
     pub file_id: String,
     /// Fields to include (e.g., "id,name,mimeType,size").
     pub fields: Option<String>,
-    /// Set to "media" to download file content instead of metadata.
-    pub alt: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FileDownloadParams {
+    pub file_id: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FileExportParams {
+    pub file_id: String,
+    pub mime_type: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RevisionDownloadParams {
+    pub file_id: String,
+    pub revision_id: String,
 }
 
 /// Parameters for `drive.files.search`.
@@ -1861,6 +1934,10 @@ pub struct FilesSearchParams {
     pub order_by: Option<String>,
     /// Fields to include in the response.
     pub fields: Option<String>,
+    pub corpora: Option<String>,
+    pub drive_id: Option<String>,
+    pub spaces: Option<String>,
+    pub include_items_from_all_drives: Option<bool>,
 }
 
 /// Parameters for `drive.files.create`.
@@ -1893,6 +1970,10 @@ pub struct FileUpdateParams {
     pub file: serde_json::Value,
     /// Fields to include in the response.
     pub fields: Option<String>,
+    /// Parent IDs to add, passed as the Drive API `addParents` query parameter.
+    pub add_parents: Option<String>,
+    /// Parent IDs to remove, passed as the Drive API `removeParents` query parameter.
+    pub remove_parents: Option<String>,
 }
 
 // -- Story 9.3: Drive parity gap-fill ----------------------------------------
@@ -1922,6 +2003,110 @@ pub struct FileCopyParams {
 #[derive(serde::Deserialize, schemars::JsonSchema, Default)]
 pub struct DriveAboutGetParams {}
 
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct DrivesListParams {
+    pub page_size: Option<u32>,
+    pub page_token: Option<String>,
+    pub q: Option<String>,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DriveGetParams {
+    pub drive_id: String,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FilePermissionListParams {
+    pub file_id: String,
+    pub page_size: Option<u32>,
+    pub page_token: Option<String>,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FilePermissionGetParams {
+    pub file_id: String,
+    pub permission_id: String,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionPrincipalType {
+    User,
+    Group,
+}
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionRole {
+    Reader,
+    Commenter,
+    Writer,
+}
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PermissionCreateInput {
+    #[serde(rename = "type")]
+    pub principal_type: PermissionPrincipalType,
+    pub role: PermissionRole,
+    pub email_address: String,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FilePermissionCreateParams {
+    pub file_id: String,
+    pub permission: PermissionCreateInput,
+    pub send_notification_email: Option<bool>,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FilePermissionUpdateParams {
+    pub file_id: String,
+    pub permission_id: String,
+    pub role: PermissionRole,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FilePermissionDeleteParams {
+    pub file_id: String,
+    pub permission_id: String,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RevisionsListParams {
+    pub file_id: String,
+    pub page_size: Option<u32>,
+    pub page_token: Option<String>,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RevisionGetParams {
+    pub file_id: String,
+    pub revision_id: String,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RevisionUpdateParams {
+    pub file_id: String,
+    pub revision_id: String,
+    pub keep_forever: bool,
+    pub fields: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct RevisionDeleteParams {
+    pub file_id: String,
+    pub revision_id: String,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct ChangesStartTokenParams {
+    pub drive_id: Option<String>,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct ChangesListParams {
+    pub page_token: String,
+    pub page_size: Option<u32>,
+    pub drive_id: Option<String>,
+    pub spaces: Option<String>,
+    pub include_removed: Option<bool>,
+    pub fields: Option<String>,
+}
+
 // -- Drive MCP server ---------------------------------------------------------
 
 /// MCP server that exposes Google Drive tools via `ProxyService::handle`.
@@ -1929,6 +2114,7 @@ pub struct DriveAboutGetParams {}
 pub struct DriveMcpServer {
     proxy_service: Arc<ProxyService>,
     tool_router: ToolRouter<Self>,
+    transfer_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl DriveMcpServer {
@@ -1937,14 +2123,17 @@ impl DriveMcpServer {
     pub fn new(proxy_service: Arc<ProxyService>) -> Self {
         let mut tool_router = Self::tool_router();
         strip_meta_schema(&mut tool_router);
-        Self { proxy_service, tool_router }
+        Self { proxy_service, tool_router, transfer_gate: Arc::new(tokio::sync::Semaphore::new(1)) }
     }
 
     /// Dispatch a proxy request and return the upstream response body as a
     /// string.
     async fn dispatch(&self, req: ProxyRequest) -> Result<String, String> {
         match self.proxy_service.handle(req).await {
-            Ok(resp) => Ok(String::from_utf8_lossy(&resp.body).into_owned()),
+            Ok(resp) if resp.status.is_success() => {
+                Ok(String::from_utf8_lossy(&resp.body).into_owned())
+            }
+            Ok(resp) => Err(format!("Drive returned HTTP {}", resp.status)),
             Err(err) => Err(err.to_string()),
         }
     }
@@ -1984,6 +2173,185 @@ impl DriveMcpServer {
             request_id: ulid::Ulid::new().to_string(),
         }
     }
+
+    async fn materialize(
+        &self,
+        file_id: &str,
+        export_mime: Option<&str>,
+        revision_id: Option<&str>,
+        agent_id: String,
+    ) -> Result<CallToolResult, String> {
+        const MCP_DRIVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+        validate_resource_id(file_id)?;
+        if let Some(revision) = revision_id {
+            validate_resource_id(revision)?;
+        }
+        if let Some(mime) = export_mime {
+            mime.parse::<mime::Mime>().map_err(|_| "invalid export MIME type".to_owned())?;
+        }
+        let _permit = self
+            .transfer_gate
+            .acquire()
+            .await
+            .map_err(|_| "Drive transfer gate is unavailable".to_owned())?;
+        let cli_command = drive_transfer_cli_command(file_id, export_mime, revision_id);
+        let start = if let Some(revision_id) = revision_id {
+            DriveTransferStart::Revision {
+                file_id: file_id.to_owned(),
+                revision_id: revision_id.to_owned(),
+            }
+        } else if let Some(mime_type) = export_mime {
+            DriveTransferStart::Export {
+                file_id: file_id.to_owned(),
+                mime_type: mime_type.to_owned(),
+            }
+        } else {
+            DriveTransferStart::Blob { file_id: file_id.to_owned() }
+        };
+        let info = self
+            .proxy_service
+            .drive_transfer_start(
+                agent_id.clone(),
+                "drive".to_owned(),
+                ulid::Ulid::new().to_string(),
+                start,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if info.size_bytes.is_some_and(|size| size > MCP_DRIVE_MAX_BYTES) {
+            let _ = self
+                .proxy_service
+                .drive_transfer_cancel(&agent_id, "drive", &info.transfer_id)
+                .await;
+            return Err(format!(
+                "file exceeds the 16 MiB MCP materialization limit; run `{cli_command}`"
+            ));
+        }
+        let mut bytes = Vec::with_capacity(
+            info.size_bytes.unwrap_or(MCP_DRIVE_MAX_BYTES).min(MCP_DRIVE_MAX_BYTES) as usize,
+        );
+        let mut offset = 0_u64;
+        loop {
+            if offset >= MCP_DRIVE_MAX_BYTES {
+                let _ = self
+                    .proxy_service
+                    .drive_transfer_cancel(&agent_id, "drive", &info.transfer_id)
+                    .await;
+                return Err(format!(
+                    "file exceeds the 16 MiB MCP materialization limit; run `{cli_command}`"
+                ));
+            }
+            let chunk = self
+                .proxy_service
+                .drive_transfer_chunk(
+                    &agent_id,
+                    "drive",
+                    ulid::Ulid::new().to_string(),
+                    &info.transfer_id,
+                    offset,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let next = offset
+                .checked_add(chunk.bytes.len() as u64)
+                .ok_or_else(|| "Drive materialization size overflow".to_owned())?;
+            if next > MCP_DRIVE_MAX_BYTES {
+                let _ = self
+                    .proxy_service
+                    .drive_transfer_cancel(&agent_id, "drive", &info.transfer_id)
+                    .await;
+                return Err(format!(
+                    "file exceeds the 16 MiB MCP materialization limit; run `{cli_command}`"
+                ));
+            }
+            bytes.extend_from_slice(&chunk.bytes);
+            offset = next;
+            if chunk.complete {
+                break;
+            }
+            if chunk.bytes.is_empty() {
+                return Err("Drive returned an empty incomplete transfer chunk".to_owned());
+            }
+        }
+        let name = sanitize_filename(Some(&info.name), file_id);
+        let mime_type = normalize_mime_type(Some(info.mime_type.clone()));
+        let sha256 = {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(&bytes))
+        };
+        let uri =
+            format!("permitlayer://drive/{}/{}", ulid::Ulid::new(), urlencoding::encode(&name));
+        let blob = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let resource = ResourceContents::blob(blob, uri).with_mime_type(mime_type.clone());
+        let mut result = CallToolResult::success(vec![Content::resource(resource)]);
+        result.structured_content = Some(serde_json::json!({
+            "fileId": file_id,
+            "name": name,
+            "mimeType": mime_type,
+            "size": bytes.len(),
+            "sha256": sha256,
+            "md5Checksum": info.md5_checksum,
+        }));
+        Ok(result)
+    }
+
+    async fn set_trashed(
+        &self,
+        file_id: String,
+        trashed: bool,
+        parts: axum::http::request::Parts,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&file_id)?;
+        let path = format!(
+            "files/{}?supportsAllDrives=true&fields=id,name,trashed",
+            urlencoding::encode(&file_id)
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"trashed": trashed}))
+                .map_err(|error| error.to_string())?,
+        );
+        self.dispatch(Self::drive_request(path, "drive.file", Method::PATCH, body, agent)).await
+    }
+
+    async fn delete_file(
+        &self,
+        file_id: String,
+        parts: axum::http::request::Parts,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&file_id)?;
+        let path = format!("files/{}?supportsAllDrives=true", urlencoding::encode(&file_id));
+        self.dispatch(Self::drive_request(path, "drive.file", Method::DELETE, Bytes::new(), agent))
+            .await
+    }
+
+    async fn permission_for_mutation(
+        &self,
+        file_id: &str,
+        permission_id: &str,
+        agent: String,
+    ) -> Result<serde_json::Value, String> {
+        let path = format!(
+            "files/{}/permissions/{}?fields=id,type,role,permissionDetails&supportsAllDrives=true",
+            urlencoding::encode(file_id),
+            urlencoding::encode(permission_id)
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &self
+                .dispatch(Self::drive_request(
+                    path,
+                    "drive.share",
+                    Method::GET,
+                    Bytes::new(),
+                    agent,
+                ))
+                .await?,
+        )
+        .map_err(|error| error.to_string())?;
+        validate_permission_principal_for_mutation(&value)?;
+        Ok(value)
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -1999,12 +2367,21 @@ impl DriveMcpServer {
     ) -> Result<String, String> {
         debug!(tool = "drive.files.list", "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_drive_corpora(params.corpora.as_deref(), params.drive_id.as_deref())?;
         let qs = build_query_string(&[
             ("pageSize", params.page_size.map(|n| n.to_string())),
             ("pageToken", params.page_token),
             ("q", params.q),
             ("orderBy", params.order_by),
             ("fields", params.fields),
+            ("corpora", params.corpora),
+            ("driveId", params.drive_id),
+            ("spaces", params.spaces),
+            (
+                "includeItemsFromAllDrives",
+                Some(params.include_items_from_all_drives.unwrap_or(true).to_string()),
+            ),
+            ("supportsAllDrives", Some("true".to_owned())),
         ]);
         let path = format!("files{qs}");
         let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent_id);
@@ -2013,7 +2390,7 @@ impl DriveMcpServer {
 
     #[tool(
         name = "drive.files.get",
-        description = "Get a file's metadata or content from Google Drive. Set alt='media' to download content."
+        description = "Get a file's metadata from Google Drive. Use drive.files.download for binary content."
     )]
     async fn files_get(
         &self,
@@ -2023,11 +2400,66 @@ impl DriveMcpServer {
         debug!(tool = "drive.files.get", file_id = %params.file_id, "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.file_id)?;
-        let qs = build_query_string(&[("fields", params.fields), ("alt", params.alt)]);
+        let qs = build_query_string(&[
+            ("fields", params.fields),
+            ("supportsAllDrives", Some("true".to_owned())),
+        ]);
         let encoded_file_id = urlencoding::encode(&params.file_id);
         let path = format!("files/{encoded_file_id}{qs}");
         let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "drive.files.download",
+        description = "Download a blob file as a bounded MCP embedded resource. Files above 16 MiB return a secretless agentsso CLI command."
+    )]
+    async fn files_download(
+        &self,
+        Parameters(params): Parameters<FileDownloadParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = match agent_id_from_parts(&parts) {
+            Ok(agent) => self.materialize(&params.file_id, None, None, agent).await,
+            Err(error) => Err(error.to_string()),
+        };
+        Ok(result.unwrap_or_else(|error| CallToolResult::error(vec![Content::text(error)])))
+    }
+
+    #[tool(
+        name = "drive.files.export",
+        description = "Export a Google Workspace file as a bounded MCP embedded resource."
+    )]
+    async fn files_export(
+        &self,
+        Parameters(params): Parameters<FileExportParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = match agent_id_from_parts(&parts) {
+            Ok(agent) => {
+                self.materialize(&params.file_id, Some(&params.mime_type), None, agent).await
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        Ok(result.unwrap_or_else(|error| CallToolResult::error(vec![Content::text(error)])))
+    }
+
+    #[tool(
+        name = "drive.revisions.download",
+        description = "Download a retained blob revision as a bounded MCP embedded resource."
+    )]
+    async fn revisions_download(
+        &self,
+        Parameters(params): Parameters<RevisionDownloadParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = match agent_id_from_parts(&parts) {
+            Ok(agent) => {
+                self.materialize(&params.file_id, None, Some(&params.revision_id), agent).await
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        Ok(result.unwrap_or_else(|error| CallToolResult::error(vec![Content::text(error)])))
     }
 
     #[tool(
@@ -2044,12 +2476,21 @@ impl DriveMcpServer {
         if params.q.trim().is_empty() {
             return Err("q must not be empty or whitespace-only — use drive.files.list for unfiltered listing".to_owned());
         }
+        validate_drive_corpora(params.corpora.as_deref(), params.drive_id.as_deref())?;
         let qs = build_query_string(&[
             ("q", Some(params.q)),
             ("pageSize", params.page_size.map(|n| n.to_string())),
             ("pageToken", params.page_token),
             ("orderBy", params.order_by),
             ("fields", params.fields),
+            ("corpora", params.corpora),
+            ("driveId", params.drive_id),
+            ("spaces", params.spaces),
+            (
+                "includeItemsFromAllDrives",
+                Some(params.include_items_from_all_drives.unwrap_or(true).to_string()),
+            ),
+            ("supportsAllDrives", Some("true".to_owned())),
         ]);
         let path = format!("files{qs}");
         let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent_id);
@@ -2071,7 +2512,10 @@ impl DriveMcpServer {
         reject_drive_create_content_fields(&params.file)?;
         let body =
             serde_json::to_vec(&params.file).map_err(|e| format!("invalid file JSON: {e}"))?;
-        let qs = build_query_string(&[("fields", params.fields)]);
+        let qs = build_query_string(&[
+            ("fields", params.fields),
+            ("supportsAllDrives", Some("true".to_owned())),
+        ]);
         let path = format!("files{qs}");
         let req =
             Self::drive_request(path, "drive.file", Method::POST, Bytes::from(body), agent_id);
@@ -2091,9 +2535,32 @@ impl DriveMcpServer {
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.file_id)?;
         coerce_and_validate_json_object_body(&mut params.file, "file")?;
+        // Older callers placed these query parameters inside the File JSON,
+        // which Google silently ignored. Lift them into the correct location
+        // and never forward them as metadata fields.
+        if let Some(object) = params.file.as_object_mut() {
+            if params.add_parents.is_none() {
+                params.add_parents =
+                    object.remove("addParents").and_then(|value| value.as_str().map(str::to_owned));
+            } else {
+                object.remove("addParents");
+            }
+            if params.remove_parents.is_none() {
+                params.remove_parents = object
+                    .remove("removeParents")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+            } else {
+                object.remove("removeParents");
+            }
+        }
         let body =
             serde_json::to_vec(&params.file).map_err(|e| format!("invalid file JSON: {e}"))?;
-        let qs = build_query_string(&[("fields", params.fields)]);
+        let qs = build_query_string(&[
+            ("fields", params.fields),
+            ("addParents", params.add_parents),
+            ("removeParents", params.remove_parents),
+            ("supportsAllDrives", Some("true".to_owned())),
+        ]);
         let encoded_file_id = urlencoding::encode(&params.file_id);
         let path = format!("files/{encoded_file_id}{qs}");
         let req =
@@ -2116,7 +2583,7 @@ impl DriveMcpServer {
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.file_id)?;
         let encoded_file_id = urlencoding::encode(&params.file_id);
-        let path = format!("files/{encoded_file_id}");
+        let path = format!("files/{encoded_file_id}?supportsAllDrives=true");
         let req = Self::drive_request(path, "drive.file", Method::DELETE, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
@@ -2143,11 +2610,377 @@ impl DriveMcpServer {
             }
             None => Bytes::new(),
         };
-        let qs = build_query_string(&[("fields", params.fields)]);
+        let qs = build_query_string(&[
+            ("fields", params.fields),
+            ("supportsAllDrives", Some("true".to_owned())),
+        ]);
         let encoded_file_id = urlencoding::encode(&params.file_id);
         let path = format!("files/{encoded_file_id}/copy{qs}");
         let req = Self::drive_request(path, "drive.file", Method::POST, body, agent_id);
         self.dispatch(req).await
+    }
+
+    #[tool(name = "drive.files.trash", description = "Move a Drive file to trash (reversible).")]
+    async fn files_trash(
+        &self,
+        Parameters(params): Parameters<FileDeleteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        self.set_trashed(params.file_id, true, parts).await
+    }
+
+    #[tool(name = "drive.files.restore", description = "Restore a Drive file from trash.")]
+    async fn files_restore(
+        &self,
+        Parameters(params): Parameters<FileDeleteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        self.set_trashed(params.file_id, false, parts).await
+    }
+
+    #[tool(
+        name = "drive.files.delete_permanently",
+        description = "PERMANENTLY delete a file. This is an explicit alias for the legacy drive.files.delete behavior and cannot be undone."
+    )]
+    async fn files_delete_permanently(
+        &self,
+        Parameters(params): Parameters<FileDeleteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        self.delete_file(params.file_id, parts).await
+    }
+
+    #[tool(name = "drive.drives.list", description = "List shared drives visible to the account.")]
+    async fn drives_list(
+        &self,
+        Parameters(params): Parameters<DrivesListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        let path = format!(
+            "drives{}",
+            build_query_string(&[
+                ("pageSize", params.page_size.map(|v| v.to_string())),
+                ("pageToken", params.page_token),
+                ("q", params.q),
+                ("fields", params.fields)
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(name = "drive.drives.get", description = "Get metadata for a shared drive.")]
+    async fn drives_get(
+        &self,
+        Parameters(params): Parameters<DriveGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.drive_id)?;
+        let path = format!(
+            "drives/{}{}",
+            urlencoding::encode(&params.drive_id),
+            build_query_string(&[("fields", params.fields)])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(
+        name = "drive.permissions.list",
+        description = "List permissions on a Drive file, including shared-drive files."
+    )]
+    async fn permissions_list(
+        &self,
+        Parameters(params): Parameters<FilePermissionListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        let path = format!(
+            "files/{}/permissions{}",
+            urlencoding::encode(&params.file_id),
+            build_query_string(&[
+                ("pageSize", params.page_size.map(|v| v.to_string())),
+                ("pageToken", params.page_token),
+                ("fields", params.fields),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(name = "drive.permissions.get", description = "Get one permission on a Drive file.")]
+    async fn permissions_get(
+        &self,
+        Parameters(params): Parameters<FilePermissionGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        validate_resource_id(&params.permission_id)?;
+        let path = format!(
+            "files/{}/permissions/{}{}",
+            urlencoding::encode(&params.file_id),
+            urlencoding::encode(&params.permission_id),
+            build_query_string(&[
+                ("fields", params.fields),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(
+        name = "drive.permissions.create",
+        description = "Share a file with one user or group as reader, commenter, or writer. Notifications default off. Requires a sharing-enabled full-control policy."
+    )]
+    async fn permissions_create(
+        &self,
+        Parameters(params): Parameters<FilePermissionCreateParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        if params.permission.email_address.trim().is_empty()
+            || !params.permission.email_address.contains('@')
+            || params.permission.email_address.chars().any(char::is_control)
+        {
+            return Err("permission email_address is invalid".to_owned());
+        }
+        let body =
+            Bytes::from(serde_json::to_vec(&params.permission).map_err(|error| error.to_string())?);
+        let path = format!(
+            "files/{}/permissions{}",
+            urlencoding::encode(&params.file_id),
+            build_query_string(&[
+                (
+                    "sendNotificationEmail",
+                    Some(params.send_notification_email.unwrap_or(false).to_string())
+                ),
+                ("fields", params.fields),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.share", Method::POST, body, agent)).await
+    }
+
+    #[tool(
+        name = "drive.permissions.update",
+        description = "Change a user/group permission role. Ownership transfer and public/domain grants are not supported."
+    )]
+    async fn permissions_update(
+        &self,
+        Parameters(params): Parameters<FilePermissionUpdateParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        validate_resource_id(&params.permission_id)?;
+        self.permission_for_mutation(&params.file_id, &params.permission_id, agent.clone()).await?;
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"role": params.role}))
+                .map_err(|error| error.to_string())?,
+        );
+        let path = format!(
+            "files/{}/permissions/{}{}",
+            urlencoding::encode(&params.file_id),
+            urlencoding::encode(&params.permission_id),
+            build_query_string(&[
+                ("fields", params.fields),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.share", Method::PATCH, body, agent)).await
+    }
+
+    #[tool(
+        name = "drive.permissions.delete",
+        description = "Delete a direct permission. Inherited shared-drive permissions are rejected."
+    )]
+    async fn permissions_delete(
+        &self,
+        Parameters(params): Parameters<FilePermissionDeleteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        validate_resource_id(&params.permission_id)?;
+        let base = format!(
+            "files/{}/permissions/{}",
+            urlencoding::encode(&params.file_id),
+            urlencoding::encode(&params.permission_id)
+        );
+        let value = self
+            .permission_for_mutation(&params.file_id, &params.permission_id, agent.clone())
+            .await?;
+        if permission_is_inherited(&value) {
+            return Err("inherited permissions cannot be deleted".to_owned());
+        }
+        self.dispatch(Self::drive_request(
+            format!("{base}?supportsAllDrives=true"),
+            "drive.share",
+            Method::DELETE,
+            Bytes::new(),
+            agent,
+        ))
+        .await
+    }
+
+    #[tool(
+        name = "drive.revisions.list",
+        description = "List revisions for a Drive file. Google may return incomplete history."
+    )]
+    async fn revisions_list(
+        &self,
+        Parameters(params): Parameters<RevisionsListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        let path = format!(
+            "files/{}/revisions{}",
+            urlencoding::encode(&params.file_id),
+            build_query_string(&[
+                ("pageSize", params.page_size.map(|v| v.to_string())),
+                ("pageToken", params.page_token),
+                ("fields", params.fields),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(name = "drive.revisions.get", description = "Get revision metadata.")]
+    async fn revisions_get(
+        &self,
+        Parameters(params): Parameters<RevisionGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        validate_resource_id(&params.revision_id)?;
+        let path = format!(
+            "files/{}/revisions/{}{}",
+            urlencoding::encode(&params.file_id),
+            urlencoding::encode(&params.revision_id),
+            build_query_string(&[
+                ("fields", params.fields),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(
+        name = "drive.revisions.update",
+        description = "Set keepForever on a retained blob revision. Drive permits at most 200 pinned revisions."
+    )]
+    async fn revisions_update(
+        &self,
+        Parameters(params): Parameters<RevisionUpdateParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        validate_resource_id(&params.revision_id)?;
+        let path = format!(
+            "files/{}/revisions/{}{}",
+            urlencoding::encode(&params.file_id),
+            urlencoding::encode(&params.revision_id),
+            build_query_string(&[
+                ("fields", params.fields),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"keepForever": params.keep_forever}))
+                .map_err(|error| error.to_string())?,
+        );
+        self.dispatch(Self::drive_request(path, "drive.full", Method::PATCH, body, agent)).await
+    }
+
+    #[tool(
+        name = "drive.revisions.delete",
+        description = "Delete a retained non-head blob revision. This cannot delete Workspace or head revisions."
+    )]
+    async fn revisions_delete(
+        &self,
+        Parameters(params): Parameters<RevisionDeleteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        validate_resource_id(&params.revision_id)?;
+        let path = format!(
+            "files/{}/revisions/{}?supportsAllDrives=true",
+            urlencoding::encode(&params.file_id),
+            urlencoding::encode(&params.revision_id)
+        );
+        self.dispatch(Self::drive_request(path, "drive.full", Method::DELETE, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(
+        name = "drive.changes.getStartPageToken",
+        description = "Get a starting page token for Drive change listing."
+    )]
+    async fn changes_start_token(
+        &self,
+        Parameters(params): Parameters<ChangesStartTokenParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        if let Some(drive_id) = params.drive_id.as_deref() {
+            validate_resource_id(drive_id)?;
+        }
+        let path = format!(
+            "changes/startPageToken{}",
+            build_query_string(&[
+                ("driveId", params.drive_id),
+                ("supportsAllDrives", Some("true".to_owned()))
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
+    }
+
+    #[tool(
+        name = "drive.changes.list",
+        description = "List Drive changes from a page token, including shared-drive changes."
+    )]
+    async fn changes_list(
+        &self,
+        Parameters(params): Parameters<ChangesListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        if params.page_token.trim().is_empty() {
+            return Err("page_token is required".to_owned());
+        }
+        let agent = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        if let Some(drive_id) = params.drive_id.as_deref() {
+            validate_resource_id(drive_id)?;
+        }
+        let path = format!(
+            "changes{}",
+            build_query_string(&[
+                ("pageToken", Some(params.page_token)),
+                ("pageSize", params.page_size.map(|v| v.to_string())),
+                ("driveId", params.drive_id),
+                ("spaces", params.spaces),
+                ("includeRemoved", params.include_removed.map(|v| v.to_string())),
+                ("includeItemsFromAllDrives", Some("true".to_owned())),
+                ("supportsAllDrives", Some("true".to_owned())),
+                ("fields", params.fields)
+            ])
+        );
+        self.dispatch(Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent))
+            .await
     }
 
     #[tool(
@@ -2881,12 +3714,66 @@ mod tests {
     /// the registered tool set.
     /// Gmail: 5 original + 6 (9.1) + 15 (9.2) = 26.
     /// Calendar: 5 original + 7 (9.3) = 12.
-    /// Drive: 5 original + 3 (9.3) = 8.
+    /// Drive: complete document lifecycle = 27.
     #[test]
     fn epic9_tool_counts_are_exact() {
         assert_eq!(GmailMcpServer::tool_router().map.len(), 26, "Gmail tool count");
         assert_eq!(CalendarMcpServer::tool_router().map.len(), 12, "Calendar tool count");
-        assert_eq!(DriveMcpServer::tool_router().map.len(), 8, "Drive tool count");
+        assert_eq!(DriveMcpServer::tool_router().map.len(), 27, "Drive tool count");
+    }
+
+    #[test]
+    fn drive_rust_and_connector_tool_catalogs_are_equal() {
+        let registry = permitlayer_connectors::ConnectorRegistry::load(None).unwrap();
+        let connector = registry.get("google-drive").unwrap();
+        let declared: std::collections::BTreeSet<_> =
+            connector.def.tools.iter().map(|tool| tool.name.as_str()).collect();
+        let router = DriveMcpServer::tool_router();
+        let implemented: std::collections::BTreeSet<_> =
+            router.map.keys().map(|name| name.as_ref()).collect();
+        assert_eq!(declared, implemented);
+    }
+
+    #[test]
+    fn drive_corpora_validation_requires_drive_id() {
+        assert!(validate_drive_corpora(Some("drive"), None).is_err());
+        assert!(validate_drive_corpora(Some("drive"), Some("shared-drive-id")).is_ok());
+        assert!(validate_drive_corpora(Some("invalid"), None).is_err());
+        assert!(validate_drive_corpora(None, Some("shared-drive-id")).is_err());
+    }
+
+    #[test]
+    fn oversized_drive_materialization_commands_match_operation() {
+        assert_eq!(
+            drive_transfer_cli_command("file", None, None),
+            "agentsso drive download file --output <path>"
+        );
+        assert_eq!(
+            drive_transfer_cli_command("file", Some("application/pdf"), None),
+            "agentsso drive export file --mime-type 'application/pdf' --output <path>"
+        );
+        assert_eq!(
+            drive_transfer_cli_command("file", None, Some("revision")),
+            "agentsso drive revision-download file revision --output <path>"
+        );
+    }
+
+    #[test]
+    fn permission_mutation_rejects_public_domain_and_late_inheritance() {
+        for principal_type in ["anyone", "domain"] {
+            assert!(
+                validate_permission_principal_for_mutation(
+                    &serde_json::json!({"type": principal_type})
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_permission_principal_for_mutation(&serde_json::json!({"type":"user"})).is_ok()
+        );
+        assert!(permission_is_inherited(&serde_json::json!({
+            "permissionDetails": [{"inherited": false}, {"inherited": true}]
+        })));
     }
 
     // ---- Story 11.4: generic connector dispatch resolver ----

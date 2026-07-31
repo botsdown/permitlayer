@@ -14,7 +14,9 @@ use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
 use permitlayer_credential::{ConnectionId, OAuthToken, SealedCredential, Slot};
 use permitlayer_proxy::error::ProxyError;
 use permitlayer_proxy::request::ProxyRequest;
-use permitlayer_proxy::service::{DriveUploadChunkResult, DriveUploadStart, ProxyService};
+use permitlayer_proxy::service::{
+    DriveTransferStart, DriveUploadChunkResult, DriveUploadStart, ProxyService,
+};
 use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
@@ -745,12 +747,14 @@ async fn drive_resumable_upload_reconciles_ambiguous_chunk_failure() {
             "agent-integration-test".to_owned(),
             "drive".to_owned(),
             ulid::Ulid::new().to_string(),
+            false,
             DriveUploadStart {
                 name: "folio.pdf".to_owned(),
                 mime_type: "application/pdf".to_owned(),
                 size_bytes: 3,
                 parent_id: Some("receipts-folder".to_owned()),
                 idempotency_key: Some("upload-key".to_owned()),
+                replace_file_id: None,
             },
         )
         .await
@@ -761,6 +765,7 @@ async fn drive_resumable_upload_reconciles_ambiguous_chunk_failure() {
             "drive".to_owned(),
             ulid::Ulid::new().to_string(),
             &started.upload_id,
+            false,
             "bytes 0-2/3",
             Bytes::from_static(b"pdf"),
         )
@@ -777,6 +782,121 @@ async fn drive_resumable_upload_reconciles_ambiguous_chunk_failure() {
     initiate.assert_async().await;
     ambiguous_put.assert_async().await;
     status_probe.assert_async().await;
+}
+
+#[tokio::test]
+async fn drive_revision_transfer_uses_revision_integrity_metadata() {
+    let mut server = mockito::Server::new_async().await;
+    let _file = server
+        .mock("GET", "/files/file-id")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"file-id","name":"book.xlsx","mimeType":"application/octet-stream","size":"99","md5Checksum":"head-md5","version":"7","capabilities":{"canDownload":true}}"#)
+        .create_async()
+        .await;
+    let _revision = server
+        .mock("GET", "/files/file-id/revisions/rev-id")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"rev-id","mimeType":"application/octet-stream","size":"3","md5Checksum":"revision-md5","modifiedTime":"2026-07-01T00:00:00Z","keepForever":true}"#)
+        .create_async()
+        .await;
+    let url = format!("{}/", server.url());
+    let (service, _) = build_service_multi(&[("drive", &url, b"drive-token")]).await;
+    let info = service
+        .drive_transfer_start(
+            "agent-integration-test".to_owned(),
+            "drive".to_owned(),
+            ulid::Ulid::new().to_string(),
+            DriveTransferStart::Revision {
+                file_id: "file-id".to_owned(),
+                revision_id: "rev-id".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.size_bytes, Some(3));
+    assert_eq!(info.md5_checksum.as_deref(), Some("revision-md5"));
+}
+
+#[tokio::test]
+async fn drive_transfer_rejects_mismatched_content_range() {
+    let mut server = mockito::Server::new_async().await;
+    let _file = server
+        .mock("GET", "/files/file-id")
+        .match_query(mockito::Matcher::Regex("^supportsAllDrives=true&fields=.*".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"file-id","name":"book.xlsx","mimeType":"application/octet-stream","size":"8","md5Checksum":"md5","version":"7","capabilities":{"canDownload":true}}"#)
+        .create_async()
+        .await;
+    let _content = server
+        .mock("GET", "/files/file-id")
+        .match_query(mockito::Matcher::Regex(".*alt=media.*".to_owned()))
+        .with_status(206)
+        .with_header("content-range", "bytes 5-7/8")
+        .with_body("abc")
+        .create_async()
+        .await;
+    let url = format!("{}/", server.url());
+    let (service, _) = build_service_multi(&[("drive", &url, b"drive-token")]).await;
+    let info = service
+        .drive_transfer_start(
+            "agent-integration-test".to_owned(),
+            "drive".to_owned(),
+            ulid::Ulid::new().to_string(),
+            DriveTransferStart::Blob { file_id: "file-id".to_owned() },
+        )
+        .await
+        .unwrap();
+    let error = service
+        .drive_transfer_chunk(
+            "agent-integration-test",
+            "drive",
+            ulid::Ulid::new().to_string(),
+            &info.transfer_id,
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("non-contiguous"));
+}
+
+#[tokio::test]
+async fn google_vids_transfer_starts_with_long_running_download() {
+    let mut server = mockito::Server::new_async().await;
+    let _file = server
+        .mock("GET", "/files/vid-id")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"vid-id","name":"clip","mimeType":"application/vnd.google-apps.vid","version":"2","capabilities":{"canDownload":true}}"#)
+        .create_async()
+        .await;
+    let _lro = server
+        .mock("POST", "/files/vid-id/download")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"done":true,"response":{"downloadUri":"https://drive.usercontent.google.com/download?id=opaque"}}"#)
+        .create_async()
+        .await;
+    let url = format!("{}/", server.url());
+    let (service, _) = build_service_multi(&[("drive", &url, b"drive-token")]).await;
+    let info = service
+        .drive_transfer_start(
+            "agent-integration-test".to_owned(),
+            "drive".to_owned(),
+            ulid::Ulid::new().to_string(),
+            DriveTransferStart::Blob { file_id: "vid-id".to_owned() },
+        )
+        .await
+        .unwrap();
+    assert!(!info.resumable);
+    assert_eq!(info.mime_type, "video/mp4");
+    assert_eq!(info.size_bytes, None);
 }
 
 #[tokio::test]

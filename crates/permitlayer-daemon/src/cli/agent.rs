@@ -87,6 +87,10 @@ pub struct LocalAccessGrantArgs {
     /// macOS account authenticated by LOCAL_PEERCRED.
     #[arg(long)]
     pub user: String,
+    /// Fixed-function operation to allow. Repeat to grant multiple. Existing
+    /// installations default to upload-only.
+    #[arg(long = "capability", value_parser = ["drive-upload", "drive-download", "drive-replace"])]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Args)]
@@ -177,6 +181,7 @@ async fn local_access(args: LocalAccessArgs) -> Result<()> {
             let request = crate::cli::connect_uds::GrantLocalAccessRequest {
                 agent: &args.agent,
                 user: &args.user,
+                capabilities: &args.capabilities,
             };
             match crate::cli::connect_uds::post_grant_local_access(&handle, &request).await? {
                 crate::cli::connect_uds::ControlOutcome::Ok(response) => {
@@ -185,6 +190,16 @@ async fn local_access(args: LocalAccessArgs) -> Result<()> {
                     println!(
                         "✓ local access granted: macOS user '{}' (uid {}) → agent '{}'",
                         response.grant.username_at_grant, response.grant.uid, response.grant.agent
+                    );
+                    println!(
+                        "  capabilities: {}",
+                        response
+                            .grant
+                            .capabilities
+                            .iter()
+                            .map(|capability| capability.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                     Ok(())
                 }
@@ -197,13 +212,19 @@ async fn local_access(args: LocalAccessArgs) -> Result<()> {
                     if response.grants.is_empty() {
                         println!("No local access grants.");
                     } else {
-                        println!("USER\tUID\tAGENT\tGRANTED");
+                        println!("USER\tUID\tAGENT\tCAPABILITIES\tGRANTED");
                         for grant in response.grants {
                             println!(
-                                "{}\t{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}",
                                 grant.username_at_grant,
                                 grant.uid,
                                 grant.agent,
+                                grant
+                                    .capabilities
+                                    .iter()
+                                    .map(|capability| capability.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(","),
                                 grant.granted_at.to_rfc3339()
                             );
                         }

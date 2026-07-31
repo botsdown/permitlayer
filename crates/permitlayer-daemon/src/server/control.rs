@@ -2457,6 +2457,7 @@ pub(crate) async fn credentials_seal_handler(
     let tier = match payload.tier.as_str() {
         "read" => permitlayer_core::store::connection::ConnectionTier::Read,
         "read-write" => permitlayer_core::store::connection::ConnectionTier::ReadWrite,
+        "full-control" => permitlayer_core::store::connection::ConnectionTier::FullControl,
         other => {
             emit_seal_denied_audit(
                 &state,
@@ -2470,11 +2471,23 @@ pub(crate) async fn credentials_seal_handler(
             return agent_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "credentials.bad_request",
-                format!("tier {other:?} is not one of \"read\" | \"read-write\""),
+                format!(
+                    "tier {other:?} is not one of \"read\" | \"read-write\" | \"full-control\""
+                ),
                 Some(request_id),
             );
         }
     };
+    if tier == permitlayer_core::store::connection::ConnectionTier::FullControl
+        && payload.connector_id != "google-drive"
+    {
+        return agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials.bad_request",
+            "full-control is only supported for Google Drive".to_owned(),
+            Some(request_id),
+        );
+    }
 
     // Per-connection seal lock (re-keyed from `service` to the connection
     // id text in Story 11.12). Same-connection seals serialize; disjoint
@@ -2538,9 +2551,9 @@ pub(crate) async fn credentials_seal_handler(
         }
     };
 
-    let credential_exists =
+    let existing_record =
         match permitlayer_core::store::ConnectionStore::get(&connection_store, connection).await {
-            Ok(rec) => rec.is_some(),
+            Ok(record) => record,
             Err(e) => {
                 emit_seal_denied_audit(
                     &state,
@@ -2559,6 +2572,21 @@ pub(crate) async fn credentials_seal_handler(
                 );
             }
         };
+    let credential_exists = existing_record.is_some();
+
+    if matches!(payload.if_exists, SealIfExists::Replace)
+        && existing_record.as_ref().is_some_and(|record| {
+            (record.tier == permitlayer_core::store::connection::ConnectionTier::FullControl)
+                != (tier == permitlayer_core::store::connection::ConnectionTier::FullControl)
+        })
+    {
+        return agent_error_response(
+            StatusCode::CONFLICT,
+            "credentials.full_control_requires_new_connection",
+            "a connection cannot be promoted to or demoted from full-control in place; create a new Drive connection".to_owned(),
+            Some(request_id),
+        );
+    }
 
     match (payload.if_exists, credential_exists) {
         (SealIfExists::Error, true) => {
@@ -3744,11 +3772,14 @@ pub(crate) async fn bind_agent_handler(
     let tier = match payload.tier.as_str() {
         "read" => permitlayer_core::store::connection::ConnectionTier::Read,
         "read-write" => permitlayer_core::store::connection::ConnectionTier::ReadWrite,
+        "full-control" => permitlayer_core::store::connection::ConnectionTier::FullControl,
         other => {
             return agent_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "binding.bad_request",
-                format!("tier {other:?} is not one of \"read\" | \"read-write\""),
+                format!(
+                    "tier {other:?} is not one of \"read\" | \"read-write\" | \"full-control\""
+                ),
                 Some(request_id),
             );
         }
@@ -3841,11 +3872,35 @@ pub(crate) async fn bind_agent_handler(
             }
         };
 
+    if (tier == permitlayer_core::store::connection::ConnectionTier::FullControl)
+        != (connection_record.tier
+            == permitlayer_core::store::connection::ConnectionTier::FullControl)
+    {
+        return agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "binding.tier_mismatch",
+            "full-control connections must be bound at full-control, and full-control bindings require a full-control connection".to_owned(),
+            Some(request_id),
+        );
+    }
+
+    if tier == permitlayer_core::store::connection::ConnectionTier::FullControl
+        && payload.policy.is_none()
+    {
+        return agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "binding.full_control_policy_required",
+            "full-control bindings require an explicit policy that allows drive.full and drive.share".to_owned(),
+            Some(request_id),
+        );
+    }
+
     // 3. If a policy was named, it MUST exist in the live PolicySet
     //    (authoritative — the binding store is policy-agnostic).
     if let Some(policy) = payload.policy.as_deref() {
         let snapshot = state.policy_set.load();
-        if snapshot.get(policy).is_none() {
+        let compiled = snapshot.get(policy);
+        if compiled.is_none() {
             let known = snapshot.policy_names();
             let known_str =
                 if known.is_empty() { "(none registered)".to_owned() } else { known.join(", ") };
@@ -3853,6 +3908,21 @@ pub(crate) async fn bind_agent_handler(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "binding.unknown_policy",
                 format!("policy '{policy}' not found. Known policies: {known_str}"),
+                Some(request_id),
+            );
+        }
+        if tier == permitlayer_core::store::connection::ConnectionTier::FullControl
+            && compiled.is_some_and(|compiled| {
+                !compiled.scope_allowlist.contains("drive.full")
+                    || !compiled.scope_allowlist.contains("drive.share")
+            })
+        {
+            return agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "binding.full_control_policy_insufficient",
+                format!(
+                    "policy '{policy}' must explicitly allow drive.full and drive.share for a full-control binding"
+                ),
                 Some(request_id),
             );
         }
@@ -4391,6 +4461,7 @@ pub(crate) async fn agent_bindings_handler(
         let tier = match b.tier {
             ConnectionTier::Read => "read",
             ConnectionTier::ReadWrite => "read-write",
+            ConnectionTier::FullControl => "full-control",
         };
         rows.push(AgentBindingRow {
             connection_id: b.connection_id.to_string(),
@@ -5938,6 +6009,8 @@ pub(crate) async fn connectors_handler(
 struct GrantLocalAccessRequest {
     agent: String,
     user: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6013,8 +6086,7 @@ async fn grant_local_access_handler(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let GrantLocalAccessRequest { agent, user } = payload;
-        let _ = (state, peer, agent, user);
+        let _ = (state, peer, payload.agent, payload.user, payload.capabilities);
         local_access_error(
             StatusCode::NOT_IMPLEMENTED,
             "local_access.unsupported_platform",
@@ -6023,7 +6095,28 @@ async fn grant_local_access_handler(
     }
     #[cfg(target_os = "macos")]
     {
-        if permitlayer_core::agent::validate_agent_name(&payload.agent).is_err() {
+        let GrantLocalAccessRequest { agent, user, capabilities } = payload;
+        let capability_names =
+            if capabilities.is_empty() { vec!["drive-upload".to_owned()] } else { capabilities };
+        let mut requested_capabilities = Vec::new();
+        for capability in capability_names {
+            let parsed = match capability.as_str() {
+                "drive-upload" => permitlayer_core::store::LocalCapability::DriveUpload,
+                "drive-download" => permitlayer_core::store::LocalCapability::DriveDownload,
+                "drive-replace" => permitlayer_core::store::LocalCapability::DriveReplace,
+                _ => {
+                    return local_access_error(
+                        StatusCode::BAD_REQUEST,
+                        "local_access.invalid_capability",
+                        "capability must be drive-upload, drive-download, or drive-replace",
+                    );
+                }
+            };
+            if !requested_capabilities.contains(&parsed) {
+                requested_capabilities.push(parsed);
+            }
+        }
+        if permitlayer_core::agent::validate_agent_name(&agent).is_err() {
             return local_access_error(
                 StatusCode::BAD_REQUEST,
                 "local_access.invalid_agent",
@@ -6037,13 +6130,13 @@ async fn grant_local_access_handler(
                 "agent store is unavailable",
             );
         };
-        match agent_store.get(&payload.agent).await {
+        match agent_store.get(&agent).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return local_access_error(
                     StatusCode::NOT_FOUND,
                     "local_access.agent_not_found",
-                    format!("agent '{}' is not registered", payload.agent),
+                    format!("agent '{}' is not registered", agent),
                 );
             }
             Err(error) => {
@@ -6054,7 +6147,7 @@ async fn grant_local_access_handler(
                 );
             }
         }
-        let (uid, canonical_username) = match resolve_macos_user(&payload.user) {
+        let (uid, canonical_username) = match resolve_macos_user(&user) {
             Ok(user) => user,
             Err(message) => {
                 return local_access_error(
@@ -6073,12 +6166,30 @@ async fn grant_local_access_handler(
         };
         match store.get(uid).await {
             Ok(Some(existing))
-                if existing.agent == payload.agent
-                    && existing.username_at_grant == canonical_username =>
+                if existing.agent == agent && existing.username_at_grant == canonical_username =>
             {
+                let mut updated = existing;
+                let before = updated.capabilities.clone();
+                for capability in requested_capabilities {
+                    if !updated.capabilities.contains(&capability) {
+                        updated.capabilities.push(capability);
+                    }
+                }
+                updated.capabilities.sort_unstable();
+                updated.schema_version =
+                    permitlayer_core::store::local_principal::LOCAL_PRINCIPAL_SCHEMA_VERSION;
+                if updated.capabilities != before
+                    && let Err(error) = store.replace(updated.clone()).await
+                {
+                    return local_access_error(
+                        StatusCode::CONFLICT,
+                        "local_access.grant_failed",
+                        error.to_string(),
+                    );
+                }
                 return (
                     StatusCode::OK,
-                    Json(serde_json::json!({ "status": "ok", "grant": existing })),
+                    Json(serde_json::json!({ "status": "ok", "grant": updated })),
                 )
                     .into_response();
             }
@@ -6115,7 +6226,8 @@ async fn grant_local_access_handler(
             platform: "macos".to_owned(),
             uid,
             username_at_grant: canonical_username.clone(),
-            agent: payload.agent.clone(),
+            agent: agent.clone(),
+            capabilities: requested_capabilities,
             granted_at: chrono::Utc::now(),
             granted_by_peer_uid: peer_creds.map(|creds| creds.uid),
         };

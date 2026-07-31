@@ -38,7 +38,12 @@ use crate::response::ProxyResponse;
 use crate::token::ScopedTokenIssuer;
 use crate::upstream::UpstreamClient;
 
+mod drive_transfer;
 mod drive_upload;
+pub use drive_transfer::{
+    DRIVE_TRANSFER_CHUNK_BYTES, DRIVE_TRANSFER_MAX_BYTES, DriveTransferChunk, DriveTransferError,
+    DriveTransferSessionInfo, DriveTransferStart,
+};
 pub use drive_upload::{
     DriveUploadChunkResult, DriveUploadError, DriveUploadSessionInfo, DriveUploadStart,
     DriveUploadStatus,
@@ -151,6 +156,7 @@ pub struct ProxyService {
     /// Google session URIs never leave this process and are discarded on
     /// daemon restart or after the inactivity deadline.
     drive_uploads: drive_upload::DriveUploadSessions,
+    drive_transfers: drive_transfer::DriveTransferSessions,
 }
 
 impl ProxyService {
@@ -186,6 +192,7 @@ impl ProxyService {
             binding_store: None,
             connection_store: None,
             drive_uploads: drive_upload::DriveUploadSessions::default(),
+            drive_transfers: drive_transfer::DriveTransferSessions::default(),
         }
     }
 
@@ -324,7 +331,22 @@ impl ProxyService {
         let tier_name = match binding.tier {
             ConnectionTier::Read => "read",
             ConnectionTier::ReadWrite => "read-write",
+            ConnectionTier::FullControl => "full-control",
         };
+
+        // A full-control token is a separate trust boundary. Never route a
+        // narrow binding through it, nor a full binding through a narrow
+        // connection, even when Google's scope implication would allow the
+        // immediate API call.
+        if (binding.tier == ConnectionTier::FullControl)
+            != (connection.tier == ConnectionTier::FullControl)
+        {
+            return Err(ProxyError::TierDenied {
+                connection: connection.id.to_string(),
+                tier: tier_name.to_owned(),
+                required_scope: required_scope.to_owned(),
+            });
+        }
         let tier_bundle =
             connector.def.tiers.get(tier_name).ok_or_else(|| ProxyError::Internal {
                 message: format!(
@@ -352,7 +374,14 @@ impl ProxyService {
                 required_scope: required_scope.to_owned(),
             }
         })?;
-        if !connection.granted_scopes.iter().any(|g| g == required_uri) {
+        let full_drive_uri = "https://www.googleapis.com/auth/drive";
+        let full_implies_required = connection.tier == ConnectionTier::FullControl
+            && connection.granted_scopes.iter().any(|g| g == full_drive_uri)
+            && matches!(
+                required_scope,
+                "drive.full" | "drive.share" | "drive.readonly" | "drive.file"
+            );
+        if !full_implies_required && !connection.granted_scopes.iter().any(|g| g == required_uri) {
             return Err(ProxyError::ScopeNotGranted {
                 connection: connection.id.to_string(),
                 required_scope: required_scope.to_owned(),
@@ -470,6 +499,7 @@ impl ProxyService {
             binding_store: None,
             connection_store: None,
             drive_uploads: drive_upload::DriveUploadSessions::default(),
+            drive_transfers: drive_transfer::DriveTransferSessions::default(),
         }
     }
 
@@ -845,7 +875,7 @@ impl ProxyService {
     /// solely for the upstream `Authorization: Bearer` header and is NEVER
     /// returned to the agent.
     pub async fn handle(&self, req: ProxyRequest) -> Result<ProxyResponse, ProxyError> {
-        self.handle_inner(req, true).await
+        self.handle_inner(req, true, None).await
     }
 
     /// Like [`Self::handle`] but returns the upstream body **un-scrubbed**.
@@ -859,7 +889,17 @@ impl ProxyService {
     /// skipped. Used by the Gmail attachment-fetch path (`attachments.get`),
     /// which decodes the returned base64 itself.
     pub async fn fetch_raw(&self, req: ProxyRequest) -> Result<ProxyResponse, ProxyError> {
-        self.handle_inner(req, false).await
+        self.handle_inner(req, false, None).await
+    }
+
+    /// Return an un-scrubbed upstream response while enforcing a caller-owned
+    /// byte ceiling during network reads, before the complete body is buffered.
+    pub async fn fetch_raw_bounded(
+        &self,
+        req: ProxyRequest,
+        max_body: usize,
+    ) -> Result<ProxyResponse, ProxyError> {
+        self.handle_inner(req, false, Some(max_body)).await
     }
 
     /// Shared request pipeline for [`Self::handle`] (scrubbed) and
@@ -870,6 +910,7 @@ impl ProxyService {
         &self,
         req: ProxyRequest,
         scrub_response: bool,
+        raw_body_limit: Option<usize>,
     ) -> Result<ProxyResponse, ProxyError> {
         // 0. Resolve the connection id from the agent's binding and run the
         // Story 11.10 default-deny authz gate (tier ∩ granted_scopes). In
@@ -1021,7 +1062,9 @@ impl ProxyService {
         // 4. Dispatch upstream. The attachment-fetch path (`!scrub_response`)
         // uses a larger body cap since a single attachment's base64 can
         // exceed the 10 MiB JSON ceiling.
-        let max_body = if scrub_response {
+        let max_body = if let Some(limit) = raw_body_limit {
+            limit
+        } else if scrub_response {
             crate::upstream::MAX_RESPONSE_BODY
         } else {
             crate::upstream::MAX_ATTACHMENT_BODY

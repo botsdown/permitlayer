@@ -218,6 +218,21 @@ id = "allow-drive-writes"
 scopes = ["drive.file"]
 action = "allow"
 
+# Restricted-scope policy for explicit arbitrary-file and sharing authority.
+# Merely creating a full-control connection does not grant an agent this
+# policy; the operator must name it on the full-control binding.
+[[policies]]
+name = "drive-sharing-full-control"
+scopes = ["drive.readonly", "drive.file", "drive.full", "drive.share"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+[[policies.rules]]
+id = "allow-drive-full-control"
+scopes = ["drive.readonly", "drive.file", "drive.full", "drive.share"]
+action = "allow"
+
 # -----------------------------------------------------------------
 # Policy: gmail-read-only-tier
 #

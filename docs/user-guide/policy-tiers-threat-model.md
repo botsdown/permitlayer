@@ -22,6 +22,10 @@ the specific request at the terminal prompt**:
   to files the app created or opened — it cannot touch arbitrary Drive
   content — but `drive.files.delete` bypasses the trash and is **not
   reversible**.
+  The separate `drive-sharing-full-control` policy can modify arbitrary
+  existing files and direct user/group permissions. It must be paired with a
+  separately created full-control connection and binding; public/domain
+  sharing and ownership transfer remain unavailable.
 
 Every one of those write operations surfaces an approval prompt
 (`y` / `n` / `a` / `never`; ENTER = deny; timeout → HTTP 403

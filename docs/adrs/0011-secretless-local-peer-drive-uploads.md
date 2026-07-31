@@ -34,6 +34,10 @@ the same `AgentId` used by bearer authentication and then converges on the
 shared kill-switch, connection-tracking, binding-policy, and audit stack. The
 Drive service retains its authoritative binding tier and granted-scope gates.
 
+ADR-0012 supersedes the upload-only route restriction with explicit
+`drive-upload`, `drive-download`, and `drive-replace` capabilities. Existing
+version-1 grants deserialize as upload-only and gain no authority.
+
 The unprivileged CLI opens and hashes the caller file and sends bounded bytes
 over HTTP/1.1 on its effective UID's socket. The root daemon never opens a
 caller-supplied path. The macOS CLI contains no implicit bearer fallback and

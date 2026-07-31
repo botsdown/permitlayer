@@ -150,6 +150,9 @@ semver = { workspace = true }
 # Per 7.25 AC #11 + Task 8.1.
 permitlayer-platform-macos.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 # Story 7.6b round-2 review: rotation-state marker file uses
