@@ -26,6 +26,14 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.4.1] - 2026-07-31 — `agentsso` binary
+
+### Fixed
+
+- Restored Windows release builds by isolating the `ReplaceFileW` FFI behind
+  a safe platform-crate API, preserving atomic Drive download replacement
+  without violating the daemon's `unsafe_code` prohibition.
+
 ## [1.4.0] - 2026-07-31 — `agentsso` binary
 
 ### Added
