@@ -152,11 +152,18 @@ use the unprivileged streaming helper rather than the metadata-only
 `drive.files.create` MCP tool:
 
 ```sh
+# One-time operator action on a macOS system-service installation:
+sudo agentsso agent local-access grant <agent> --user <macos-user>
+
+# Run as the granted user (including from Hermes):
 agentsso drive upload ./receipt.pdf --parent <drive-folder-id>
 ```
 
 The helper reads the file as the invoking user, sends policy-checked 8 MiB
-chunks through the daemon, and verifies Drive's returned size and MD5.
+chunks through the daemon, and verifies Drive's returned size and MD5. On
+macOS it authenticates with the kernel-attested UID over a private per-user
+socket; it does not read or receive a PermitLayer bearer token. Do not create
+`~/.agentsso/agent-bearer.token` for a shell-capable agent to enable uploads.
 
 ### Connect over SSH or under `su`
 

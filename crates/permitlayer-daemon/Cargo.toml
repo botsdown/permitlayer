@@ -127,6 +127,9 @@ urlencoding.workspace = true
 hmac.workspace = true
 zeroize.workspace = true
 reqwest.workspace = true
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
 url.workspace = true
 notify.workspace = true
 csv.workspace = true
@@ -166,7 +169,6 @@ serde_json.workspace = true
 [dev-dependencies]
 rmcp = { version = "=1.4.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 insta = { workspace = true }
-http-body-util.workspace = true
 # Needed by the `FailingAuditStore` test fixture in `server::control::tests`
 # to impl the `AuditStore` trait (which is defined via `#[async_trait]`).
 async-trait.workspace = true

@@ -26,6 +26,40 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.3.4] - 2026-07-31 — `agentsso` binary
+
+Security patch release. Adds secretless, kernel-authenticated local Drive
+uploads for the macOS root-LaunchDaemon deployment. Workspace / binary bump
+1.3.3 → 1.3.4; plugin host-API surface unchanged (still `1.0.0-rc.1`).
+
+### Added
+
+- **Per-user upload-only sockets.** An operator can map a macOS account to one
+  existing PermitLayer agent with `sudo agentsso agent local-access grant
+  <agent> --user <user>`. The daemon creates a mode-0600
+  `/var/run/permitlayer/agent-<uid>.sock`, verifies `LOCAL_PEERCRED` on every
+  request, and exposes only Drive upload start/chunk/status/cancel routes.
+- **Root-owned local-principal grants.** Grant/list/revoke operations are
+  atomic and audited. UID conflicts, root/system accounts, username drift,
+  missing agents, unsafe socket paths, and peer mismatches fail closed.
+- **Peer-attributed upload audit events.** Local upload authentication and
+  denial records carry the PermitLayer agent, kernel UID/GID, connection
+  selector, method, and request path without file bytes or local paths.
+- **Local-access diagnostics.** `sudo agentsso doctor` checks grant username
+  stability plus each socket's existence, type, owner, and mode.
+
+### Changed
+
+- **macOS Drive uploads no longer read agent bearer files.** `agentsso drive
+  upload`, `upload-status`, and `upload-cancel` use HTTP over the current
+  user's dedicated Unix socket. There is no automatic bearer fallback and no
+  `--token-file` option on macOS. Linux and Windows retain the legacy
+  authenticated TCP transport.
+- **Authorization is unchanged after authentication.** Peer-authenticated
+  requests converge on the normal `AgentId` chain and still enforce the global
+  kill switch, connection binding/tier, `drive.file`, binding policy,
+  concurrency, expiry, integrity, and audit controls.
+
 ## [1.3.3] - 2026-07-30 — `agentsso` binary
 
 Patch release. Adds policy-checked binary uploads to Google Drive and an

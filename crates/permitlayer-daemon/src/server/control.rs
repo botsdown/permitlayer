@@ -111,6 +111,8 @@ pub(crate) struct ControlState {
     /// directory cannot be created/read; the register/remove handlers
     /// return 503 in that case.
     pub agent_store: Option<Arc<dyn AgentIdentityStore>>,
+    /// Root-private mappings from kernel OS users to PermitLayer agents.
+    pub local_principal_store: Option<Arc<dyn permitlayer_core::store::LocalPrincipalStore>>,
     /// Story 4.4: HMAC subkey for bearer-token lookup. Zero placeholder
     /// when the master key is unavailable; the register handler refuses
     /// to mint tokens against a placeholder (otherwise the resulting
@@ -5929,6 +5931,305 @@ pub(crate) async fn connectors_handler(
 }
 
 // --------------------------------------------------------------------------
+// Secretless local-principal authorization.
+// --------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct GrantLocalAccessRequest {
+    agent: String,
+    user: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeLocalAccessRequest {
+    user: String,
+}
+
+fn local_access_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    let message = message.into();
+    (
+        status,
+        Json(serde_json::json!({
+            "status": "error",
+            "code": code,
+            "message": message.clone(),
+            "error": { "code": code, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_user(username: &str) -> Result<(u32, String), String> {
+    if username.is_empty() || username.len() > 255 || username.bytes().any(|b| b == 0 || b == b'/')
+    {
+        return Err("invalid macOS username".to_owned());
+    }
+    let user = nix::unistd::User::from_name(username)
+        .map_err(|error| format!("could not resolve macOS user: {error}"))?
+        .ok_or_else(|| format!("macOS user '{username}' does not exist"))?;
+    let uid = user.uid.as_raw();
+    if uid < 501 {
+        return Err(
+            "root and macOS system accounts cannot be granted local agent access".to_owned()
+        );
+    }
+    Ok((uid, user.name))
+}
+
+async fn emit_local_access_audit(
+    state: &ControlState,
+    event_type: &str,
+    agent: &str,
+    username: &str,
+    uid: u32,
+    outcome: &str,
+    peer: Option<crate::server::PeerCredentials>,
+) {
+    let Some(store) = state.audit_store.as_ref() else { return };
+    let mut event = permitlayer_core::audit::event::AuditEvent::new(
+        agent.to_owned(),
+        "local-data-plane".to_owned(),
+        "local-peer".to_owned(),
+        username.to_owned(),
+        outcome.to_owned(),
+        event_type.to_owned(),
+    );
+    event.extra = serde_json::json!({ "local_uid": uid });
+    enrich_audit_extra_with_peer_creds(&mut event.extra, peer);
+    if let Err(error) = store.append(event).await {
+        tracing::warn!(error = %error, event_type, "local-access audit write failed");
+    }
+}
+
+async fn grant_local_access_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    peer: Option<axum::Extension<crate::server::PeerCredentials>>,
+    Json(payload): Json<GrantLocalAccessRequest>,
+) -> Response {
+    if let Err(error) = require_loopback(peer_addr) {
+        return error.into_response();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, peer, payload);
+        return local_access_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "local_access.unsupported_platform",
+            "kernel local-principal access is currently available on macOS system services",
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if permitlayer_core::agent::validate_agent_name(&payload.agent).is_err() {
+            return local_access_error(
+                StatusCode::BAD_REQUEST,
+                "local_access.invalid_agent",
+                "agent name is invalid",
+            );
+        }
+        let Some(agent_store) = state.agent_store.as_ref() else {
+            return local_access_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "local_access.agent_store_unavailable",
+                "agent store is unavailable",
+            );
+        };
+        match agent_store.get(&payload.agent).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return local_access_error(
+                    StatusCode::NOT_FOUND,
+                    "local_access.agent_not_found",
+                    format!("agent '{}' is not registered", payload.agent),
+                );
+            }
+            Err(error) => {
+                return local_access_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "local_access.agent_lookup_failed",
+                    error.to_string(),
+                );
+            }
+        }
+        let (uid, canonical_username) = match resolve_macos_user(&payload.user) {
+            Ok(user) => user,
+            Err(message) => {
+                return local_access_error(
+                    StatusCode::BAD_REQUEST,
+                    "local_access.user_invalid",
+                    message,
+                );
+            }
+        };
+        let Some(store) = state.local_principal_store.as_ref() else {
+            return local_access_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "local_access.store_unavailable",
+                "local-principal store is unavailable",
+            );
+        };
+        match store.get(uid).await {
+            Ok(Some(existing))
+                if existing.agent == payload.agent
+                    && existing.username_at_grant == canonical_username =>
+            {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "status": "ok", "grant": existing })),
+                )
+                    .into_response();
+            }
+            Ok(Some(existing)) if existing.username_at_grant != canonical_username => {
+                return local_access_error(
+                    StatusCode::CONFLICT,
+                    "local_access.username_drift",
+                    format!(
+                        "uid {uid} was granted as user '{}' but now resolves as '{}'; revoke the stale grant before granting access",
+                        existing.username_at_grant, canonical_username
+                    ),
+                );
+            }
+            Ok(Some(existing)) => {
+                return local_access_error(
+                    StatusCode::CONFLICT,
+                    "local_access.uid_already_granted",
+                    format!("uid {uid} is already granted to agent '{}'", existing.agent),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return local_access_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "local_access.store_read_failed",
+                    error.to_string(),
+                );
+            }
+        }
+        let peer_creds = peer.map(|extension| extension.0);
+        let grant = permitlayer_core::store::LocalPrincipal {
+            schema_version:
+                permitlayer_core::store::local_principal::LOCAL_PRINCIPAL_SCHEMA_VERSION,
+            platform: "macos".to_owned(),
+            uid,
+            username_at_grant: canonical_username.clone(),
+            agent: payload.agent.clone(),
+            granted_at: chrono::Utc::now(),
+            granted_by_peer_uid: peer_creds.map(|creds| creds.uid),
+        };
+        if let Err(error) = store.grant(grant.clone()).await {
+            return local_access_error(
+                StatusCode::CONFLICT,
+                "local_access.grant_failed",
+                error.to_string(),
+            );
+        }
+        emit_local_access_audit(
+            &state,
+            "local-access-granted",
+            &grant.agent,
+            &grant.username_at_grant,
+            grant.uid,
+            "ok",
+            peer_creds,
+        )
+        .await;
+        (StatusCode::CREATED, Json(serde_json::json!({ "status": "ok", "grant": grant })))
+            .into_response()
+    }
+}
+
+async fn list_local_access_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(error) = require_loopback(peer_addr) {
+        return error.into_response();
+    }
+    let Some(store) = state.local_principal_store.as_ref() else {
+        return local_access_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local_access.store_unavailable",
+            "local-principal store is unavailable",
+        );
+    };
+    match store.list().await {
+        Ok(grants) => {
+            (StatusCode::OK, Json(serde_json::json!({ "grants": grants }))).into_response()
+        }
+        Err(error) => local_access_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local_access.list_failed",
+            error.to_string(),
+        ),
+    }
+}
+
+async fn revoke_local_access_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    peer: Option<axum::Extension<crate::server::PeerCredentials>>,
+    Json(payload): Json<RevokeLocalAccessRequest>,
+) -> Response {
+    if let Err(error) = require_loopback(peer_addr) {
+        return error.into_response();
+    }
+    let Some(store) = state.local_principal_store.as_ref() else {
+        return local_access_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local_access.store_unavailable",
+            "local-principal store is unavailable",
+        );
+    };
+    let grants = match store.list().await {
+        Ok(grants) => grants,
+        Err(error) => {
+            return local_access_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "local_access.list_failed",
+                error.to_string(),
+            );
+        }
+    };
+    let Some(grant) = grants.into_iter().find(|grant| grant.username_at_grant == payload.user)
+    else {
+        return local_access_error(
+            StatusCode::NOT_FOUND,
+            "local_access.not_found",
+            format!("no local access grant exists for user '{}'", payload.user),
+        );
+    };
+    match store.revoke(grant.uid).await {
+        Ok(true) => {
+            let peer_creds = peer.map(|extension| extension.0);
+            emit_local_access_audit(
+                &state,
+                "local-access-revoked",
+                &grant.agent,
+                &grant.username_at_grant,
+                grant.uid,
+                "ok",
+                peer_creds,
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "revoked": grant })))
+                .into_response()
+        }
+        Ok(false) => local_access_error(
+            StatusCode::NOT_FOUND,
+            "local_access.not_found",
+            "local access grant disappeared before revocation",
+        ),
+        Err(error) => local_access_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local_access.revoke_failed",
+            error.to_string(),
+        ),
+    }
+}
+
+// --------------------------------------------------------------------------
 // Router builder.
 // --------------------------------------------------------------------------
 
@@ -5954,6 +6255,7 @@ pub(crate) fn router(
     reload_mutex: Arc<std::sync::Mutex<()>>,
     agent_registry: Arc<AgentRegistry>,
     agent_store: Option<Arc<dyn AgentIdentityStore>>,
+    local_principal_store: Option<Arc<dyn permitlayer_core::store::LocalPrincipalStore>>,
     agent_lookup_key: Arc<zeroize::Zeroizing<[u8; LOOKUP_KEY_BYTES]>>,
     approval_service: Arc<dyn permitlayer_proxy::middleware::ApprovalService>,
     conn_tracker: Arc<crate::server::conn_tracker::ConnTracker>,
@@ -5981,6 +6283,7 @@ pub(crate) fn router(
         policy_edit_mutex: Arc::new(tokio::sync::Mutex::new(())),
         agent_registry,
         agent_store,
+        local_principal_store,
         agent_lookup_key,
         agent_crud_semaphore: Arc::new(tokio::sync::Semaphore::new(AGENT_CRUD_MAX_CONCURRENT)),
         agent_registry_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -6019,6 +6322,11 @@ pub(crate) fn router(
         .route("/v1/control/connections/record/{selector}", get(get_connection_record_handler))
         .route("/v1/control/connections/{selector}/revoke", post(revoke_connection_handler))
         .route("/v1/control/agent/{name}/bindings", get(agent_bindings_handler))
+        .route(
+            "/v1/control/agent/local-access",
+            get(list_local_access_handler).post(grant_local_access_handler),
+        )
+        .route("/v1/control/agent/local-access/revoke", post(revoke_local_access_handler))
         .route("/v1/control/bindings", post(bind_agent_handler))
         .route("/v1/control/bindings/remove", post(unbind_agent_handler))
         .route("/v1/control/policy/{policy_name}/scopes", post(policy_scopes_handler))
@@ -6171,6 +6479,7 @@ mod tests {
             reload_mutex,
             agent_registry,
             None,
+            None,
             // Story 1.15: the agent lookup key is ALWAYS a real HKDF
             // derivation after boot (never zero). Using a non-zero
             // dummy here so the test fixture encodes the post-1.15
@@ -6209,6 +6518,7 @@ mod tests {
             policies_dir,
             reload_mutex,
             agent_registry,
+            None,
             None,
             // Story 1.15: the agent lookup key is ALWAYS a real HKDF
             // derivation after boot (never zero). Using a non-zero
@@ -6251,6 +6561,7 @@ mod tests {
             policies_dir,
             reload_mutex,
             agent_registry,
+            None,
             None,
             Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
             test_approval_service(),
@@ -6453,6 +6764,7 @@ mod tests {
             policies_dir,
             reload_mutex,
             agent_registry,
+            None,
             None,
             Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
             test_approval_service(),
@@ -7638,6 +7950,7 @@ mod tests {
             reload_mutex,
             agent_registry,
             agent_store,
+            None,
             Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
             test_approval_service(),
             test_conn_tracker(),
@@ -7804,6 +8117,7 @@ mod tests {
             policies_dir,
             reload_mutex,
             agent_registry,
+            None,
             None,
             Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
             test_approval_service(),
@@ -8233,6 +8547,7 @@ mod tests {
             reload_mutex,
             agent_registry,
             None,
+            None,
             Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
             test_approval_service(),
             test_conn_tracker(),
@@ -8629,6 +8944,7 @@ auto-approve-reads = true
             reload_mutex,
             agent_registry,
             None,
+            None,
             Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
             test_approval_service(),
             test_conn_tracker(),
@@ -8821,6 +9137,7 @@ auto-approve-reads = true
             reload_mutex,
             agent_registry,
             Some(store.clone()),
+            None,
             Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
             test_approval_service(),
             test_conn_tracker(),

@@ -3474,6 +3474,21 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     let (agent_store, binding_store_mw, connection_store_mw, agent_registry, agent_lookup_key) =
         try_build_agent_runtime(&config, &master_key).await?;
 
+    #[cfg(target_os = "macos")]
+    let local_principal_store: Option<Arc<dyn permitlayer_core::store::LocalPrincipalStore>> =
+        match permitlayer_core::store::fs::LocalPrincipalFsStore::new(config.paths.home.clone()) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "local-principal store unavailable — secretless local uploads will default-deny"
+                );
+                None
+            }
+        };
+    #[cfg(not(target_os = "macos"))]
+    let local_principal_store: Option<Arc<dyn permitlayer_core::store::LocalPrincipalStore>> = None;
+
     // (Story 11.9/11.10: the `<home>/connections/` + `<home>/bindings/`
     // directories are provisioned by the `BindingFsStore`/`ConnectionFsStore`
     // constructors inside `try_build_agent_runtime` above — both 0o700, both
@@ -3725,7 +3740,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         connection_store_mw.clone(),
         Arc::clone(&approval_service),
         Arc::clone(&approval_timeout_atomic),
-        conn_tracker_sink,
+        Arc::clone(&conn_tracker_sink),
     );
 
     // 9. Build axum router using the `proxy_service` resolved earlier
@@ -3757,6 +3772,51 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         #[cfg(debug_assertions)]
         audit_dispatcher: Arc::clone(&audit_dispatcher),
     };
+
+    // macOS local users upload through a dedicated Unix socket and never
+    // receive a reusable bearer token. Keep this router deliberately tiny:
+    // it has no MCP, generic REST, health, or control-plane routes.
+    #[cfg(target_os = "macos")]
+    let local_upload_context = local_principal_store.clone().map(|store| {
+        let upload_start_slot = Arc::clone(&proxy_route_slots.proxy);
+        let upload_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
+        let upload_status_slot = Arc::clone(&proxy_route_slots.proxy);
+        let upload_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
+        let routes = Router::new()
+            .route(
+                "/v1/tools/{selector}/uploads",
+                post(move |path, req| {
+                    dynamic_drive_upload_start_handler(Arc::clone(&upload_start_slot), path, req)
+                }),
+            )
+            .route(
+                "/v1/tools/{selector}/uploads/{upload_id}",
+                put(move |path, req| {
+                    dynamic_drive_upload_chunk_handler(Arc::clone(&upload_chunk_slot), path, req)
+                })
+                .merge(get(move |path, req| {
+                    dynamic_drive_upload_status_handler(Arc::clone(&upload_status_slot), path, req)
+                }))
+                .merge(delete(move |path, req| {
+                    dynamic_drive_upload_cancel_handler(Arc::clone(&upload_cancel_slot), path, req)
+                })),
+            )
+            .with_state(state.clone());
+        crate::server::local_data_listener::LocalUploadContext {
+            routes,
+            store,
+            binding_store: binding_store_mw.clone(),
+            connection_store: connection_store_mw.clone(),
+            agent_store: agent_store.clone(),
+            agent_registry: Arc::clone(&agent_registry),
+            kill_switch: Arc::clone(&kill_switch),
+            policy_set: Arc::clone(&policy_set),
+            audit_dispatcher: Arc::clone(&audit_dispatcher),
+            approval_service: Arc::clone(&approval_service),
+            approval_timeout: Arc::clone(&approval_timeout_atomic),
+            conn_tracker: Arc::clone(&conn_tracker_sink),
+        }
+    });
 
     // Story 8.7 AC #4: `proxy_stub_branch_active` was initialized up-
     // front (line ~1695) from `proxy_service.is_none()` so the flag is
@@ -3914,6 +3974,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         reload_mutex,
         Arc::clone(&agent_registry),
         agent_store.clone(),
+        local_principal_store.clone(),
         agent_lookup_key,
         Arc::clone(&approval_service),
         Arc::clone(&conn_tracker),
@@ -4000,6 +4061,18 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // observe the true value via `changed()`/`borrow()`. Three
     // independent `receiver.clone()`s feed the three waiters.
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    #[cfg(target_os = "macos")]
+    let local_upload_reconciler = match local_upload_context {
+        Some(context) => Some(
+            crate::server::local_data_listener::spawn_local_upload_reconciler(
+                context,
+                permitlayer_core::paths::home_override(),
+                drain_rx.clone(),
+            )
+            .await,
+        ),
+        None => None,
+    };
     let drain_tx_for_graceful = drain_tx.clone();
     let sweep_shutdown_for_graceful = Arc::clone(&sweep_shutdown);
     let graceful_fut = async move {
@@ -4160,6 +4233,30 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
                 () = drain_deadline_uds => Ok(()),
             }
         });
+        let local_task = async move {
+            let Some(mut task) = local_upload_reconciler else { return };
+            let mut dn = drain_rx.clone();
+            let deadline = async move {
+                let _ = dn.changed().await;
+                tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
+            };
+            tokio::pin!(deadline);
+            tokio::select! {
+                result = &mut task => {
+                    if let Err(error) = result {
+                        tracing::warn!(error = %error, "local upload reconciler task failed");
+                    }
+                }
+                () = &mut deadline => {
+                    tracing::warn!(
+                        "local upload listeners exceeded shutdown drain budget ({}s)",
+                        AXUM_DRAIN_BUDGET.as_secs()
+                    );
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        };
         // Story 7.27 Round-2 review fix (P1): use `tokio::join!`
         // (not `try_join!`) so an error in one listener does NOT
         // cancel the other mid-drain. `try_join!` documented
@@ -4169,7 +4266,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // With `join!`, both listeners run to completion (their
         // own selects honor the 25s drain deadline); we then
         // inspect both results and surface the first error.
-        let (tcp_result, uds_result) = tokio::join!(tcp_task, uds_task);
+        let (tcp_result, uds_result, ()) = tokio::join!(tcp_task, uds_task, local_task);
         // Round-3 review fix (R3-C3-P10): when both listeners fail
         // with different errors, `tcp_result?` short-circuits and
         // the UDS error is dropped on the floor. Log both results

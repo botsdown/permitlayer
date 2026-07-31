@@ -14,6 +14,7 @@ This directory holds the load-bearing design decisions for permitlayer. Each ADR
 | [0008](0008-media-file-trust-boundary.md) | Media-file trust boundary for attachment delivery | Superseded by 0009 | 2026-05-29 | Gmail attachment UX |
 | [0009](0009-client-owned-attachment-materialization.md) | Client-owned attachment materialization through MCP resources | Accepted | 2026-07-30 | Hermes attachment compatibility |
 | [0010](0010-client-owned-drive-upload-streaming.md) | Client-owned Drive upload streaming | Accepted | 2026-07-30 | Drive binary upload compatibility |
+| [0011](0011-secretless-local-peer-drive-uploads.md) | Secretless local peer authentication for Drive uploads | Accepted | 2026-07-31 | 11.18 |
 
 ## Conventions
 

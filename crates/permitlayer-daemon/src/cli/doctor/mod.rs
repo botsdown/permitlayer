@@ -76,7 +76,7 @@ use crate::cli::kill::{self, ControlEndpoint};
 use crate::cli::silent_cli_error;
 use crate::design::render::{self, Outcome};
 use crate::design::terminal::styled;
-use permitlayer_core::store::AuditStore;
+use permitlayer_core::store::{AuditStore, LocalPrincipalStore};
 
 // ── Embedded managed bundle (Decision C1) ───────────────────────────
 //
@@ -614,7 +614,7 @@ fn refuse_non_root() -> FixOutcome {
     FixOutcome::Refused { why: "re-run as: sudo agentsso doctor --fix".to_owned() }
 }
 
-// ── The 8 checks ────────────────────────────────────────────────────
+// ── The checks ──────────────────────────────────────────────────────
 //
 // Plan note: a `trait Check` with `async fn` + trait objects is
 // friction (object-safety / `async_trait` only-if-already-a-dep).
@@ -637,10 +637,10 @@ struct CheckSpec {
     fix_class: FixClass,
 }
 
-/// Canonical list of all 8 checks in run order. The declared
+/// Canonical list of all checks in run order. The declared
 /// `fix_class` here is the single source of truth that
 /// `may_apply_fix` consults and `fix_class_invariants` asserts.
-fn check_specs() -> [CheckSpec; 8] {
+fn check_specs() -> [CheckSpec; 9] {
     [
         CheckSpec { id: "version_drift", fix_class: FixClass::NeverAutomatic },
         CheckSpec { id: "stale_launchd", fix_class: FixClass::GatedByRestartOk },
@@ -650,6 +650,7 @@ fn check_specs() -> [CheckSpec; 8] {
         CheckSpec { id: "no_tty_prompt_trap", fix_class: FixClass::NeverAutomatic },
         CheckSpec { id: "operator_layer_compile", fix_class: FixClass::NeverAutomatic },
         CheckSpec { id: "legacy_seed_snapshot_present", fix_class: FixClass::SafeAutomatic },
+        CheckSpec { id: "local_access_sockets", fix_class: FixClass::NeverAutomatic },
     ]
 }
 
@@ -1682,6 +1683,129 @@ fn fix_snapshot_gc(ctx: &DoctorCtx) -> FixOutcome {
     }
 }
 
+// ── Check: secretless local-access grant/socket consistency ─────────
+
+async fn detect_local_access_sockets(ctx: &DoctorCtx) -> CheckReport {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx;
+        return CheckReport::pass(
+            "local_access_sockets",
+            "secretless local-access sockets",
+            "kernel local-access sockets are currently macOS-only",
+            FixClass::NeverAutomatic,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+        let grants_dir = ctx.home.join("local-principals");
+        if !grants_dir.exists() {
+            return CheckReport::pass(
+                "local_access_sockets",
+                "secretless local-access sockets",
+                "no local-access grants are configured",
+                FixClass::NeverAutomatic,
+            );
+        }
+        let store = match permitlayer_core::store::fs::LocalPrincipalFsStore::open_existing(
+            ctx.home.clone(),
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                return CheckReport {
+                    id: "local_access_sockets",
+                    title: "secretless local-access sockets",
+                    severity: Severity::Warn,
+                    detail: format!("local-principal state is unreadable: {error}"),
+                    auto_fixable: false,
+                    fix_class: FixClass::NeverAutomatic,
+                    remediation: Some("sudo agentsso doctor".to_owned()),
+                    fix_outcome: None,
+                };
+            }
+        };
+        let grants = match store.list().await {
+            Ok(grants) => grants,
+            Err(error) => {
+                return CheckReport {
+                    id: "local_access_sockets",
+                    title: "secretless local-access sockets",
+                    severity: Severity::Warn,
+                    detail: format!("local-principal grants are unreadable: {error}"),
+                    auto_fixable: false,
+                    fix_class: FixClass::NeverAutomatic,
+                    remediation: Some("sudo agentsso doctor".to_owned()),
+                    fix_outcome: None,
+                };
+            }
+        };
+        if grants.is_empty() {
+            return CheckReport::pass(
+                "local_access_sockets",
+                "secretless local-access sockets",
+                "no local-access grants are configured",
+                FixClass::NeverAutomatic,
+            );
+        }
+
+        let home_override = permitlayer_core::paths::home_override();
+        let mut problems = Vec::new();
+        for grant in &grants {
+            match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(grant.uid)) {
+                Ok(Some(user)) if user.name == grant.username_at_grant => {}
+                Ok(Some(user)) => problems.push(format!(
+                    "uid {} now resolves to '{}' (granted as '{}')",
+                    grant.uid, user.name, grant.username_at_grant
+                )),
+                Ok(None) => problems.push(format!("uid {} no longer exists", grant.uid)),
+                Err(error) => problems.push(format!("uid {} lookup failed: {error}", grant.uid)),
+            }
+            let socket = permitlayer_core::paths::local_agent_socket_path(
+                home_override.as_deref(),
+                grant.uid,
+            );
+            match std::fs::symlink_metadata(&socket) {
+                Ok(metadata)
+                    if metadata.file_type().is_socket()
+                        && metadata.uid() == grant.uid
+                        && metadata.permissions().mode() & 0o777 == 0o600 => {}
+                Ok(_) => problems.push(format!(
+                    "{} is not a mode-0600 socket owned by uid {}",
+                    socket.display(),
+                    grant.uid
+                )),
+                Err(error) => problems.push(format!("{}: {error}", socket.display())),
+            }
+        }
+
+        if problems.is_empty() {
+            CheckReport::pass(
+                "local_access_sockets",
+                "secretless local-access sockets",
+                format!("{} local-access grant/socket pair(s) are consistent", grants.len()),
+                FixClass::NeverAutomatic,
+            )
+        } else {
+            CheckReport {
+                id: "local_access_sockets",
+                title: "secretless local-access sockets",
+                severity: Severity::Fail,
+                detail: problems.join("; "),
+                auto_fixable: false,
+                fix_class: FixClass::NeverAutomatic,
+                remediation: Some(
+                    "inspect `sudo agentsso agent local-access list`; revoke and re-grant stale users, or run `sudo agentsso setup` if the daemon is not current"
+                        .to_owned(),
+                ),
+                fix_outcome: None,
+            }
+        }
+    }
+}
+
 // ── JSON report ─────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -1756,6 +1880,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         detect_no_tty_prompt_trap(&ctx).await,
         detect_operator_layer_compile(&ctx),
         detect_legacy_seed_snapshot_present(&ctx),
+        detect_local_access_sockets(&ctx).await,
     ];
 
     // --fix pass: for every non-passing check, consult the SINGLE
@@ -1831,7 +1956,10 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 /// gate is the only authorization path.
 async fn apply_fix(id: &str, ctx: &DoctorCtx) -> FixOutcome {
     match id {
-        "version_drift" | "no_tty_prompt_trap" | "operator_layer_compile" => {
+        "version_drift"
+        | "no_tty_prompt_trap"
+        | "operator_layer_compile"
+        | "local_access_sockets" => {
             // NeverAutomatic — the gate already refused; this is
             // defense-in-depth (must never be reached for these).
             FixOutcome::Refused { why: "never auto-fixable".to_owned() }
@@ -2276,6 +2404,7 @@ mod tests {
         // legacy_seed_snapshot_present → SafeAutomatic (the destructive
         // >30d GC routes through the same may_apply_fix gate).
         assert_eq!(by_id("legacy_seed_snapshot_present"), FixClass::SafeAutomatic);
+        assert_eq!(by_id("local_access_sockets"), FixClass::NeverAutomatic);
         // Concrete membership (Story 10.3: daemon_binary_missing OUT,
         // legacy_seed_snapshot_present IN) — assert the exact id set so
         // this test documents intent, not a bare count.
@@ -2286,6 +2415,7 @@ mod tests {
             [
                 "daemon_not_running",
                 "legacy_seed_snapshot_present",
+                "local_access_sockets",
                 "managed_policy_staleness",
                 "no_tty_prompt_trap",
                 "operator_layer_compile",

@@ -86,6 +86,57 @@ pub type MiddlewareStack = ServiceBuilder<
     >,
 >;
 
+/// Concrete stack for a transport that authenticates with a caller-supplied
+/// layer and then converges on PermitLayer's normal agent authorization tail.
+///
+/// Runtime order is `Trace → transport auth → AgentIdentity → KillSwitch →
+/// ConnTrack → Policy → Audit → handler`. Keeping this builder in the proxy
+/// crate prevents a peer-authenticated transport from silently omitting a
+/// common enforcement layer.
+pub type AuthenticatedTransportStack<A> = ServiceBuilder<
+    Stack<
+        AuditLayer,
+        Stack<
+            PolicyLayer,
+            Stack<
+                ConnTrackLayer,
+                Stack<
+                    KillSwitchLayer,
+                    Stack<AgentIdentityLayer, Stack<A, Stack<RequestTraceLayer, Identity>>>,
+                >,
+            >,
+        >,
+    >,
+>;
+
+/// Assemble a non-bearer transport so it shares the canonical post-identity
+/// kill, tracking, policy, and audit enforcement chain.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_authenticated_transport<A>(
+    authentication: A,
+    kill_switch: Arc<KillSwitch>,
+    policy_set: Arc<ArcSwap<PolicySet>>,
+    audit_dispatcher: Arc<permitlayer_core::audit::dispatcher::AuditDispatcher>,
+    approval_service: Arc<dyn ApprovalService>,
+    approval_timeout: Arc<AtomicU64>,
+    conn_tracker: Arc<dyn ConnTrackerSink>,
+) -> AuthenticatedTransportStack<A> {
+    ServiceBuilder::new()
+        .layer(RequestTraceLayer::new())
+        .layer(authentication)
+        .layer(AgentIdentityLayer::new())
+        .layer(KillSwitchLayer::new(kill_switch, Arc::clone(&audit_dispatcher)))
+        .layer(ConnTrackLayer::new(conn_tracker))
+        .layer(PolicyLayer::with_approval_service(
+            policy_set,
+            Arc::clone(&audit_dispatcher),
+            approval_service,
+            approval_timeout,
+        ))
+        .layer(AuditLayer::new())
+}
+
 /// Assemble the canonical middleware chain.
 ///
 /// Execution order (outermost → innermost, i.e., the order layers

@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +60,40 @@ pub enum AgentCommand {
     /// connection (name + connector), tier, optional policy + alias.
     /// Replaces the single-policy view deleted in 11.9 (FR47).
     Bindings(BindingsArgs),
+    /// Grant, inspect, or revoke secretless kernel-local access.
+    LocalAccess(LocalAccessArgs),
+}
+
+#[derive(Args)]
+pub struct LocalAccessArgs {
+    #[command(subcommand)]
+    pub command: LocalAccessCommand,
+}
+
+#[derive(Subcommand)]
+pub enum LocalAccessCommand {
+    /// Map one macOS user to an existing PermitLayer agent without minting a token.
+    Grant(LocalAccessGrantArgs),
+    /// List kernel-local access grants.
+    List,
+    /// Revoke the grant for one macOS user.
+    Revoke(LocalAccessRevokeArgs),
+}
+
+#[derive(Args)]
+pub struct LocalAccessGrantArgs {
+    /// Existing PermitLayer agent whose bindings and policies apply.
+    pub agent: String,
+    /// macOS account authenticated by LOCAL_PEERCRED.
+    #[arg(long)]
+    pub user: String,
+}
+
+#[derive(Args)]
+pub struct LocalAccessRevokeArgs {
+    /// macOS account whose grant is removed.
+    #[arg(long)]
+    pub user: String,
 }
 
 #[derive(Args)]
@@ -129,6 +163,114 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         AgentCommand::Remove(a) => remove_agent(a).await,
         AgentCommand::Rotate(a) => rotate_agent(a).await,
         AgentCommand::Bindings(a) => bindings_agent(a).await,
+        AgentCommand::LocalAccess(a) => local_access(a).await,
+    }
+}
+
+async fn local_access(args: LocalAccessArgs) -> Result<()> {
+    let home = crate::cli::agentsso_home()?;
+    let handle = crate::cli::connect_uds::require_daemon_running(&home)
+        .await
+        .context("agent local-access: daemon not reachable")?;
+    match args.command {
+        LocalAccessCommand::Grant(args) => {
+            let request = crate::cli::connect_uds::GrantLocalAccessRequest {
+                agent: &args.agent,
+                user: &args.user,
+            };
+            match crate::cli::connect_uds::post_grant_local_access(&handle, &request).await? {
+                crate::cli::connect_uds::ControlOutcome::Ok(response) => {
+                    #[cfg(target_os = "macos")]
+                    wait_for_local_upload_socket(response.grant.uid, true).await?;
+                    println!(
+                        "✓ local access granted: macOS user '{}' (uid {}) → agent '{}'",
+                        response.grant.username_at_grant, response.grant.uid, response.grant.agent
+                    );
+                    Ok(())
+                }
+                outcome => local_access_outcome_error("grant", outcome),
+            }
+        }
+        LocalAccessCommand::List => {
+            match crate::cli::connect_uds::get_local_access(&handle).await? {
+                crate::cli::connect_uds::ControlOutcome::Ok(response) => {
+                    if response.grants.is_empty() {
+                        println!("No local access grants.");
+                    } else {
+                        println!("USER\tUID\tAGENT\tGRANTED");
+                        for grant in response.grants {
+                            println!(
+                                "{}\t{}\t{}\t{}",
+                                grant.username_at_grant,
+                                grant.uid,
+                                grant.agent,
+                                grant.granted_at.to_rfc3339()
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                outcome => local_access_outcome_error("list", outcome),
+            }
+        }
+        LocalAccessCommand::Revoke(args) => {
+            let request = crate::cli::connect_uds::RevokeLocalAccessRequest { user: &args.user };
+            match crate::cli::connect_uds::post_revoke_local_access(&handle, &request).await? {
+                crate::cli::connect_uds::ControlOutcome::Ok(response) => {
+                    #[cfg(target_os = "macos")]
+                    wait_for_local_upload_socket(response.grant.uid, false).await?;
+                    println!(
+                        "✓ local access revoked: macOS user '{}' (uid {}) → agent '{}'",
+                        response.grant.username_at_grant, response.grant.uid, response.grant.agent
+                    );
+                    Ok(())
+                }
+                outcome => local_access_outcome_error("revoke", outcome),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_local_upload_socket(uid: u32, should_exist: bool) -> Result<()> {
+    let path = permitlayer_core::paths::local_agent_socket_path(
+        permitlayer_core::paths::home_override().as_deref(),
+        uid,
+    );
+    for _ in 0..40 {
+        if path.exists() == should_exist {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if should_exist {
+        anyhow::bail!(
+            "the grant was saved, but upload socket {} did not become ready; inspect /Library/Logs/permitlayer/daemon.log",
+            path.display()
+        );
+    }
+    anyhow::bail!(
+        "the grant was revoked, but upload socket {} was not removed; inspect /Library/Logs/permitlayer/daemon.log",
+        path.display()
+    )
+}
+
+fn local_access_outcome_error<T>(
+    action: &str,
+    outcome: crate::cli::connect_uds::ControlOutcome<T>,
+) -> Result<()> {
+    match outcome {
+        crate::cli::connect_uds::ControlOutcome::Ok(_) => unreachable!(),
+        crate::cli::connect_uds::ControlOutcome::Err { status_code, body } => anyhow::bail!(
+            "local-access {action} failed (HTTP {status_code}, {}): {}",
+            body.code,
+            crate::cli::oauth_seal::sanitize_for_terminal(&body.message)
+        ),
+        crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. } => {
+            anyhow::bail!(
+                "local-access {action} returned an unparseable response (HTTP {status_code})"
+            )
+        }
     }
 }
 

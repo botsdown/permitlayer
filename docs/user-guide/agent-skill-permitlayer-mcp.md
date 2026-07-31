@@ -132,6 +132,19 @@ terminal:
 agentsso drive upload /path/to/folio.pdf --parent <drive-folder-id>
 ```
 
+On a macOS system-service installation, an operator must first grant the
+Hermes OS account access to exactly one existing PermitLayer agent:
+
+```sh
+sudo agentsso agent local-access grant <agent> --user angie
+```
+
+Hermes must not request, locate, create, print, or pass a bearer token for this
+command. The CLI derives `/var/run/permitlayer/agent-<uid>.sock` from its
+effective UID and PermitLayer authenticates it with `LOCAL_PEERCRED`. A missing
+socket means the operator grant is absent or unhealthy; it is not a reason to
+create `~/.agentsso/agent-bearer.token` or retry through TCP.
+
 Add `--connection <alias-or-name>` when the Drive connection is not named
 `drive`. PermitLayer authorizes each 8 MiB chunk under `drive.file`, keeps the
 Google resumable session inside the daemon, and verifies Drive's final size
