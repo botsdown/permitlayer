@@ -6013,12 +6013,13 @@ async fn grant_local_access_handler(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state, peer, payload);
-        return local_access_error(
+        let GrantLocalAccessRequest { agent, user } = payload;
+        let _ = (state, peer, agent, user);
+        local_access_error(
             StatusCode::NOT_IMPLEMENTED,
             "local_access.unsupported_platform",
             "kernel local-principal access is currently available on macOS system services",
-        );
+        )
     }
     #[cfg(target_os = "macos")]
     {

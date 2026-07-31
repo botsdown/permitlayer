@@ -76,7 +76,9 @@ use crate::cli::kill::{self, ControlEndpoint};
 use crate::cli::silent_cli_error;
 use crate::design::render::{self, Outcome};
 use crate::design::terminal::styled;
-use permitlayer_core::store::{AuditStore, LocalPrincipalStore};
+use permitlayer_core::store::AuditStore;
+#[cfg(target_os = "macos")]
+use permitlayer_core::store::LocalPrincipalStore;
 
 // ── Embedded managed bundle (Decision C1) ───────────────────────────
 //
@@ -1689,12 +1691,12 @@ async fn detect_local_access_sockets(ctx: &DoctorCtx) -> CheckReport {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = ctx;
-        return CheckReport::pass(
+        CheckReport::pass(
             "local_access_sockets",
             "secretless local-access sockets",
             "kernel local-access sockets are currently macOS-only",
             FixClass::NeverAutomatic,
-        );
+        )
     }
 
     #[cfg(target_os = "macos")]
