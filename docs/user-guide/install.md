@@ -8,6 +8,9 @@ This guide is the canonical install reference. The
 [README](../../README.md) quickstart points here for the full
 lifecycle.
 
+For the shortest install → account → Hermes → upgrade sequence, see
+[Install, enroll, upgrade, and diagnose](lifecycle.md).
+
 Two companion runbooks cover scenarios this guide does not:
 
 - [Cross-user / multi-machine setup runbook](multi-user-setup.md) —
@@ -52,10 +55,11 @@ Run, once per machine:
 sudo agentsso setup
 ```
 
-`sudo agentsso setup` is the canonical install **and** upgrade verb. It
-is idempotent: run it on a fresh machine to install, and run it again
-after every `brew upgrade agentsso` to roll the new binary into place
-and re-bootstrap the LaunchDaemon. It detects and repairs the common
+`agentsso setup` is the canonical service install/repair primitive. It
+self-elevates when needed and is idempotent. For routine upgrades use
+`agentsso upgrade`: it upgrades the Homebrew formula, invokes the newly
+installed CLI's setup path, and verifies the running daemon version in one
+workflow. Setup detects and repairs the common
 refusal conditions itself (re-staging the privileged binary, re-pointing
 the version symlink, re-bootstrapping a wedged LaunchDaemon) rather
 than handing you a list of `launchctl` commands to run by hand.
@@ -115,6 +119,7 @@ what is holding it.
 ```sh
 sudo agentsso setup              # install, or upgrade with an interactive prompt
 sudo agentsso setup --upgrade    # scripted upgrade: keep config, archive shadows, continue
+agentsso upgrade                 # routine Homebrew + daemon upgrade and verification
 ```
 
 To add additional operators to the control-plane group:
@@ -320,13 +325,12 @@ Other common failures:
   connected service will need to re-run
   `agentsso quickstart <service> --read|--read-write --oauth-client
   <json>` to reconnect.
-- **Stale binary after `brew upgrade agentsso`**: the privileged
+- **Stale binary after a manual `brew upgrade agentsso`**: the privileged
   helper copy at `/Library/PrivilegedHelperTools/agentsso` is what
   the LaunchDaemon executes; `brew upgrade` only refreshes
-  `/opt/homebrew/bin/agentsso`. Re-run `sudo agentsso setup` after
-  every `brew upgrade` to roll the new binary into place and
-  re-bootstrap the LaunchDaemon (`setup` is the canonical
-  install/upgrade verb — see [above](#set-up-the-system-service)).
+  `/opt/homebrew/bin/agentsso`. Run `agentsso upgrade` for the combined
+  workflow, or re-run `sudo agentsso setup --upgrade` to finish a manual
+  Homebrew upgrade and re-bootstrap the LaunchDaemon.
   The master key in System.keychain is preserved (`-A` ACL is
   independent of the binary's codesign hash), so sealed credentials
   survive the upgrade.

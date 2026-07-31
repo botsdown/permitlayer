@@ -65,6 +65,9 @@ pub struct ReplaceArgs {
     pub token_file: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    /// Permit replacing content with an intentional zero-byte object.
+    #[arg(long)]
+    pub allow_empty: bool,
 }
 
 #[derive(Args, Debug)]
@@ -81,6 +84,9 @@ pub struct DownloadArgs {
     pub token_file: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    /// Permit an intentional zero-byte Drive object.
+    #[arg(long)]
+    pub allow_empty: bool,
 }
 
 #[derive(Args, Debug)]
@@ -99,6 +105,9 @@ pub struct ExportArgs {
     pub token_file: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    /// Permit an intentionally empty export result.
+    #[arg(long)]
+    pub allow_empty: bool,
 }
 
 #[derive(Args, Debug)]
@@ -116,6 +125,9 @@ pub struct RevisionDownloadArgs {
     pub token_file: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    /// Permit an intentional zero-byte Drive revision.
+    #[arg(long)]
+    pub allow_empty: bool,
 }
 
 #[derive(Args, Debug)]
@@ -141,6 +153,9 @@ pub struct UploadArgs {
     /// Emit one machine-readable result object on stdout.
     #[arg(long)]
     pub json: bool,
+    /// Permit creating an intentional zero-byte Drive object.
+    #[arg(long)]
+    pub allow_empty: bool,
     #[arg(skip)]
     replace_file_id: Option<String>,
 }
@@ -165,6 +180,7 @@ struct StartRequest<'a> {
     parent_id: Option<&'a str>,
     idempotency_key: String,
     replace_file_id: Option<&'a str>,
+    allow_empty: bool,
 }
 
 #[derive(Deserialize)]
@@ -258,6 +274,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
                 &args.connection,
                 args.force,
                 args.json,
+                args.allow_empty,
                 transfer_token!(args),
             )
             .await
@@ -270,6 +287,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
                 &args.connection,
                 args.force,
                 args.json,
+                args.allow_empty,
                 transfer_token!(args),
             )
             .await
@@ -284,6 +302,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
                 &args.connection,
                 args.force,
                 args.json,
+                args.allow_empty,
                 transfer_token!(args),
             )
             .await
@@ -298,6 +317,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
                 #[cfg(not(target_os = "macos"))]
                 token_file: args.token_file,
                 json: args.json,
+                allow_empty: args.allow_empty,
                 replace_file_id: Some(args.file_id),
             };
             upload(upload_args).await
@@ -334,6 +354,11 @@ async fn upload(args: UploadArgs) -> Result<()> {
         mime_guess::from_path(&args.path).first_or_octet_stream().essence_str().to_owned()
     });
     let _: mime::Mime = mime_type.parse().context("invalid --mime-type")?;
+    if initial.len() == 0 && mime_requires_content(&mime_type) && !args.allow_empty {
+        bail!(
+            "drive.integrity.empty_source: refusing to upload an empty structured file; pass --allow-empty only when a zero-byte Drive object is intentional"
+        );
+    }
 
     let mut hasher = Md5::new();
     let mut hash_buffer = vec![0_u8; 1024 * 1024];
@@ -366,6 +391,7 @@ async fn upload(args: UploadArgs) -> Result<()> {
             args.replace_file_id.as_deref(),
         ),
         replace_file_id: args.replace_file_id.as_deref(),
+        allow_empty: args.allow_empty,
     };
     let response = transfer_http_request(
         axum::http::Method::POST,
@@ -481,6 +507,7 @@ async fn download_transfer(
     connection: &str,
     force: bool,
     json: bool,
+    allow_empty: bool,
     bearer_token: Option<String>,
 ) -> Result<()> {
     let request_value = serde_json::to_value(&start_request)?;
@@ -524,6 +551,7 @@ async fn download_transfer(
     } else {
         let start =
             start_drive_transfer(&collection_path, &start_request, bearer_token.as_deref()).await?;
+        validate_nonempty_transfer(&start, allow_empty)?;
         let state = TransferResumeState {
             schema_version: 1,
             request: request_value.clone(),
@@ -542,6 +570,7 @@ async fn download_transfer(
         std::fs::remove_file(&resume_path).context("discard export resume metadata")?;
         let start =
             start_drive_transfer(&collection_path, &start_request, bearer_token.as_deref()).await?;
+        validate_nonempty_transfer(&start, allow_empty)?;
         resume = TransferResumeState {
             schema_version: 1,
             request: request_value,
@@ -555,6 +584,7 @@ async fn download_transfer(
         persist_transfer_resume(&resume_path, &resume)?;
     }
     validate_transfer_start(&resume.transfer)?;
+    validate_nonempty_transfer(&resume.transfer, allow_empty)?;
     let mut partial = open_transfer_partial(&partial_path, false)
         .with_context(|| format!("open download partial file {}", partial_path.display()))?;
     let mut sha256 = sha2::Sha256::new();
@@ -653,15 +683,24 @@ async fn download_transfer(
     if let Some(expected) = resume.transfer.size_bytes
         && expected != offset
     {
-        bail!("Drive size check failed: expected {expected} bytes, received {offset}");
+        bail!(
+            "drive.integrity.truncated: Drive size check failed: expected {expected} bytes, received {offset}"
+        );
     }
     let local_md5 = format!("{:x}", md5.finalize());
     if let Some(expected) = &resume.transfer.md5_checksum
         && !expected.eq_ignore_ascii_case(&local_md5)
     {
-        bail!("Drive MD5 check failed; destination was not installed");
+        bail!(
+            "drive.integrity.checksum_mismatch: Drive MD5 check failed; destination was not installed"
+        );
     }
     let local_sha256 = format!("{:x}", sha256.finalize());
+    if offset == 0 && mime_requires_content(&resume.transfer.mime_type) && !allow_empty {
+        bail!(
+            "drive.integrity.empty_source: Drive returned an empty structured file; the destination was not installed. Pass --allow-empty only when zero bytes are intentional"
+        );
+    }
     partial.sync_all().context("sync downloaded file")?;
     drop(partial);
     install_transfer_partial(&partial_path, output, force)?;
@@ -717,6 +756,28 @@ fn validate_transfer_start(start: &TransferStartResponse) -> Result<()> {
         bail!("Drive file is larger than the 250 MiB transfer limit");
     }
     Ok(())
+}
+
+fn validate_nonempty_transfer(start: &TransferStartResponse, allow_empty: bool) -> Result<()> {
+    if start.size_bytes == Some(0) && mime_requires_content(&start.mime_type) && !allow_empty {
+        bail!(
+            "drive.integrity.empty_source: Drive metadata reports a zero-byte structured file; the destination was not installed. Pass --allow-empty only when zero bytes are intentional"
+        );
+    }
+    Ok(())
+}
+
+fn mime_requires_content(mime_type: &str) -> bool {
+    let mime = mime_type.trim().to_ascii_lowercase();
+    mime == "application/pdf"
+        || mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || mime == "application/zip"
+        || mime == "application/gzip"
+        || mime.starts_with("application/vnd.openxmlformats-officedocument.")
+        || mime.starts_with("application/vnd.ms-")
+        || mime.starts_with("application/vnd.oasis.opendocument.")
 }
 
 fn same_resume_source(previous: &TransferStartResponse, restarted: &TransferStartResponse) -> bool {
@@ -1016,9 +1077,14 @@ fn validate_drive_integrity(
         .or_else(|| file["size"].as_u64())
         .context("Drive did not return a valid file size")?;
     let md5 = file["md5Checksum"].as_str().context("Drive did not return md5Checksum")?;
-    if size != expected_size || !md5.eq_ignore_ascii_case(expected_md5) {
+    if size != expected_size {
         bail!(
-            "Drive integrity check failed for file {file_id}; expected {expected_size} bytes/{expected_md5}, received {size} bytes/{md5}. Inspect and delete that Drive file manually."
+            "drive.integrity.truncated: Drive size check failed for file {file_id}; expected {expected_size} bytes, received {size}. Inspect and delete that Drive file manually."
+        );
+    }
+    if !md5.eq_ignore_ascii_case(expected_md5) {
+        bail!(
+            "drive.integrity.checksum_mismatch: Drive checksum check failed for file {file_id}; expected {expected_md5}, received {md5}. Inspect and delete that Drive file manually."
         );
     }
     Ok(())
@@ -1213,7 +1279,8 @@ mod tests {
                 transfer_id: "01TESTTRANSFER".to_owned(),
                 file_id: "file-id".to_owned(),
                 name: "template.xlsx".to_owned(),
-                mime_type: "application/octet-stream".to_owned(),
+                mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_owned(),
                 size_bytes: Some(offset),
                 md5_checksum: None,
                 source_fingerprint: "source".to_owned(),
@@ -1236,6 +1303,41 @@ mod tests {
     fn integrity_rejects_mismatch() {
         let file = serde_json::json!({"size":"4","md5Checksum":"bad"});
         assert!(validate_drive_integrity(&file, 3, "good", "id").is_err());
+    }
+
+    #[test]
+    fn empty_download_requires_explicit_override() {
+        let mut transfer =
+            resume_state(serde_json::json!({"kind":"blob","file_id":"id"}), "drive", 0).transfer;
+        transfer.size_bytes = Some(0);
+        assert!(validate_nonempty_transfer(&transfer, false).is_err());
+        assert!(validate_nonempty_transfer(&transfer, true).is_ok());
+    }
+
+    #[test]
+    fn empty_text_download_does_not_require_override() {
+        let mut transfer =
+            resume_state(serde_json::json!({"kind":"blob","file_id":"id"}), "drive", 0).transfer;
+        transfer.size_bytes = Some(0);
+        transfer.mime_type = "text/plain".to_owned();
+        assert!(validate_nonempty_transfer(&transfer, false).is_ok());
+    }
+
+    #[test]
+    fn integrity_errors_have_distinct_stable_codes() -> anyhow::Result<()> {
+        let size = serde_json::json!({"size":"4","md5Checksum":"good"});
+        let size_error = match validate_drive_integrity(&size, 3, "good", "id") {
+            Ok(()) => anyhow::bail!("size mismatch unexpectedly passed"),
+            Err(error) => error,
+        };
+        assert!(size_error.to_string().contains("drive.integrity.truncated"));
+        let checksum = serde_json::json!({"size":"3","md5Checksum":"bad"});
+        let checksum_error = match validate_drive_integrity(&checksum, 3, "good", "id") {
+            Ok(()) => anyhow::bail!("checksum mismatch unexpectedly passed"),
+            Err(error) => error,
+        };
+        assert!(checksum_error.to_string().contains("drive.integrity.checksum_mismatch"));
+        Ok(())
     }
 
     #[test]

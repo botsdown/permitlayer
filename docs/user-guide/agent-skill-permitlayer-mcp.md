@@ -132,15 +132,18 @@ terminal:
 agentsso drive upload /path/to/folio.pdf --parent <drive-folder-id>
 ```
 
-On a macOS system-service installation, an operator must first grant the
-Hermes OS account access to exactly one existing PermitLayer agent:
+On a macOS system-service installation, enroll the Hermes OS account once:
 
 ```sh
-sudo agentsso agent local-access grant <agent> --user angie \
-  --capability drive-upload \
-  --capability drive-download \
-  --capability drive-replace
+agentsso onboard hermes --user angie
+# Select an account when more than one active Drive connection exists:
+agentsso onboard hermes --user angie --drive drive-refresh-2026
 ```
+
+The command performs one sudo authorization, creates or adopts a single local
+agent, binds the selected Gmail/Calendar/Drive connections, stores an immutable
+connection-scoped consent record, and merges target-owned stdio MCP entries
+into `~/.hermes/config.yaml`. Re-running it resumes safely.
 
 Hermes must not request, locate, create, print, or pass a bearer token for this
 command. The CLI derives `/var/run/permitlayer/agent-<uid>.sock` from its
@@ -171,6 +174,12 @@ agentsso drive replace <file-id> ./completed.xlsx
 destinations unless `--force` is explicit, install atomically, and report
 SHA-256 plus Drive MD5 when available. Replacement preserves the file ID and
 creates a revision.
+
+PermitLayer rejects zero-byte uploads, replacements, and downloads by default
+so an empty placeholder cannot masquerade as a valid PDF or workbook. Pass
+`--allow-empty` only when zero bytes are intentional. Use the read-only MCP
+tool `drive.files.audit_empty` to inventory suspicious existing placeholders;
+it never deletes or modifies them.
 
 Interrupted blob and retained-revision downloads leave a hidden partial file
 and non-secret resume record beside the destination; rerun the identical

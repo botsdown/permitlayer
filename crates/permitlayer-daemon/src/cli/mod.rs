@@ -16,9 +16,11 @@ pub mod doctor;
 pub mod drive;
 pub mod kill;
 pub mod logs;
+pub mod mcp_bridge;
 pub mod migrations;
 pub mod oauth_render;
 pub mod oauth_seal;
+pub mod onboard;
 pub mod openclaw;
 pub mod policy;
 pub mod quickstart;
@@ -36,6 +38,7 @@ pub mod stop;
 pub mod ui;
 pub mod uninstall;
 pub mod update;
+pub mod upgrade;
 
 /// Resolve the daemon state-dir.
 ///

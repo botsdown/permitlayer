@@ -239,6 +239,8 @@ mod tests {
             username_at_grant: user.to_owned(),
             agent: agent.to_owned(),
             capabilities: vec![crate::store::LocalCapability::DriveUpload],
+            connection_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()],
+            profile: None,
             granted_at: Utc::now(),
             granted_by_peer_uid: Some(0),
         }
@@ -278,6 +280,60 @@ granted_at = "2026-07-30T12:00:00Z"
         .unwrap();
         assert!(record.capabilities.is_empty());
         assert!(validate_record(&record).is_err());
+    }
+
+    #[test]
+    fn version_two_explicit_capabilities_remain_legacy_unscoped() {
+        let record: LocalPrincipal = toml::from_str(
+            r#"
+schema_version = 2
+platform = "macos"
+uid = 501
+username_at_grant = "angie"
+agent = "drive-agent"
+capabilities = ["drive-upload", "drive-download"]
+granted_at = "2026-07-30T12:00:00Z"
+"#,
+        )
+        .unwrap();
+        assert!(validate_record(&record).is_ok());
+        assert!(record.connection_ids.is_empty());
+    }
+
+    #[test]
+    fn version_three_rejects_duplicate_connection_ids() {
+        let mut record = principal(501, "angie", "drive-agent");
+        record.connection_ids.push(record.connection_ids[0].clone());
+        assert!(validate_record(&record).is_err());
+    }
+
+    #[test]
+    fn profile_contract_rejects_misleading_capabilities() {
+        let mut record = principal(501, "angie", "drive-agent");
+        record.profile =
+            Some(crate::store::LocalAccessProfile { name: "drive-read".to_owned(), version: 1 });
+        assert!(validate_record(&record).is_err());
+
+        record.capabilities = vec![crate::store::LocalCapability::DriveDownload];
+        assert!(validate_record(&record).is_ok());
+    }
+
+    #[test]
+    fn hermes_profile_requires_drive_transfers_with_drive_mcp() {
+        let mut record = principal(501, "angie", "hermes-angie");
+        record.profile = Some(crate::store::LocalAccessProfile {
+            name: "hermes-standard".to_owned(),
+            version: 1,
+        });
+        record.capabilities = vec![crate::store::LocalCapability::McpDrive];
+        assert!(validate_record(&record).is_err());
+
+        record.capabilities.extend([
+            crate::store::LocalCapability::DriveUpload,
+            crate::store::LocalCapability::DriveDownload,
+            crate::store::LocalCapability::DriveReplace,
+        ]);
+        assert!(validate_record(&record).is_ok());
     }
 
     #[test]
@@ -362,7 +418,7 @@ granted_at = "2026-07-30T12:00:00Z"
 }
 
 fn validate_record(record: &LocalPrincipal) -> Result<(), StoreError> {
-    if record.schema_version != 1 && record.schema_version != LOCAL_PRINCIPAL_SCHEMA_VERSION {
+    if !matches!(record.schema_version, 1 | 2 | LOCAL_PRINCIPAL_SCHEMA_VERSION) {
         return Err(StoreError::UnsupportedVersion {
             got: record.schema_version,
             expected: LOCAL_PRINCIPAL_SCHEMA_VERSION,
@@ -374,6 +430,73 @@ fn validate_record(record: &LocalPrincipal) -> Result<(), StoreError> {
         return Err(StoreError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "version-1 local-principal grants must be upload-only",
+        )));
+    }
+    if record.schema_version < 3 && !record.connection_ids.is_empty() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy local-principal grants cannot contain connection IDs",
+        )));
+    }
+    if record.schema_version < 3 && record.profile.is_some() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy local-principal grants cannot contain a profile",
+        )));
+    }
+    if record.schema_version == LOCAL_PRINCIPAL_SCHEMA_VERSION && record.connection_ids.is_empty() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "version-3 local-principal grants require explicit connection IDs",
+        )));
+    }
+    if record.connection_ids.iter().any(String::is_empty) {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local-principal grant contains an empty connection ID",
+        )));
+    }
+    let mut connection_ids = record.connection_ids.clone();
+    connection_ids.sort();
+    connection_ids.dedup();
+    if connection_ids.len() != record.connection_ids.len() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local-principal grant contains duplicate connection IDs",
+        )));
+    }
+    if let Some(profile) = &record.profile
+        && !matches!(
+            (profile.name.as_str(), profile.version),
+            ("drive-read", 1)
+                | ("drive-read-write", 1)
+                | ("drive-full-control", 1)
+                | ("hermes-standard", 1)
+        )
+    {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unknown local-access consent profile version",
+        )));
+    }
+    if !record.profile_contract_matches() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local-access profile does not match its immutable capability set",
+        )));
+    }
+    let has_mcp = record.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            crate::store::LocalCapability::McpGmail
+                | crate::store::LocalCapability::McpCalendar
+                | crate::store::LocalCapability::McpDrive
+        )
+    });
+    if has_mcp && record.connection_ids.is_empty() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local MCP grants require at least one explicit connection ID",
         )));
     }
     if record.capabilities.is_empty() {

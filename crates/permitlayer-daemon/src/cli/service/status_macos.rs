@@ -15,10 +15,37 @@ use super::{DAEMON_LABEL, LAUNCHD_PLIST_PATH};
 
 const PLIST_PATH: &str = LAUNCHD_PLIST_PATH;
 
-pub async fn run() -> Result<()> {
-    let installed = Path::new(PLIST_PATH).exists();
+/// Machine-readable snapshot shared by `service status`, `status`, doctor,
+/// and upgrade verification.  Reading launchd is authoritative for the
+/// privileged macOS installation; a per-user PID file is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceSnapshot {
+    pub installed: bool,
+    pub state: &'static str,
+    pub pid: Option<u32>,
+    pub control_reachable: bool,
+}
 
+pub(crate) async fn snapshot() -> ServiceSnapshot {
+    let installed = Path::new(PLIST_PATH).exists();
     let (state, pid) = if installed { read_launchctl_state() } else { ("not-installed", None) };
+    let control_reachable = if installed {
+        let sock_path = permitlayer_core::paths::control_socket_path(None);
+        matches!(
+            timeout(Duration::from_millis(100), tokio::net::UnixStream::connect(sock_path)).await,
+            Ok(Ok(_))
+        )
+    } else {
+        false
+    };
+    ServiceSnapshot { installed, state, pid, control_reachable }
+}
+
+pub async fn run() -> Result<()> {
+    let snapshot = snapshot().await;
+    let installed = snapshot.installed;
+    let state = snapshot.state;
+    let pid = snapshot.pid;
 
     let sock_status = if installed {
         let sock_path = permitlayer_core::paths::control_socket_path(None);
@@ -43,14 +70,18 @@ pub async fn run() -> Result<()> {
     // via exit code. Now: exit 0 for `running`, exit 1 for any
     // non-running state. Operators relying on the always-zero
     // behavior can pipe `|| true`.
-    if state == "running" {
+    if state == "running" && snapshot.control_reachable {
         Ok(())
+    } else if state == "running" {
+        Err(crate::cli::silent_cli_error(
+            "daemon process is running but its control socket is unreachable".to_owned(),
+        ))
     } else {
         Err(crate::cli::silent_cli_error(format!("daemon not running (state: {state})")))
     }
 }
 
-fn read_launchctl_state() -> (&'static str, Option<u32>) {
+pub(crate) fn read_launchctl_state() -> (&'static str, Option<u32>) {
     let out =
         Command::new("/bin/launchctl").args(["print", &format!("system/{DAEMON_LABEL}")]).output();
     let Ok(o) = out else { return ("unknown", None) };

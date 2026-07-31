@@ -65,6 +65,8 @@ pub struct DriveUploadStart {
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub replace_file_id: Option<String>,
+    #[serde(default)]
+    pub allow_empty: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,6 +178,15 @@ impl ProxyService {
             if start.replace_file_id.is_some() { "drive.full" } else { "drive.file" };
         let (_, resolved_connector_id) =
             self.resolve_connection(&agent_id, &selector, required_scope).await?;
+        if start.size_bytes == 0 && start.allow_empty {
+            self.audit_explicit_empty_override(
+                &request_id,
+                &agent_id,
+                required_scope,
+                if expected_replace { "drive.replace" } else { "drive.upload" },
+            )
+            .await;
+        }
         let (mut initiation_url, _, _) =
             self.resolve_upstream(&selector, resolved_connector_id.as_deref())?;
         let initiation_path = start.replace_file_id.as_ref().map_or_else(
@@ -839,6 +850,12 @@ fn validate_start(start: &DriveUploadStart) -> Result<(), DriveUploadError> {
     if start.size_bytes > MAX_DRIVE_UPLOAD_BYTES {
         return Err(DriveUploadError::TooLarge);
     }
+    if start.size_bytes == 0 && mime_requires_content(parsed.essence_str()) && !start.allow_empty {
+        return Err(DriveUploadError::Invalid(
+            "drive.integrity.empty_source: zero-byte structured uploads require explicit allow_empty consent"
+                .to_owned(),
+        ));
+    }
     if let Some(parent) = &start.parent_id
         && (parent.is_empty()
             || parent.len() > 256
@@ -864,6 +881,19 @@ fn validate_start(start: &DriveUploadStart) -> Result<(), DriveUploadError> {
         return Err(DriveUploadError::Invalid("invalid idempotency key".to_owned()));
     }
     Ok(())
+}
+
+fn mime_requires_content(mime_type: &str) -> bool {
+    let mime = mime_type.trim().to_ascii_lowercase();
+    mime == "application/pdf"
+        || mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || mime == "application/zip"
+        || mime == "application/gzip"
+        || mime.starts_with("application/vnd.openxmlformats-officedocument.")
+        || mime.starts_with("application/vnd.ms-")
+        || mime.starts_with("application/vnd.oasis.opendocument.")
 }
 
 fn parse_content_range(value: &str) -> Result<(u64, u64, u64), DriveUploadError> {
@@ -1057,6 +1087,7 @@ mod tests {
             parent_id: None,
             idempotency_key: None,
             replace_file_id: None,
+            allow_empty: false,
         };
         assert!(validate_start(&request).is_ok());
         request.size_bytes += 1;
@@ -1064,6 +1095,14 @@ mod tests {
         request.size_bytes = 1;
         request.mime_type = "application/vnd.google-apps.document".to_owned();
         assert!(validate_start(&request).is_err());
+        request.mime_type = "application/pdf".to_owned();
+        request.size_bytes = 0;
+        assert!(validate_start(&request).is_err());
+        request.allow_empty = true;
+        assert!(validate_start(&request).is_ok());
+        request.allow_empty = false;
+        request.mime_type = "text/plain".to_owned();
+        assert!(validate_start(&request).is_ok());
     }
 
     #[test]
@@ -1141,6 +1180,7 @@ mod tests {
             parent_id: Some("folder".to_owned()),
             idempotency_key: Some("key".to_owned()),
             replace_file_id: None,
+            allow_empty: false,
         };
         let existing = sessions.find_idempotent("agent", "drive", &start).await;
         assert!(matches!(

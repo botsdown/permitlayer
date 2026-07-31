@@ -62,6 +62,12 @@ method = "GET"
 path = "files"
 
 [[tools]]
+name = "drive.files.audit_empty"
+required_scope = "drive.readonly"
+method = "GET"
+path = "files"
+
+[[tools]]
 name = "drive.files.create"
 required_scope = "drive.file"
 method = "POST"

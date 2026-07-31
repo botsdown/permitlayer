@@ -59,6 +59,7 @@ fn run_update(
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home.to_str().unwrap())
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
+        .env("AGENTSSO_UPGRADE_DRY_RUN", "1")
         .env("NO_COLOR", "1")
         .arg("update")
         .args(args)
@@ -136,7 +137,7 @@ async fn drift_report_selects_highest_prerelease_and_flags_cli_behind() {
         "expected a 'drift detected' section;\nstdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("brew upgrade agentsso") && stdout.contains("sudo agentsso setup"),
+        stdout.contains("agentsso upgrade"),
         "expected the remediation to name the supported upgrade path;\nstdout:\n{stdout}"
     );
 }
@@ -195,10 +196,9 @@ async fn drift_report_handles_release_query_failure() {
     );
 }
 
-/// `agentsso update --apply` is a hard error now: it redirects to the
-/// supported upgrade path (exit 3) and changes nothing.
+/// `agentsso update --apply` remains a non-mutating compatibility error.
 #[tokio::test]
-async fn apply_is_removed_and_redirects() {
+async fn apply_redirects_without_mutating() {
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
     std::fs::create_dir_all(home.join("audit")).unwrap();
@@ -208,16 +208,13 @@ async fn apply_is_removed_and_redirects() {
 
     assert_eq!(
         code, 3,
-        "expected exit 3 for the --apply redirect; got {code}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "expected compatibility exit 3; got {code}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("update_apply_removed"),
-        "expected error_block code 'update_apply_removed';\nstderr:\n{stderr}"
+        stderr.contains("update_apply_removed") && stderr.contains("agentsso upgrade"),
+        "expected non-mutating upgrade redirect;\nstderr:\n{stderr}"
     );
-    assert!(
-        stderr.contains("brew upgrade agentsso") && stderr.contains("sudo agentsso setup"),
-        "expected the redirect to name the supported upgrade path;\nstderr:\n{stderr}"
-    );
+    assert!(!stdout.contains("would run"), "update --apply must not enter upgrade flow");
 }
 
 /// The drift report records an audit event with the three versions

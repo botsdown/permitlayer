@@ -99,18 +99,34 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let config = DaemonConfig::load(&CliOverrides::default()).unwrap_or_default();
     let home = config.paths.home.clone();
 
-    // -- PID guard: applies to ALL paths (summary, connections, watch).
-    let pid = match PidFile::read(&home)? {
-        Some(pid) => pid,
-        None => {
-            eprintln!("daemon not running");
+    // The privileged macOS service belongs to root, so the invoking user's
+    // `~/.agentsso/pid` says nothing about its liveness. Prefer launchd and
+    // the root-owned control socket when the system plist is installed; use
+    // the legacy PID guard only for foreground/per-user daemons.
+    #[cfg(target_os = "macos")]
+    let system_snapshot = crate::cli::service::status_macos::snapshot().await;
+    #[cfg(target_os = "macos")]
+    let pid = if permitlayer_core::paths::home_override().is_none() && system_snapshot.installed {
+        if system_snapshot.state != "running" {
+            eprintln!("daemon not running (system service state: {})", system_snapshot.state);
             std::process::exit(3);
         }
+        if !system_snapshot.control_reachable {
+            eprintln!("daemon unreachable (system service control socket is not reachable)");
+            std::process::exit(3);
+        }
+        match system_snapshot.pid {
+            Some(pid) => pid,
+            None => {
+                eprintln!("daemon degraded (launchd reports running but no PID is available)");
+                std::process::exit(3);
+            }
+        }
+    } else {
+        foreground_pid(&home)?
     };
-    if !PidFile::is_daemon_running(&home)? {
-        eprintln!("daemon not running (stale PID file for PID {pid})");
-        std::process::exit(3);
-    }
+    #[cfg(not(target_os = "macos"))]
+    let pid = foreground_pid(&home)?;
 
     let bind_addr = config.http.bind_addr;
     let control_token = crate::cli::kill::read_control_token(&home);
@@ -137,10 +153,41 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
             } else {
                 print_human_status(&body, pid);
             }
+            let daemon_version = body["version"].as_str().unwrap_or("unknown");
+            if daemon_version != env!("CARGO_PKG_VERSION") {
+                eprintln!(
+                    "daemon version drift: CLI {}, daemon {daemon_version}",
+                    env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(3);
+            }
+            if body["status"].as_str() != Some("healthy") {
+                eprintln!("daemon degraded (health status is not healthy)");
+                std::process::exit(3);
+            }
         }
-        Err(_) => print_fallback_status(pid, bind_addr, args.json),
+        Err(error) => {
+            print_fallback_status(pid, bind_addr, args.json);
+            eprintln!("daemon degraded: health endpoint unreachable: {error}");
+            std::process::exit(3);
+        }
     }
     Ok(())
+}
+
+fn foreground_pid(home: &std::path::Path) -> anyhow::Result<u32> {
+    let pid = match PidFile::read(home)? {
+        Some(pid) => pid,
+        None => {
+            eprintln!("daemon not running");
+            std::process::exit(3);
+        }
+    };
+    if !PidFile::is_daemon_running(home)? {
+        eprintln!("daemon not running (stale PID file for PID {pid})");
+        std::process::exit(3);
+    }
+    Ok(pid)
 }
 
 // --------------------------------------------------------------------------

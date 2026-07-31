@@ -60,6 +60,9 @@ enum Commands {
     /// Upload local binary files to Google Drive through PermitLayer's
     /// authenticated, policy-checked resumable transfer path.
     Drive(cli::drive::DriveArgs),
+    /// Run a secretless stdio MCP bridge over the caller UID's
+    /// kernel-authenticated local data socket.
+    Mcp(cli::mcp_bridge::McpArgs),
     /// Grant an agent use of a connection at a tier, with an optional
     /// policy + selector alias (Epic 11, Story 11.14). One agent may hold
     /// many bindings. Bearer-immutable — never touches the agent's token.
@@ -76,6 +79,8 @@ enum Commands {
     /// then composes the `connect` OAuth + seal + verify + scope-merge
     /// + rebind + OpenClaw-snippet flow. Idempotent on re-runs.
     Quickstart(cli::quickstart::QuickstartArgs),
+    /// Enroll a local agent runtime without giving it a reusable bearer.
+    Onboard(cli::onboard::OnboardArgs),
     /// Manage user-facing configuration
     Config(cli::config::ConfigArgs),
     /// Tail the audit log live (historical query ships in Story 5.2)
@@ -118,10 +123,12 @@ enum Commands {
     /// entry, autostart, data dir, and binary (FR8). Destructive —
     /// requires interactive confirmation OR --yes.
     Uninstall(cli::uninstall::UninstallArgs),
-    /// Check for updates (default) or apply them in place
-    /// (`--apply`). Preserves vault, audit log, policies, agent
-    /// registrations, and the OS-keychain master key. FR73-76.
+    /// Check for version drift. `--apply` is a deprecated compatibility
+    /// alias for `agentsso upgrade`.
     Update(cli::update::UpdateArgs),
+    /// Upgrade the Homebrew formula, activate the newly installed binary as
+    /// the privileged daemon, and verify CLI/daemon convergence.
+    Upgrade(cli::upgrade::UpgradeArgs),
     /// Rotate the master encryption key in your OS keychain (FR17).
     /// Re-encrypts every credential under a fresh key; OAuth refresh
     /// tokens persist (no re-consent needed). Agent bearer tokens
@@ -309,6 +316,7 @@ async fn main() -> ExitCode {
             connection_to_exit_code(cli::connection::run(args).await)
         }
         Some(Commands::Drive(args)) => anyhow_to_exit_code(cli::drive::run(args).await),
+        Some(Commands::Mcp(args)) => anyhow_to_exit_code(cli::mcp_bridge::run(args).await),
         // `bind`/`unbind` share the connection exit taxonomy (operator-
         // correctable → 2; conflict/system → 3) via `cli::oauth_seal`.
         Some(Commands::Bind(args)) => connection_to_exit_code(cli::bind::run_bind(args).await),
@@ -316,6 +324,7 @@ async fn main() -> ExitCode {
         Some(Commands::Quickstart(args)) => {
             connection_to_exit_code(cli::quickstart::run(args).await)
         }
+        Some(Commands::Onboard(args)) => anyhow_to_exit_code(cli::onboard::run(args).await),
         Some(Commands::Config(args)) => anyhow_to_exit_code(cli::config::run(args)),
         Some(Commands::Policy(args)) => anyhow_to_exit_code(cli::policy::run(args).await),
         Some(Commands::Audit(args)) => anyhow_to_exit_code(cli::audit::run(args).await),
@@ -330,6 +339,7 @@ async fn main() -> ExitCode {
         Some(Commands::Service(args)) => anyhow_to_exit_code(cli::service::run(args).await),
         Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),
+        Some(Commands::Upgrade(args)) => anyhow_to_exit_code(cli::upgrade::run(args).await),
         Some(Commands::RotateKey(args)) => {
             rotate_key_to_exit_code(cli::rotate_key::run(args).await)
         }

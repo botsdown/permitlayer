@@ -479,6 +479,15 @@ impl RegistrySnapshot {
         let mut by_name = HashMap::with_capacity(agents.len());
         let mut by_lookup_key = HashMap::with_capacity(agents.len());
         for agent in agents {
+            if agent.local_only {
+                // Local-only identities are administrative principals for the
+                // UID-authenticated Unix-socket bridge. Keep them available
+                // to CRUD and onboarding by name, but make bearer lookup
+                // structurally impossible rather than relying only on the
+                // auth layer to reject them after a lookup hit.
+                by_name.insert(agent.name().to_owned(), agent);
+                continue;
+            }
             let Some(key) = lookup_key_from_hex(&agent.lookup_key_hex) else {
                 tracing::warn!(
                     agent_name = %agent.name(),
@@ -519,6 +528,10 @@ impl RegistrySnapshot {
         let mut malformed: Vec<String> = Vec::new();
         let mut stale: Vec<String> = Vec::new();
         for agent in agents {
+            if agent.local_only {
+                by_name.insert(agent.name().to_owned(), agent);
+                continue;
+            }
             let Some(stored_key) = lookup_key_from_hex(&agent.lookup_key_hex) else {
                 malformed.push(agent.name().to_owned());
                 continue;
@@ -1130,6 +1143,21 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_keeps_local_only_agent_out_of_bearer_index() {
+        let key = [0x44u8; LOOKUP_KEY_BYTES];
+        let mut agent = fake_agent("hermes-local", key);
+        agent.local_only = true;
+
+        let snap = RegistrySnapshot::from_agents(vec![agent.clone()]);
+        assert!(snap.get_by_name("hermes-local").is_some());
+        assert!(snap.lookup_by_key(&key).is_none());
+
+        let checked = RegistrySnapshot::from_agents_checked(vec![agent], &[0x55; 32]);
+        assert!(checked.get_by_name("hermes-local").is_some());
+        assert!(checked.lookup_by_key(&key).is_none());
+    }
+
+    #[test]
     fn from_agents_checked_skips_stale_lookup_keys_from_index() {
         // Story 7.6b AC #12: an agent whose on-disk lookup_key_hex was
         // computed under the OLD daemon subkey (i.e., a rotation that
@@ -1169,6 +1197,7 @@ mod tests {
             lookup_key_hex: "not-hex".to_owned(),
             created_at: Utc::now(),
             last_seen_at: None,
+            local_only: false,
         };
         let bad_agent = raw.into_validated().unwrap();
         let snap = RegistrySnapshot::from_agents(vec![bad_agent]);

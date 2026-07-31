@@ -24,7 +24,7 @@ use rmcp::model::{
 use rmcp::{tool, tool_handler, tool_router};
 use tracing::debug;
 
-use crate::error::{AgentId, ProxyError};
+use crate::error::{AgentId, ProxyError, RequestId};
 use crate::request::ProxyRequest;
 use crate::service::{DriveTransferStart, ProxyService};
 use crate::transport::gmail_shape;
@@ -603,6 +603,44 @@ fn reject_drive_create_content_fields(value: &serde_json::Value) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// Metadata-only create is safe by default for Google-native resources (most
+/// commonly folders). Creating any other MIME type through this endpoint
+/// necessarily creates a zero-byte placeholder, which must be explicit.
+fn reject_implicit_empty_drive_file(
+    value: &serde_json::Value,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if allow_empty {
+        return Ok(());
+    }
+    let mime_type = value
+        .as_object()
+        .and_then(|object| object.get("mimeType"))
+        .and_then(serde_json::Value::as_str);
+    if mime_type.is_some_and(|mime| {
+        mime.starts_with("application/vnd.google-apps.") || !mime_requires_content(mime)
+    }) {
+        return Ok(());
+    }
+    Err(
+        "drive.integrity.empty_source: metadata-only drive.files.create would create a zero-byte structured file; use `agentsso drive upload <path>` for content, or set allow_empty=true only for an intentional empty placeholder"
+            .to_owned(),
+    )
+}
+
+fn mime_requires_content(mime_type: &str) -> bool {
+    let mime = mime_type.trim().to_ascii_lowercase();
+    mime == "application/pdf"
+        || mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || mime == "application/zip"
+        || mime == "application/gzip"
+        || mime.starts_with("application/vnd.openxmlformats-officedocument.")
+        || mime.starts_with("application/vnd.ms-")
+        || mime.starts_with("application/vnd.oasis.opendocument.")
 }
 
 fn json_type_name(value: &serde_json::Value) -> &'static str {
@@ -1955,6 +1993,17 @@ pub struct FileCreateParams {
     pub file: serde_json::Value,
     /// Fields to include in the response (e.g., "id,name,mimeType").
     pub fields: Option<String>,
+    /// Explicitly allow a zero-byte non-Google-native placeholder.
+    #[serde(default)]
+    pub allow_empty: bool,
+}
+
+/// Parameters for the read-only suspicious zero-byte placeholder audit.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyFileAuditParams {
+    /// Page token returned by a previous audit page.
+    pub page_token: Option<String>,
 }
 
 /// Parameters for `drive.files.update`.
@@ -2357,6 +2406,65 @@ impl DriveMcpServer {
 #[tool_router(router = tool_router)]
 impl DriveMcpServer {
     #[tool(
+        name = "drive.files.audit_empty",
+        description = "Read-only audit for suspicious zero-byte non-Google-native Drive files. Returns matching metadata from one page plus nextPageToken when more files remain; it never deletes or modifies files."
+    )]
+    async fn files_audit_empty(
+        &self,
+        Parameters(params): Parameters<EmptyFileAuditParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "drive.files.audit_empty", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|error| error.to_string())?;
+        let qs = build_query_string(&[
+            ("pageSize", Some("1000".to_owned())),
+            ("pageToken", params.page_token),
+            ("q", Some("trashed = false".to_owned())),
+            (
+                "fields",
+                Some(
+                    "nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,parents,webViewLink)"
+                        .to_owned(),
+                ),
+            ),
+            ("includeItemsFromAllDrives", Some("true".to_owned())),
+            ("supportsAllDrives", Some("true".to_owned())),
+        ]);
+        let body = self
+            .dispatch(Self::drive_request(
+                format!("files{qs}"),
+                "drive.readonly",
+                Method::GET,
+                Bytes::new(),
+                agent_id,
+            ))
+            .await?;
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| format!("invalid Drive list: {error}"))?;
+        let files = value
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "Drive list response omitted its files array".to_owned())?;
+        let suspicious = files
+            .iter()
+            .filter(|file| {
+                file.get("size").and_then(serde_json::Value::as_str) == Some("0")
+                    && !file
+                        .get("mimeType")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|mime| mime.starts_with("application/vnd.google-apps."))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        serde_json::to_string(&serde_json::json!({
+            "suspicious": suspicious,
+            "nextPageToken": value.get("nextPageToken"),
+            "readOnly": true,
+        }))
+        .map_err(|error| error.to_string())
+    }
+
+    #[tool(
         name = "drive.files.list",
         description = "List files in Google Drive. Returns file IDs, names, and metadata."
     )]
@@ -2499,7 +2607,7 @@ impl DriveMcpServer {
 
     #[tool(
         name = "drive.files.create",
-        description = "Create a metadata-only file or folder in Google Drive; this tool never uploads file bytes. Pass a JSON file resource with at minimum a 'name'. Use 'mimeType': 'application/vnd.google-apps.folder' to create a folder. For PDF, Excel, image, or other local binary content, run `agentsso drive upload <path> --parent <folder-id>` through the terminal. Do not pass media_body, content, base64, data, or a local path."
+        description = "Create a metadata-only Google-native resource (such as a folder). This tool never uploads file bytes and refuses zero-byte non-Google-native placeholders by default. For PDF, Excel, image, or other local binary content, run `agentsso drive upload <path> --parent <folder-id>` through the terminal. Set allow_empty=true only when an empty placeholder is intentional."
     )]
     async fn files_create(
         &self,
@@ -2510,6 +2618,22 @@ impl DriveMcpServer {
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         coerce_and_validate_json_object_body(&mut params.file, "file")?;
         reject_drive_create_content_fields(&params.file)?;
+        reject_implicit_empty_drive_file(&params.file, params.allow_empty)?;
+        if params.allow_empty {
+            let request_id = parts
+                .extensions
+                .get::<RequestId>()
+                .map(|request_id| request_id.0.clone())
+                .unwrap_or_else(|| ulid::Ulid::new().to_string());
+            self.proxy_service
+                .audit_explicit_empty_override(
+                    &request_id,
+                    &agent_id,
+                    "drive.file",
+                    "drive.files.create",
+                )
+                .await;
+        }
         let body =
             serde_json::to_vec(&params.file).map_err(|e| format!("invalid file JSON: {e}"))?;
         let qs = build_query_string(&[
@@ -3365,6 +3489,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn drive_create_requires_explicit_consent_for_empty_blob_placeholders() {
+        let spreadsheet = serde_json::json!({
+            "name": "report.xlsx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        });
+        assert!(reject_implicit_empty_drive_file(&spreadsheet, false).is_err());
+        assert!(reject_implicit_empty_drive_file(&spreadsheet, true).is_ok());
+
+        let folder = serde_json::json!({
+            "name": "Expenses",
+            "mimeType": "application/vnd.google-apps.folder"
+        });
+        assert!(reject_implicit_empty_drive_file(&folder, false).is_ok());
+
+        let text = serde_json::json!({
+            "name": "notes.txt",
+            "mimeType": "text/plain"
+        });
+        assert!(reject_implicit_empty_drive_file(&text, false).is_ok());
+    }
+
     // ── Arg coercion: stringified-JSON-object args (Fix A) ─────────
 
     #[test]
@@ -3714,12 +3860,12 @@ mod tests {
     /// the registered tool set.
     /// Gmail: 5 original + 6 (9.1) + 15 (9.2) = 26.
     /// Calendar: 5 original + 7 (9.3) = 12.
-    /// Drive: complete document lifecycle = 27.
+    /// Drive: complete document lifecycle + empty-placeholder audit = 28.
     #[test]
     fn epic9_tool_counts_are_exact() {
         assert_eq!(GmailMcpServer::tool_router().map.len(), 26, "Gmail tool count");
         assert_eq!(CalendarMcpServer::tool_router().map.len(), 12, "Calendar tool count");
-        assert_eq!(DriveMcpServer::tool_router().map.len(), 27, "Drive tool count");
+        assert_eq!(DriveMcpServer::tool_router().map.len(), 28, "Drive tool count");
     }
 
     #[test]

@@ -723,6 +723,15 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
         }
     }
 
+    // Re-assert every persisted local runtime enrollment after the daemon is
+    // healthy. Records pin exact connection IDs and capabilities, so setup
+    // can repair sockets and managed Hermes bridge paths without expanding
+    // authority or asking operators to remember one-off grant commands.
+    crate::cli::onboard::reconcile_enrollments()
+        .await
+        .map_err(|error| anyhow::anyhow!("reconcile persisted local agent enrollments: {error}"))?;
+    println!("  {} local agent enrollments reconciled", g.check);
+
     // Setup succeeded. The legacy binary is no longer needed — drop
     // the `.legacy-bak` crumb. Best-effort; a stale crumb left by a
     // crash between here and the `rename` is swept by
