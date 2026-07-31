@@ -44,6 +44,7 @@ use crate::design::render;
 enum Access {
     Read,
     ReadWrite,
+    FullControl,
 }
 
 impl Access {
@@ -52,10 +53,11 @@ impl Access {
         match self {
             Access::Read => "read",
             Access::ReadWrite => "read-write",
+            Access::FullControl => "full-control",
         }
     }
     fn is_write(self) -> bool {
-        matches!(self, Access::ReadWrite)
+        matches!(self, Access::ReadWrite | Access::FullControl)
     }
 }
 
@@ -65,6 +67,7 @@ fn parse_access_line(line: &str) -> Option<Access> {
     match line.trim().to_lowercase().as_str() {
         "" | "1" | "read" => Some(Access::Read),
         "2" | "read-write" | "rw" => Some(Access::ReadWrite),
+        "3" | "full-control" | "full" => Some(Access::FullControl),
         _ => None,
     }
 }
@@ -77,7 +80,7 @@ fn prompt_access(connector: &str) -> Access {
     for attempt in 0..2 {
         print!(
             "What should this agent be able to do with {connector}?  \
-             [1] read (default)  [2] read & write: "
+             [1] read (default)  [2] read & write  [3] full control: "
         );
         let _ = std::io::stdout().flush();
         let mut line = String::new();
@@ -88,7 +91,7 @@ fn prompt_access(connector: &str) -> Access {
                     return a;
                 }
                 if attempt == 0 {
-                    println!("  please answer 1 or 2.");
+                    println!("  please answer 1, 2, or 3.");
                 }
             }
             Err(_) => return Access::Read,
@@ -111,14 +114,19 @@ pub struct QuickstartArgs {
 
     /// Request the read-only tier (the default). The agent can READ;
     /// writes are denied by absent scope.
-    #[arg(long, conflicts_with = "read_write")]
+    #[arg(long, conflicts_with_all = ["read_write", "full_control"])]
     pub read: bool,
 
     /// Request the read-write tier — the OAuth grant includes the write
     /// scopes so the sealed credential can send/modify. The daemon is
     /// headless; there is no per-write gate.
-    #[arg(long = "read-write", conflicts_with = "read")]
+    #[arg(long = "read-write", conflicts_with_all = ["read", "full_control"])]
     pub read_write: bool,
+
+    /// Create a separate Drive connection using Google's restricted full
+    /// Drive scope. Valid only for the Drive connector.
+    #[arg(long = "full-control", conflicts_with_all = ["read", "read_write"])]
+    pub full_control: bool,
 
     /// Path to a Google OAuth client JSON file (BYO client).
     #[arg(long = "oauth-client", value_name = "PATH")]
@@ -234,6 +242,11 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         Access::Read
     } else if args.read_write {
         Access::ReadWrite
+    } else if args.full_control {
+        if connector_id != "google-drive" {
+            anyhow::bail!("--full-control is only supported for Google Drive");
+        }
+        Access::FullControl
     } else if interactive {
         prompt_access(&service)
     } else {
@@ -248,6 +261,9 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         );
         return Err(oauth_seal::exit2());
     };
+    if access == Access::FullControl && connector_id != "google-drive" {
+        anyhow::bail!("full-control is only supported for Google Drive");
+    }
 
     // Agent name + derived connection name (`<agent>-<connector-bare>`).
     let agent_name = args.agent.clone().unwrap_or_else(|| format!("{bare}-quickstart"));
@@ -284,6 +300,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             connector_id: &connector_id,
             name: &connection_name,
             read_write: access.is_write(),
+            full_control: access == Access::FullControl,
             oauth_config,
             connection_id,
             interactive,
@@ -314,7 +331,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         agent: &agent_name,
         connection_id: &record.id.to_string(),
         tier: access.tier(),
-        policy: None,
+        policy: (access == Access::FullControl).then_some("drive-sharing-full-control"),
         alias: Some(&connection_name),
     };
     match crate::cli::connect_uds::post_bind(&handle, &req).await {
@@ -619,8 +636,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_access_line_maps_full_control_inputs() {
+        for s in ["3", "full-control", "full", "FULL", " 3 "] {
+            assert_eq!(parse_access_line(s), Some(Access::FullControl), "{s:?} → full-control");
+        }
+    }
+
+    #[test]
     fn parse_access_line_rejects_junk() {
-        for s in ["3", "yes", "y", "no", "readwrite", "r/w", "delete-everything"] {
+        for s in ["yes", "y", "no", "readwrite", "r/w", "delete-everything"] {
             assert_eq!(parse_access_line(s), None, "{s:?} must be unrecognized");
         }
     }
@@ -629,7 +653,9 @@ mod tests {
     fn access_tier_strings() {
         assert_eq!(Access::Read.tier(), "read");
         assert_eq!(Access::ReadWrite.tier(), "read-write");
+        assert_eq!(Access::FullControl.tier(), "full-control");
         assert!(Access::ReadWrite.is_write());
+        assert!(Access::FullControl.is_write());
         assert!(!Access::Read.is_write());
     }
 

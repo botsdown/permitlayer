@@ -33,7 +33,7 @@ pub struct BindArgs {
     /// Connection to bind: a connection name or its ULID id.
     pub connection: String,
     /// Access tier the binding grants.
-    #[arg(long, value_parser = ["read", "read-write"])]
+    #[arg(long, value_parser = ["read", "read-write", "full-control"])]
     pub grant: String,
     /// Optional policy further constraining the grant. Must already exist
     /// in the daemon's active policy set (checked before any write).

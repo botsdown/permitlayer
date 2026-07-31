@@ -39,5 +39,8 @@ This keeps its existing MCP contract while making misuse fail loudly.
 - The daemon transiently holds one bounded chunk per active transfer; four
   concurrent chunks cap this new memory surface at approximately 32 MiB.
 - Upload sessions are memory-only and expire after 30 minutes of inactivity.
-  Daemon restart abandons incomplete sessions; Google eventually expires the
-  unreachable upstream session.
+Daemon restart abandons incomplete sessions; Google eventually expires the
+unreachable upstream session.
+
+ADR-0012 extends this bounded transport to client-owned downloads and content
+replacement without changing the upload contract.

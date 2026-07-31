@@ -27,7 +27,7 @@ use permitlayer_core::audit::dispatcher::AuditDispatcher;
 use permitlayer_core::killswitch::KillSwitch;
 use permitlayer_core::policy::PolicySet;
 use permitlayer_core::store::{
-    AgentIdentityStore, BindingStore, ConnectionStore, LocalPrincipalStore,
+    AgentIdentityStore, BindingStore, ConnectionStore, LocalCapability, LocalPrincipalStore,
 };
 use permitlayer_proxy::error::{AgentId, AgentPolicyBinding};
 use permitlayer_proxy::middleware::{ApprovalService, ConnTrackerSink};
@@ -85,7 +85,8 @@ impl LocalRequestAudit {
                 .unwrap_or_else(|| ulid::Ulid::new().to_string()),
             path: request.uri().path().to_owned(),
             method: request.method().as_str().to_owned(),
-            selector: selector_from_upload_path(request.uri().path())
+            selector: local_route(request.uri().path())
+                .map(|route| route.selector)
                 .unwrap_or_else(|| "-".to_owned()),
         }
     }
@@ -417,8 +418,8 @@ async fn authenticate_local_peer(
             ));
         }
     };
-    let selector = match selector_from_upload_path(request.uri().path()) {
-        Some(selector) => selector,
+    let route = match local_route(request.uri().path()) {
+        Some(route) => route,
         None => {
             return Err(Box::new(
                 local_auth_denied(
@@ -427,12 +428,34 @@ async fn authenticate_local_peer(
                     peer,
                     Some(&grant.agent),
                     "local_access.route_denied",
-                    "the local data socket accepts Drive upload routes only",
+                    "the local data socket accepts fixed-function Drive transfer routes only",
                 )
                 .await,
             ));
         }
     };
+    if !grant.permits(route.capability) {
+        let capability = match route.capability {
+            LocalCapability::DriveUpload => "drive-upload",
+            LocalCapability::DriveDownload => "drive-download",
+            LocalCapability::DriveReplace => "drive-replace",
+        };
+        return Err(Box::new(
+            local_auth_denied(
+                &state,
+                &audit,
+                peer,
+                Some(&grant.agent),
+                "local_access.capability_denied",
+                &format!(
+                    "this operation requires: `sudo agentsso agent local-access grant {} --user {} --capability {capability}`",
+                    grant.agent, grant.username_at_grant
+                ),
+            )
+            .await,
+        ));
+    }
+    let selector = route.selector;
     let policy = match permitlayer_proxy::middleware::auth::resolve_local_policy_binding(
         state.binding_store.as_ref(),
         state.connection_store.as_ref(),
@@ -459,7 +482,12 @@ async fn authenticate_local_peer(
 
     // Never accept caller-declared authority. The listener itself fixes the
     // only available scope, and there is deliberately no bearer fallback.
-    request.headers_mut().insert("x-agentsso-scope", HeaderValue::from_static("drive.file"));
+    let scope = match route.capability {
+        LocalCapability::DriveDownload => "drive.readonly",
+        LocalCapability::DriveUpload => "drive.file",
+        LocalCapability::DriveReplace => "drive.full",
+    };
+    request.headers_mut().insert("x-agentsso-scope", HeaderValue::from_static(scope));
     request.extensions_mut().insert(AgentId(grant.agent.clone()));
     request.extensions_mut().insert(AgentPolicyBinding(policy));
     request.extensions_mut().insert(PeerCredentials { uid: peer.uid, gid: peer.gid });
@@ -487,13 +515,35 @@ async fn authenticate_local_peer(
     Ok(request)
 }
 
-fn selector_from_upload_path(path: &str) -> Option<String> {
+struct LocalRoute {
+    selector: String,
+    capability: LocalCapability,
+}
+
+fn local_route(path: &str) -> Option<LocalRoute> {
     let rest = path.strip_prefix("/v1/tools/")?;
     let (selector, suffix) = rest.split_once('/')?;
-    if selector.is_empty() || (suffix != "uploads" && !suffix.starts_with("uploads/")) {
+    if selector.is_empty() {
         return None;
     }
-    urlencoding::decode(selector).ok().map(|value| value.into_owned())
+    let capability = if suffix == "uploads" || suffix.starts_with("uploads/") {
+        LocalCapability::DriveUpload
+    } else if suffix == "downloads"
+        || suffix.starts_with("downloads/")
+        || suffix == "exports"
+        || suffix.starts_with("exports/")
+        || suffix == "revision-downloads"
+        || suffix.starts_with("revision-downloads/")
+    {
+        LocalCapability::DriveDownload
+    } else if suffix == "replacements" || suffix.starts_with("replacements/") {
+        LocalCapability::DriveReplace
+    } else {
+        return None;
+    };
+    urlencoding::decode(selector)
+        .ok()
+        .map(|value| LocalRoute { selector: value.into_owned(), capability })
 }
 
 async fn local_auth_denied(
@@ -686,6 +736,14 @@ mod tests {
             Ok(())
         }
 
+        async fn replace(
+            &self,
+            principal: permitlayer_core::store::LocalPrincipal,
+        ) -> Result<(), StoreError> {
+            *self.0.write().await = Some(principal);
+            Ok(())
+        }
+
         async fn get(
             &self,
             uid: u32,
@@ -765,14 +823,11 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_upload_routes() {
-        assert_eq!(selector_from_upload_path("/v1/tools/drive/uploads"), Some("drive".to_owned()));
-        assert_eq!(
-            selector_from_upload_path("/v1/tools/my%20drive/uploads/id"),
-            Some("my drive".to_owned())
-        );
-        assert_eq!(selector_from_upload_path("/v1/tools/drive/files"), None);
-        assert_eq!(selector_from_upload_path("/mcp/drive"), None);
+    fn accepts_only_transfer_routes() {
+        assert_eq!(local_route("/v1/tools/drive/uploads").unwrap().selector, "drive");
+        assert_eq!(local_route("/v1/tools/my%20drive/downloads/id").unwrap().selector, "my drive");
+        assert!(local_route("/v1/tools/drive/files").is_none());
+        assert!(local_route("/mcp/drive").is_none());
     }
 
     #[tokio::test]
@@ -788,6 +843,7 @@ mod tests {
                 uid,
                 username_at_grant: current_username(),
                 agent: "angie".to_owned(),
+                capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },
@@ -815,6 +871,7 @@ mod tests {
                 uid,
                 username_at_grant: current_username(),
                 agent: "angie".to_owned(),
+                capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },
@@ -865,6 +922,7 @@ mod tests {
                 uid,
                 username_at_grant: current_username(),
                 agent: "angie".to_owned(),
+                capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },
@@ -911,6 +969,7 @@ mod tests {
                 uid,
                 username_at_grant: "definitely-not-the-current-user".to_owned(),
                 agent: "angie".to_owned(),
+                capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },

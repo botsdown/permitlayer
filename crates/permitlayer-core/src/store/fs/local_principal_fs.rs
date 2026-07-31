@@ -84,6 +84,31 @@ impl LocalPrincipalStore for LocalPrincipalFsStore {
         Ok(())
     }
 
+    async fn replace(&self, principal: LocalPrincipal) -> Result<(), StoreError> {
+        validate_record(&principal)?;
+        let _guard = self.mutation_lock.lock().await;
+        let target = self.target(principal.uid);
+        if read_record(&target, principal.uid).await?.is_none() {
+            return Err(StoreError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "local-principal grant does not exist",
+            )));
+        }
+        let tmp = self.tempfile(principal.uid);
+        let dir = self.dir();
+        let bytes = toml::to_string_pretty(&principal)
+            .map_err(|error| StoreError::RecordSerdeFailed {
+                kind: "local-principal",
+                id: principal.uid.to_string(),
+                reason: error.to_string(),
+                source: Some(Box::new(error)),
+            })?
+            .into_bytes();
+        tokio::task::spawn_blocking(move || super::atomic_write(&tmp, &target, &dir, &bytes))
+            .await??;
+        Ok(())
+    }
+
     async fn get(&self, uid: u32) -> Result<Option<LocalPrincipal>, StoreError> {
         read_record(&self.target(uid), uid).await
     }
@@ -213,9 +238,63 @@ mod tests {
             uid,
             username_at_grant: user.to_owned(),
             agent: agent.to_owned(),
+            capabilities: vec![crate::store::LocalCapability::DriveUpload],
             granted_at: Utc::now(),
             granted_by_peer_uid: Some(0),
         }
+    }
+
+    #[test]
+    fn version_one_record_migrates_to_upload_only() {
+        let record: LocalPrincipal = toml::from_str(
+            r#"
+schema_version = 1
+platform = "macos"
+uid = 501
+username_at_grant = "angie"
+agent = "drive-agent"
+granted_at = "2026-07-30T12:00:00Z"
+"#,
+        )
+        .unwrap();
+        assert_eq!(record.capabilities, vec![crate::store::LocalCapability::DriveUpload]);
+        assert!(validate_record(&record).is_ok());
+        assert!(!record.permits(crate::store::LocalCapability::DriveDownload));
+        assert!(!record.permits(crate::store::LocalCapability::DriveReplace));
+    }
+
+    #[test]
+    fn version_two_missing_capabilities_fails_closed() {
+        let record: LocalPrincipal = toml::from_str(
+            r#"
+schema_version = 2
+platform = "macos"
+uid = 501
+username_at_grant = "angie"
+agent = "drive-agent"
+granted_at = "2026-07-30T12:00:00Z"
+"#,
+        )
+        .unwrap();
+        assert!(record.capabilities.is_empty());
+        assert!(validate_record(&record).is_err());
+    }
+
+    #[test]
+    fn version_one_cannot_claim_new_capabilities() {
+        let record: LocalPrincipal = toml::from_str(
+            r#"
+schema_version = 1
+platform = "macos"
+uid = 501
+username_at_grant = "angie"
+agent = "drive-agent"
+capabilities = ["drive-download"]
+granted_at = "2026-07-30T12:00:00Z"
+"#,
+        )
+        .unwrap();
+        assert!(validate_record(&record).is_err());
     }
 
     #[tokio::test]
@@ -283,11 +362,34 @@ mod tests {
 }
 
 fn validate_record(record: &LocalPrincipal) -> Result<(), StoreError> {
-    if record.schema_version != LOCAL_PRINCIPAL_SCHEMA_VERSION {
+    if record.schema_version != 1 && record.schema_version != LOCAL_PRINCIPAL_SCHEMA_VERSION {
         return Err(StoreError::UnsupportedVersion {
             got: record.schema_version,
             expected: LOCAL_PRINCIPAL_SCHEMA_VERSION,
         });
+    }
+    if record.schema_version == 1
+        && record.capabilities != [crate::store::LocalCapability::DriveUpload]
+    {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "version-1 local-principal grants must be upload-only",
+        )));
+    }
+    if record.capabilities.is_empty() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local-principal grant has no capabilities",
+        )));
+    }
+    let mut capabilities = record.capabilities.clone();
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    if capabilities.len() != record.capabilities.len() {
+        return Err(StoreError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local-principal grant contains duplicate capabilities",
+        )));
     }
     if record.platform != "macos" {
         return Err(StoreError::IoError(std::io::Error::new(

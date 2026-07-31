@@ -59,6 +59,10 @@ pub struct AddArgs {
     /// Request the connector's read-write tier (default: read tier).
     #[arg(long = "read-write")]
     pub read_write: bool,
+    /// Request a separate full-control Drive connection. This restricted
+    /// OAuth grant is never added to an existing connection.
+    #[arg(long = "full-control", conflicts_with = "read_write")]
+    pub full_control: bool,
     /// Path to a Google OAuth client JSON (BYO client).
     #[arg(long = "oauth-client", value_name = "PATH")]
     pub oauth_client: Option<PathBuf>,
@@ -184,6 +188,7 @@ async fn reauth(args: ReauthArgs) -> Result<()> {
             connector_id: &existing.connector_id,
             name: &existing.name,
             read_write: existing.tier == ConnectionTier::ReadWrite,
+            full_control: existing.tier == ConnectionTier::FullControl,
             oauth_config,
             connection_id: existing.id,
             interactive,
@@ -248,6 +253,9 @@ async fn add(args: AddArgs) -> Result<()> {
         }
     };
     let connector_id = connector.id().to_owned();
+    if args.full_control && connector_id != "google-drive" {
+        anyhow::bail!("--full-control is only supported for Google Drive");
+    }
     let name = args.name.clone().unwrap_or_else(|| {
         // Default the display name to the bare service selector.
         match connector_id.as_str() {
@@ -381,6 +389,7 @@ async fn add(args: AddArgs) -> Result<()> {
             connector_id: &connector_id,
             name: &name,
             read_write: args.read_write,
+            full_control: args.full_control,
             oauth_config,
             connection_id,
             interactive,
@@ -394,6 +403,7 @@ async fn add(args: AddArgs) -> Result<()> {
     let tier_label = match record.tier {
         ConnectionTier::Read => "read",
         ConnectionTier::ReadWrite => "read-write",
+        ConnectionTier::FullControl => "full-control",
     };
     println!();
     println!("\u{2713} connection '{}' created \u{00b7} {}", record.name, record.connector_id);
@@ -458,6 +468,7 @@ async fn add(args: AddArgs) -> Result<()> {
     let grant = match record.tier {
         ConnectionTier::ReadWrite => "read-write",
         ConnectionTier::Read => "read",
+        ConnectionTier::FullControl => "full-control",
     };
     println!("  bind an agent to it:  agentsso bind <agent> {} --grant {grant}", record.name);
     println!();
@@ -707,6 +718,7 @@ fn tier_label(tier: ConnectionTier) -> &'static str {
     match tier {
         ConnectionTier::Read => "read",
         ConnectionTier::ReadWrite => "read-write",
+        ConnectionTier::FullControl => "full-control",
     }
 }
 

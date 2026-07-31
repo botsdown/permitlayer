@@ -272,6 +272,7 @@ pub(crate) struct OAuthSealInputs<'a> {
     pub connector_id: &'a str,
     pub name: &'a str,
     pub read_write: bool,
+    pub full_control: bool,
     pub oauth_config: GoogleOAuthConfig,
     pub connection_id: permitlayer_credential::ConnectionId,
     pub interactive: bool,
@@ -294,6 +295,7 @@ pub(crate) async fn oauth_dance_and_seal(
         connector_id,
         name,
         read_write,
+        full_control,
         oauth_config,
         connection_id,
         interactive,
@@ -307,8 +309,16 @@ pub(crate) async fn oauth_dance_and_seal(
         oauth_config.client_secret().map(str::to_owned),
     )?;
 
-    let requested_scopes = requested_scope_uris(connector, read_write);
-    let scopes_owned: Vec<String> = requested_scopes.iter().map(|s| (*s).to_owned()).collect();
+    let requested_scopes = if full_control {
+        connector.tier_scope_uris("full-control").ok_or_else(|| {
+            anyhow::anyhow!("connector {connector_id} does not define a full-control tier")
+        })?
+    } else {
+        requested_scope_uris(connector, read_write)
+    };
+    let mut scopes_owned: Vec<String> = requested_scopes.iter().map(|s| (*s).to_owned()).collect();
+    scopes_owned.sort_unstable();
+    scopes_owned.dedup();
 
     // Phase: authorize (device-flow / headless-paste / browser).
     let result = if device_flow {
@@ -466,7 +476,13 @@ pub(crate) async fn oauth_dance_and_seal(
             anyhow::anyhow!("OAuth client bundle is not valid UTF-8")
         })?);
 
-    let tier = if read_write { "read-write" } else { "read" };
+    let tier = if full_control {
+        "full-control"
+    } else if read_write {
+        "read-write"
+    } else {
+        "read"
+    };
     let seal_req = super::connect_uds::CredentialsSealRequest {
         connection_id: &connection_id.to_string(),
         connector_id,

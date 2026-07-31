@@ -711,6 +711,7 @@ pub(crate) async fn post_unbind(
 pub(crate) struct GrantLocalAccessRequest<'a> {
     pub agent: &'a str,
     pub user: &'a str,
+    pub capabilities: &'a [String],
 }
 
 #[derive(Debug, Deserialize)]

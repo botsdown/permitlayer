@@ -136,7 +136,10 @@ On a macOS system-service installation, an operator must first grant the
 Hermes OS account access to exactly one existing PermitLayer agent:
 
 ```sh
-sudo agentsso agent local-access grant <agent> --user angie
+sudo agentsso agent local-access grant <agent> --user angie \
+  --capability drive-upload \
+  --capability drive-download \
+  --capability drive-replace
 ```
 
 Hermes must not request, locate, create, print, or pass a bearer token for this
@@ -151,6 +154,30 @@ Google resumable session inside the daemon, and verifies Drive's final size
 and MD5 checksum. If the command is interrupted, inspect the printed upload
 ID with `agentsso drive upload-status <id>`, then rerun the same upload command;
 PermitLayer reuses the live session and resumes at its acknowledged offset.
+
+### Downloading, exporting, and replacing Drive files
+
+Use MCP `drive.files.download`, `drive.files.export`, or
+`drive.revisions.download` for files up to 16 MiB. For a durable path, use:
+
+```sh
+agentsso drive download <file-id> --output ./template.xlsx
+agentsso drive export <file-id> --mime-type application/pdf --output ./document.pdf
+agentsso drive revision-download <file-id> <revision-id> --output ./old.xlsx
+agentsso drive replace <file-id> ./completed.xlsx
+```
+
+`drive.files.get` is metadata-only. Downloads refuse symlinks and existing
+destinations unless `--force` is explicit, install atomically, and report
+SHA-256 plus Drive MD5 when available. Replacement preserves the file ID and
+creates a revision.
+
+Interrupted blob and retained-revision downloads leave a hidden partial file
+and non-secret resume record beside the destination; rerun the identical
+command to continue. PermitLayer fingerprints the Drive source and refuses to
+splice a partial file onto a newer version. Exports restart from zero. Google Vids are downloaded
+through Drive's long-running operation and are also non-resumable across CLI
+invocations. PermitLayer never exposes the resulting signed Google URL.
 
 ### `format` on messages/threads/drafts
 
@@ -178,8 +205,8 @@ fields you include. Prefer `patch` for single-field changes.
 
 - `gmail.messages.trash` is **reversible** (`untrash` counterpart). Use
   this for "delete this email."
-- `drive.files.delete` is **permanent** — it bypasses the trash, no undo.
-  Confirm intent before invoking.
+- Prefer `drive.files.trash` and `drive.files.restore`. Legacy
+  `drive.files.delete` and `drive.files.delete_permanently` are **permanent**.
 
 ### Sending mail and creating drafts
 

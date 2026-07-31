@@ -28,11 +28,11 @@ use crate::common::{DaemonTestConfig, start_daemon, wait_for_health};
 /// `epic9_bundled_and_fixture_policy_sets_are_identical` /
 /// `bundled_seed_has_no_prompt_disposition` invariants; if the
 /// product bundle's policy count ever changes, that core test fails
-/// first and this constant is updated in lockstep. (8 = 2 retained
-/// originals + 6 per-service tiers; the legacy
+/// first and this constant is updated in lockstep. (9 = 2 retained
+/// originals + 7 per-service tiers, including Drive full-control; the legacy
 /// `calendar-prompt-on-write` example was deleted with the headless
 /// `prompt`-purge.)
-const MANAGED_COUNT: i64 = 8;
+const MANAGED_COUNT: i64 = 9;
 
 const POLICY_A: &str = r#"
 [[policies]]

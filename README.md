@@ -147,23 +147,28 @@ keeps tokens scoped to your Google account, not a shared app.
    agentsso audit --follow
    ```
 
-To upload a local PDF, spreadsheet, image, or other binary file to Drive,
-use the unprivileged streaming helper rather than the metadata-only
-`drive.files.create` MCP tool:
+To transfer local PDF, spreadsheet, image, or other binary file bytes with
+Drive, use the unprivileged streaming helper rather than the metadata-only
+MCP tools:
 
 ```sh
 # One-time operator action on a macOS system-service installation:
-sudo agentsso agent local-access grant <agent> --user <macos-user>
+sudo agentsso agent local-access grant <agent> --user <macos-user> \
+  --capability drive-upload --capability drive-download --capability drive-replace
 
 # Run as the granted user (including from Hermes):
 agentsso drive upload ./receipt.pdf --parent <drive-folder-id>
+agentsso drive download <file-id> --output ./template.xlsx
+agentsso drive export <file-id> --mime-type application/pdf --output ./document.pdf
+agentsso drive revision-download <file-id> <revision-id> --output ./old.xlsx
+agentsso drive replace <file-id> ./completed.xlsx
 ```
 
-The helper reads the file as the invoking user, sends policy-checked 8 MiB
-chunks through the daemon, and verifies Drive's returned size and MD5. On
+The helper reads or writes the file as the invoking user, sends policy-checked
+8 MiB chunks through the daemon, and verifies size and checksums. On
 macOS it authenticates with the kernel-attested UID over a private per-user
 socket; it does not read or receive a PermitLayer bearer token. Do not create
-`~/.agentsso/agent-bearer.token` for a shell-capable agent to enable uploads.
+`~/.agentsso/agent-bearer.token` for a shell-capable agent to enable transfers.
 
 ### Connect over SSH or under `su`
 

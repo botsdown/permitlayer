@@ -131,17 +131,24 @@ intentionally not shipped (it would require the broad
 (`calendar.freebusy.query` is an HTTP POST but a **read** — it uses
 `calendar.readonly` and auto-approves.)
 
-### Drive (8 tools)
+### Drive document lifecycle
 
 | Tool | R/W | Read-only | Read/write |
 |---|---|---|---|
-| `drive.files.list` / `.get` / `.search` | R | ✅ | ✅ |
+| `drive.files.list` / `.get` / `.search` / `.download` / `.export` | R | ✅ | ✅ |
 | `drive.about.get` | R | ✅ | ✅ |
-| `drive.files.create` / `.update` / `.copy` / `.delete` | W | ❌ | prompt |
+| shared-drive discovery, revisions, and changes | R | ✅ | ✅ |
+| `drive.files.create` / `.update` / `.copy` / `.trash` / `.restore` / `.delete` | W | ❌ | prompt |
+| arbitrary replacement and permission mutation | W | ❌ | full-control only |
 
 `drive.files.delete` is **permanent** (bypasses the trash). The
 prompt-on-write approval is the safety gate; `drive.file` also limits
 all Drive writes to files the app created or opened.
+
+Full control is an explicit third Drive tier. Create a new connection with
+`--full-control` and bind it using `--grant full-control --policy
+drive-sharing-full-control`. Existing connections cannot be promoted and
+narrow bindings cannot route through a full-control token.
 
 ## Security posture
 
