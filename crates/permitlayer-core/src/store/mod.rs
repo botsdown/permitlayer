@@ -18,6 +18,7 @@ pub mod binding;
 pub mod connection;
 pub mod error;
 pub mod fs;
+pub mod local_principal;
 #[cfg(any(test, feature = "test-seam"))]
 pub mod test_seams;
 pub mod validate;
@@ -32,6 +33,7 @@ pub use connection::{
     AccountHint, ConnectionRecord, ConnectionStatus, ConnectionStore, ConnectionTier,
 };
 pub use error::{EnvelopeParseError, StoreError};
+pub use local_principal::{LocalPrincipal, LocalPrincipalStore};
 pub use validate::validate_service_name;
 
 /// Persist sealed credentials keyed by `(ConnectionId, Slot)` (Story 11.9).

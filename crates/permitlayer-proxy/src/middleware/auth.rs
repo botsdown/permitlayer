@@ -494,6 +494,41 @@ async fn resolve_policy_binding(
     }
 }
 
+/// Resolve the policy attached to a local peer-authenticated agent's
+/// binding. This is the policy-stamping half of bearer authentication,
+/// exposed for the daemon's kernel-peer authentication path so both
+/// transports evaluate the same binding and the same policy.
+///
+/// A missing binding returns an empty stamp and remains an authoritative
+/// deny in `ProxyService::resolve_connection`, matching `AuthLayer`. Store
+/// failures fail closed.
+pub async fn resolve_local_policy_binding(
+    binding_store: Option<&Arc<dyn permitlayer_core::store::BindingStore>>,
+    connection_store: Option<&Arc<dyn permitlayer_core::store::ConnectionStore>>,
+    agent_name: &str,
+    selector: &str,
+) -> Result<String, ProxyError> {
+    let (Some(binding_store), Some(connection_store)) = (binding_store, connection_store) else {
+        return Ok(String::new());
+    };
+    match crate::binding_resolve::resolve_agent_binding(
+        binding_store,
+        connection_store,
+        agent_name,
+        selector,
+    )
+    .await
+    {
+        Ok(Some((binding, _))) => Ok(binding.policy.unwrap_or_default()),
+        Ok(None) => Ok(String::new()),
+        Err(error) => Err(ProxyError::Internal {
+            message: format!(
+                "binding/connection store read failed for local agent '{agent_name}': {error}"
+            ),
+        }),
+    }
+}
+
 /// Dispatch an `agent-auth-denied` audit event (best-effort, fire-and-track
 /// through [`AuditDispatcher`]).
 ///

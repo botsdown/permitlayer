@@ -198,6 +198,17 @@ pub fn control_socket_path(home_override: Option<&Path>) -> PathBuf {
     daemon_runtime_dir(home_override).join("control.sock")
 }
 
+/// Upload-only Unix socket for one kernel-attested local user.
+///
+/// The daemon creates this inode owned by the granted user with mode `0600`
+/// on macOS.
+/// Filesystem access is only the first gate: the listener also verifies
+/// `LOCAL_PEERCRED` and resolves the UID through the root-private
+/// local-principal store on every request.
+pub fn local_agent_socket_path(home_override: Option<&Path>, uid: u32) -> PathBuf {
+    daemon_runtime_dir(home_override).join(format!("agent-{uid}.sock"))
+}
+
 /// MCP listener socket address — kept on loopback TCP for
 /// backwards-compat with MCP clients (OpenClaw, Claude Desktop,
 /// Cursor) that speak HTTP-over-TCP "streamable-http" per the MCP
@@ -370,6 +381,7 @@ mod tests {
         let plugins = plugins_dir(Some(tmp));
         let audit = audit_log_path(Some(tmp));
         let sock = control_socket_path(Some(tmp));
+        let local_sock = local_agent_socket_path(Some(tmp), 501);
 
         assert_eq!(state, tmp);
         assert_eq!(logs, tmp.join("logs"));
@@ -384,6 +396,7 @@ mod tests {
         assert_eq!(plugins, tmp.join("plugins"));
         assert_eq!(audit, tmp.join("logs").join("audit.log"));
         assert_eq!(sock, tmp.join("run").join("control.sock"));
+        assert_eq!(local_sock, tmp.join("run").join("agent-501.sock"));
     }
 
     #[test]

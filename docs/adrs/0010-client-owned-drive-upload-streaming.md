@@ -17,8 +17,10 @@ or binding policy.
 ## Decision
 
 Binary Drive uploads use `agentsso drive upload`. The unprivileged CLI opens
-and hashes the local file. It creates an authenticated PermitLayer upload
-session and sends sequential 8 MiB chunks. The daemon owns the Google
+and hashes the local file. It creates a PermitLayer upload session and sends
+sequential 8 MiB chunks. ADR-0011 refines inbound authentication: macOS
+system-service callers use kernel peer identity, while authenticated TCP
+remains a compatibility transport. The daemon owns the Google
 resumable session URI in memory, rechecks the agent binding and `drive.file`
 authority on every request, forwards each bounded chunk, and retains no file
 content on disk. The limit is 250 MiB.

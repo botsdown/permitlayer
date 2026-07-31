@@ -707,6 +707,70 @@ pub(crate) async fn post_unbind(
     parse_outcome(status, &response_body)
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct GrantLocalAccessRequest<'a> {
+    pub agent: &'a str,
+    pub user: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LocalAccessGrantResponse {
+    #[serde(alias = "revoked")]
+    pub grant: permitlayer_core::store::LocalPrincipal,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LocalAccessListResponse {
+    pub grants: Vec<permitlayer_core::store::LocalPrincipal>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RevokeLocalAccessRequest<'a> {
+    pub user: &'a str,
+}
+
+pub(crate) async fn post_grant_local_access(
+    handle: &ConnectControlHandle,
+    req: &GrantLocalAccessRequest<'_>,
+) -> Result<ControlOutcome<LocalAccessGrantResponse>> {
+    let body = serde_json::to_string(req).context("serialize local-access grant")?;
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        "/v1/control/agent/local-access",
+        &body,
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+pub(crate) async fn get_local_access(
+    handle: &ConnectControlHandle,
+) -> Result<ControlOutcome<LocalAccessListResponse>> {
+    let (status, response_body) = http_get_with_status_via(
+        &handle.endpoint,
+        "/v1/control/agent/local-access",
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+pub(crate) async fn post_revoke_local_access(
+    handle: &ConnectControlHandle,
+    req: &RevokeLocalAccessRequest<'_>,
+) -> Result<ControlOutcome<LocalAccessGrantResponse>> {
+    let body = serde_json::to_string(req).context("serialize local-access revoke")?;
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        "/v1/control/agent/local-access/revoke",
+        &body,
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
 /// Outcome of a connection-verify POST. The 200 body is `{ ok: true,
 /// ... }` or `{ ok: false, ... }` (the caller branches on `ok`
 /// dynamically); 4xx/5xx use the standard error envelope.

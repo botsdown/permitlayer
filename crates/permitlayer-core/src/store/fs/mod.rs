@@ -11,12 +11,14 @@ pub mod audit_fs;
 pub mod binding_fs;
 pub mod connection_fs;
 pub mod credential_fs;
+pub mod local_principal_fs;
 
 pub use agent_fs::AgentIdentityFsStore;
 pub use audit_fs::AuditFsStore;
 pub use binding_fs::BindingFsStore;
 pub use connection_fs::ConnectionFsStore;
 pub use credential_fs::CredentialFsStore;
+pub use local_principal_fs::LocalPrincipalFsStore;
 
 use std::io::Write as _;
 use std::path::Path;

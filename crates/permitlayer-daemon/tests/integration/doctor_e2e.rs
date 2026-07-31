@@ -105,7 +105,7 @@ fn doctor_is_a_real_subcommand() {
 }
 
 /// `--json` parses, carries the documented schema, and the summary
-/// counts equal the `checks` array tally. There are exactly 8 checks.
+/// counts equal the `checks` array tally. There are exactly 9 checks.
 #[test]
 fn doctor_json_shape_and_summary_consistency() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -130,7 +130,7 @@ fn doctor_json_shape_and_summary_consistency() {
     );
 
     let checks = v["checks"].as_array().expect("checks array");
-    assert_eq!(checks.len(), 8, "there are exactly 8 checks");
+    assert_eq!(checks.len(), 9, "there are exactly 9 checks");
 
     // Every documented check id is present exactly once.
     let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
@@ -145,6 +145,7 @@ fn doctor_json_shape_and_summary_consistency() {
         "no_tty_prompt_trap",
         "operator_layer_compile",
         "legacy_seed_snapshot_present",
+        "local_access_sockets",
     ] {
         assert_eq!(
             ids.iter().filter(|i| **i == expected).count(),
@@ -168,7 +169,7 @@ fn doctor_json_shape_and_summary_consistency() {
     assert_eq!(v["summary"]["pass"], pass, "summary.pass must match tally");
     assert_eq!(v["summary"]["warn"], warn, "summary.warn must match tally");
     assert_eq!(v["summary"]["fail"], fail, "summary.fail must match tally");
-    assert_eq!(pass + warn + fail, 8);
+    assert_eq!(pass + warn + fail, 9);
 }
 
 /// A non-`--fix` `doctor` run NEVER mutates: it must not write a

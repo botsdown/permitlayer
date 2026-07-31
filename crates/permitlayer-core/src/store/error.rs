@@ -152,6 +152,14 @@ pub enum StoreError {
         /// The connection id (ULID text).
         connection_id: String,
     },
+    /// A kernel local principal is already granted to another agent.
+    #[error("local uid {uid} is already granted to agent '{agent}'")]
+    LocalPrincipalAlreadyExists {
+        /// Kernel user identifier that is already mapped.
+        uid: u32,
+        /// Existing PermitLayer agent name.
+        agent: String,
+    },
 }
 
 /// Structural parse failures for the on-disk sealed-credential envelope.

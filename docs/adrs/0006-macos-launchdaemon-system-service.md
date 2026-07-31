@@ -35,7 +35,7 @@ Adopt the Apple-documented system-service path:
   - `/v1/control/*` (14 handlers) lives on a Unix domain socket at `/var/run/permitlayer/control.sock` (mode 0660, owned `root:permitlayer-clients`). The daemon reads the caller's UID via `LOCAL_PEERCRED` and audit-logs it alongside any bearer-token claim.
   - `/mcp/*` lives on TCP loopback at `127.0.0.1:3820`. MCP clients (OpenClaw, Claude Desktop, Cursor) speak HTTP-over-streamable-http and cannot connect to Unix sockets.
 - **`permitlayer-clients` macOS group** (created by `service install`) gates control-plane access. The installing operator is added automatically; additional operators are added with `dseditgroup`.
-- **End-user authentication** uses per-user bearer tokens minted by `agentsso agent register <name> --policy <policy-name>` and written to `~/.agentsso/agent-bearer.token` (mode 0600, owned by the invoking user). The daemon writes the token using a `tmp + chown + atomic-rename + O_NOFOLLOW` pattern that defends against CWE-367 / filelock-CVE-2026-22701 class of TOCTOU symlink attacks.
+- **End-user authentication** supports two distinct surfaces. General MCP/REST clients use per-user bearer tokens minted by `agentsso agent register`; the daemon writes them with the existing `tmp + chown + atomic-rename + O_NOFOLLOW` defense. Shell-capable local agents that must not possess a reusable secret use ADR-0011's per-UID, peer-authenticated fixed-function data socket instead.
 
 ## Empirical evidence
 
