@@ -886,26 +886,8 @@ fn install_transfer_partial(
 
 #[cfg(windows)]
 fn atomic_replace_windows(partial: &std::path::Path, output: &std::path::Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    let replacement: Vec<u16> = partial.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = output.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: both paths are NUL-terminated UTF-16 buffers that remain alive
-    // for the call; optional backup/exclusion/reserved pointers are null.
-    let replaced = unsafe {
-        windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
-            destination.as_ptr(),
-            replacement.as_ptr(),
-            std::ptr::null(),
-            windows_sys::Win32::Storage::FileSystem::REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if replaced == 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("atomically replace {}", output.display()));
-    }
-    Ok(())
+    permitlayer_platform_windows::replace_file(partial, output)
+        .with_context(|| format!("atomically replace {}", output.display()))
 }
 
 async fn status(args: UploadStatusArgs) -> Result<()> {

@@ -2235,7 +2235,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "permitlayer-connectors"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "arc-swap",
  "serde",
@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-core"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-credential"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "rand 0.8.5",
  "serde",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-daemon"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2329,6 +2329,7 @@ dependencies = [
  "permitlayer-keystore",
  "permitlayer-oauth",
  "permitlayer-platform-macos",
+ "permitlayer-platform-windows",
  "permitlayer-plugins",
  "permitlayer-proxy",
  "permitlayer-vault",
@@ -2356,13 +2357,12 @@ dependencies = [
  "unicode-width",
  "url",
  "urlencoding",
- "windows-sys 0.59.0",
  "zeroize",
 ]
 
 [[package]]
 name = "permitlayer-keystore"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-oauth"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "axum",
  "mockito",
@@ -2409,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-platform-macos"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "libc",
  "nix",
@@ -2419,8 +2419,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "permitlayer-platform-windows"
+version = "1.4.1"
+dependencies = [
+ "tempfile",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "permitlayer-plugins"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -2442,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-proxy"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2488,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-vault"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "aes-gcm",
  "hkdf",
@@ -4868,7 +4876,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "clap",
