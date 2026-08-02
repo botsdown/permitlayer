@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::store::StoreError;
 
 /// Current local-principal record schema.
-pub const LOCAL_PRINCIPAL_SCHEMA_VERSION: u16 = 2;
+pub const LOCAL_PRINCIPAL_SCHEMA_VERSION: u16 = 3;
 
 /// A fixed-function operation a kernel-authenticated local account may use.
 /// These are deliberately narrower than connector scopes: possessing a local
@@ -21,6 +21,9 @@ pub enum LocalCapability {
     DriveUpload,
     DriveDownload,
     DriveReplace,
+    McpGmail,
+    McpCalendar,
+    McpDrive,
 }
 
 impl LocalCapability {
@@ -31,8 +34,20 @@ impl LocalCapability {
             Self::DriveUpload => "drive-upload",
             Self::DriveDownload => "drive-download",
             Self::DriveReplace => "drive-replace",
+            Self::McpGmail => "mcp-gmail",
+            Self::McpCalendar => "mcp-calendar",
+            Self::McpDrive => "mcp-drive",
         }
     }
+}
+
+/// Human-facing consent profile. The version and explicit capability list are
+/// both persisted: a future release cannot reinterpret a profile name to add
+/// authority without a new operator action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAccessProfile {
+    pub name: String,
+    pub version: u16,
 }
 
 /// One kernel-identity-to-agent authorization grant.
@@ -51,6 +66,11 @@ pub struct LocalPrincipal {
     /// Explicit fixed-function operations. Version-1 records did not contain
     /// this field and deserialize as upload-only, preserving their authority.
     pub capabilities: Vec<LocalCapability>,
+    /// Exact connection IDs this local principal may address. Empty is retained
+    /// only for legacy schema v1/v2 records and never authorizes MCP routes.
+    pub connection_ids: Vec<String>,
+    /// Optional versioned UX profile; capabilities remain authoritative.
+    pub profile: Option<LocalAccessProfile>,
     /// Grant timestamp.
     pub granted_at: DateTime<Utc>,
     /// Kernel peer UID of the operator who issued the control-plane grant.
@@ -65,6 +85,8 @@ struct LocalPrincipalWire {
     username_at_grant: String,
     agent: String,
     capabilities: Option<Vec<LocalCapability>>,
+    connection_ids: Option<Vec<String>>,
+    profile: Option<LocalAccessProfile>,
     granted_at: DateTime<Utc>,
     granted_by_peer_uid: Option<u32>,
 }
@@ -87,6 +109,8 @@ impl<'de> Deserialize<'de> for LocalPrincipal {
             username_at_grant: wire.username_at_grant,
             agent: wire.agent,
             capabilities,
+            connection_ids: wire.connection_ids.unwrap_or_default(),
+            profile: wire.profile,
             granted_at: wire.granted_at,
             granted_by_peer_uid: wire.granted_by_peer_uid,
         })
@@ -97,6 +121,61 @@ impl LocalPrincipal {
     #[must_use]
     pub fn permits(&self, capability: LocalCapability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    #[must_use]
+    pub fn permits_connection(&self, connection_id: &str) -> bool {
+        self.connection_ids.iter().any(|allowed| allowed == connection_id)
+    }
+
+    /// Validate the immutable capability contract named by a UX profile.
+    /// The explicit capability vector remains authoritative; this prevents a
+    /// profile label from becoming misleading or gaining new meaning later.
+    #[must_use]
+    pub fn profile_contract_matches(&self) -> bool {
+        let Some(profile) = &self.profile else { return true };
+        let mut capabilities = self.capabilities.clone();
+        capabilities.sort_unstable();
+        match (profile.name.as_str(), profile.version) {
+            ("drive-read", 1) => capabilities == [LocalCapability::DriveDownload],
+            ("drive-read-write", 1) => {
+                capabilities == [LocalCapability::DriveUpload, LocalCapability::DriveDownload]
+            }
+            ("drive-full-control", 1) => {
+                capabilities
+                    == [
+                        LocalCapability::DriveUpload,
+                        LocalCapability::DriveDownload,
+                        LocalCapability::DriveReplace,
+                    ]
+            }
+            ("hermes-standard", 1) => {
+                let has_mcp = capabilities.iter().any(|capability| {
+                    matches!(
+                        capability,
+                        LocalCapability::McpGmail
+                            | LocalCapability::McpCalendar
+                            | LocalCapability::McpDrive
+                    )
+                });
+                let has_drive_mcp = capabilities.contains(&LocalCapability::McpDrive);
+                let drive_transfers = [
+                    LocalCapability::DriveUpload,
+                    LocalCapability::DriveDownload,
+                    LocalCapability::DriveReplace,
+                ];
+                let has_download = capabilities.contains(&LocalCapability::DriveDownload);
+                let has_upload = capabilities.contains(&LocalCapability::DriveUpload);
+                let has_replace = capabilities.contains(&LocalCapability::DriveReplace);
+                has_mcp
+                    && if has_drive_mcp {
+                        has_download && (!has_replace || has_upload)
+                    } else {
+                        drive_transfers.iter().all(|capability| !capabilities.contains(capability))
+                    }
+            }
+            _ => false,
+        }
     }
 }
 

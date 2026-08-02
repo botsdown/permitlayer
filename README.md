@@ -152,9 +152,11 @@ Drive, use the unprivileged streaming helper rather than the metadata-only
 MCP tools:
 
 ```sh
-# One-time operator action on a macOS system-service installation:
-sudo agentsso agent local-access grant <agent> --user <macos-user> \
-  --capability drive-upload --capability drive-download --capability drive-replace
+# One-time Hermes enrollment (auto-selects a service with one active account):
+agentsso onboard hermes --user angie
+
+# If a service has multiple active accounts, select it explicitly:
+agentsso onboard hermes --user angie --drive drive-refresh-2026
 
 # Run as the granted user (including from Hermes):
 agentsso drive upload ./receipt.pdf --parent <drive-folder-id>
@@ -164,11 +166,19 @@ agentsso drive revision-download <file-id> <revision-id> --output ./old.xlsx
 agentsso drive replace <file-id> ./completed.xlsx
 ```
 
+`onboard hermes` installs secretless stdio entries in the target user's
+`~/.hermes/config.yaml`. Each runs `agentsso mcp bridge --service <service>`
+through a mode-0600, UID-authenticated Unix socket. The Hermes user never gets
+a reusable PermitLayer bearer. Re-run the same command after an interruption;
+completed identities, bindings, consent, and config entries are adopted.
+
 The helper reads or writes the file as the invoking user, sends policy-checked
 8 MiB chunks through the daemon, and verifies size and checksums. On
 macOS it authenticates with the kernel-attested UID over a private per-user
 socket; it does not read or receive a PermitLayer bearer token. Do not create
 `~/.agentsso/agent-bearer.token` for a shell-capable agent to enable transfers.
+Zero-byte creates, uploads, replacements, and downloads are rejected by
+default. Use `--allow-empty` only for a deliberately empty object.
 
 ### Connect over SSH or under `su`
 

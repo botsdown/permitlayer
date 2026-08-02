@@ -522,8 +522,8 @@ fn acquire_mint_lock() -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError
     acquire_mint_lock_at(&resolve_mint_state_dir())
 }
 
-/// Resolve the mint-lock state dir. Production: the canonical macOS
-/// daemon state dir; tests/dev: `$TMPDIR`.
+/// Resolve the mint-lock state dir. Production (root): the canonical
+/// macOS daemon state dir; tests/dev (non-root): `$TMPDIR`.
 ///
 /// The production state-dir is owned by `permitlayer-core::paths`,
 /// which this crate cannot depend on (would create a cycle). The
@@ -533,8 +533,16 @@ fn acquire_mint_lock() -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError
 /// does NOT serialize root vs user, but tests don't span that
 /// boundary).
 fn resolve_mint_state_dir() -> std::path::PathBuf {
+    // SAFETY: `geteuid` has no preconditions and does not retain pointers.
+    resolve_mint_state_dir_for_euid(unsafe { libc::geteuid() })
+}
+
+fn resolve_mint_state_dir_for_euid(euid: libc::uid_t) -> std::path::PathBuf {
     let prod = std::path::PathBuf::from("/Library/Application Support/permitlayer");
-    if prod.is_dir() {
+    // The installed state directory commonly exists on developer machines but
+    // is intentionally root-only. Presence alone therefore cannot distinguish
+    // the root LaunchDaemon from a non-root test process.
+    if euid == 0 && prod.is_dir() {
         return prod;
     }
     std::env::temp_dir()
@@ -999,6 +1007,11 @@ mod tests {
         let f = fingerprint(&[0u8; 32]);
         assert_eq!(f.len(), 8);
         assert!(f.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn non_root_mint_lock_never_uses_installed_state_dir() {
+        assert_eq!(resolve_mint_state_dir_for_euid(501), std::env::temp_dir());
     }
 
     #[test]

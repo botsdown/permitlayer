@@ -3914,6 +3914,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // it has no MCP, generic REST, health, or control-plane routes.
     #[cfg(target_os = "macos")]
     let local_upload_context = local_principal_store.clone().map(|store| {
+        let local_mcp_connectors = Arc::clone(&proxy_route_slots.connectors);
         let upload_start_slot = Arc::clone(&proxy_route_slots.proxy);
         let upload_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
         let upload_status_slot = Arc::clone(&proxy_route_slots.proxy);
@@ -3926,6 +3927,12 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         let transfer_chunk_slot = Arc::clone(&proxy_route_slots.proxy);
         let transfer_cancel_slot = Arc::clone(&proxy_route_slots.proxy);
         let routes = Router::new()
+            .route(
+                "/mcp/{selector}",
+                any(move |path, req| {
+                    dynamic_connector_mcp_handler(Arc::clone(&local_mcp_connectors), path, req)
+                }),
+            )
             .route(
                 "/v1/tools/{selector}/uploads",
                 post(move |path, req| {

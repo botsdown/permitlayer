@@ -755,6 +755,7 @@ async fn drive_resumable_upload_reconciles_ambiguous_chunk_failure() {
                 parent_id: Some("receipts-folder".to_owned()),
                 idempotency_key: Some("upload-key".to_owned()),
                 replace_file_id: None,
+                allow_empty: false,
             },
         )
         .await

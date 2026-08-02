@@ -91,7 +91,7 @@ pub struct UninstallArgs {
 #[cfg(target_os = "macos")]
 pub(crate) mod install_macos;
 #[cfg(target_os = "macos")]
-mod status_macos;
+pub(crate) mod status_macos;
 #[cfg(target_os = "macos")]
 mod uninstall_macos;
 

@@ -1490,6 +1490,8 @@ fn merge_reload_response(body: ReloadResponse, extras: ReloadResponseExtras) -> 
 pub(crate) struct RegisterAgentRequest {
     pub name: String,
     pub policy_name: String,
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 /// Response body for a successful `POST /v1/control/agent/register`.
@@ -1543,6 +1545,7 @@ pub(crate) enum BearerTokenFileWriteResult {
 pub(crate) struct AgentSummary {
     pub name: String,
     pub policy_name: String,
+    pub local_only: bool,
     pub created_at: String,
     pub last_seen_at: Option<String>,
 }
@@ -1782,13 +1785,12 @@ pub(crate) async fn register_agent_handler(
     // single policy field. We still validate the operator-named policy
     // exists (above) and echo it in the response, but it is not persisted
     // on the identity.
-    let identity = match AgentIdentity::new(
-        payload.name.clone(),
-        token_hash,
-        lookup_key_hex,
-        created_at,
-        None,
-    ) {
+    let identity_result = if payload.local_only {
+        AgentIdentity::new_local(payload.name.clone(), token_hash, lookup_key_hex, created_at, None)
+    } else {
+        AgentIdentity::new(payload.name.clone(), token_hash, lookup_key_hex, created_at, None)
+    };
+    let identity = match identity_result {
         Ok(id) => id,
         Err(e) => {
             return agent_error_response(
@@ -1930,7 +1932,9 @@ pub(crate) async fn register_agent_handler(
     #[cfg(target_os = "macos")]
     let bearer_token_file: Option<BearerTokenFileWriteResult> = {
         let home_override = permitlayer_core::paths::home_override();
-        if !should_write_per_user_bearer_token(home_override.as_deref()) {
+        if payload.local_only {
+            None
+        } else if !should_write_per_user_bearer_token(home_override.as_deref()) {
             tracing::debug!(
                 target: "control",
                 request_id = %request_id,
@@ -2048,7 +2052,7 @@ pub(crate) async fn register_agent_handler(
         status: "ok",
         name: payload.name,
         policy_name: payload.policy_name,
-        bearer_token,
+        bearer_token: if payload.local_only { String::new() } else { bearer_token },
         created_at: format_audit_timestamp(created_at),
         peer_uid: _peer_creds_for_audit.map(|creds| creds.uid),
         bearer_token_file,
@@ -2104,6 +2108,7 @@ pub(crate) async fn list_agents_handler(
             // (bindings replace it in 11.14). The wire field is retained
             // for now but carries no per-agent policy binding.
             policy_name: String::new(),
+            local_only: a.local_only,
             created_at: format_audit_timestamp(a.created_at),
             last_seen_at: a.last_seen_at.map(format_audit_timestamp),
         })
@@ -6005,12 +6010,23 @@ pub(crate) async fn connectors_handler(
 // Secretless local-principal authorization.
 // --------------------------------------------------------------------------
 
+// One daemon owns the root-private local-principal store. Serialize the
+// read/compare/write consent transaction so concurrent `--replace` requests
+// cannot both validate against the same stale record and report success.
+static LOCAL_ACCESS_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug, Deserialize)]
 struct GrantLocalAccessRequest {
     agent: String,
     user: String,
     #[serde(default)]
     capabilities: Vec<String>,
+    #[serde(default)]
+    connections: Vec<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    replace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6086,7 +6102,16 @@ async fn grant_local_access_handler(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (state, peer, payload.agent, payload.user, payload.capabilities);
+        let _ = (
+            state,
+            peer,
+            payload.agent,
+            payload.user,
+            payload.capabilities,
+            payload.connections,
+            payload.profile,
+            payload.replace,
+        );
         local_access_error(
             StatusCode::NOT_IMPLEMENTED,
             "local_access.unsupported_platform",
@@ -6095,7 +6120,8 @@ async fn grant_local_access_handler(
     }
     #[cfg(target_os = "macos")]
     {
-        let GrantLocalAccessRequest { agent, user, capabilities } = payload;
+        let GrantLocalAccessRequest { agent, user, capabilities, connections, profile, replace } =
+            payload;
         let capability_names =
             if capabilities.is_empty() { vec!["drive-upload".to_owned()] } else { capabilities };
         let mut requested_capabilities = Vec::new();
@@ -6104,11 +6130,14 @@ async fn grant_local_access_handler(
                 "drive-upload" => permitlayer_core::store::LocalCapability::DriveUpload,
                 "drive-download" => permitlayer_core::store::LocalCapability::DriveDownload,
                 "drive-replace" => permitlayer_core::store::LocalCapability::DriveReplace,
+                "mcp-gmail" => permitlayer_core::store::LocalCapability::McpGmail,
+                "mcp-calendar" => permitlayer_core::store::LocalCapability::McpCalendar,
+                "mcp-drive" => permitlayer_core::store::LocalCapability::McpDrive,
                 _ => {
                     return local_access_error(
                         StatusCode::BAD_REQUEST,
                         "local_access.invalid_capability",
-                        "capability must be drive-upload, drive-download, or drive-replace",
+                        "unsupported local-access capability",
                     );
                 }
             };
@@ -6116,11 +6145,58 @@ async fn grant_local_access_handler(
                 requested_capabilities.push(parsed);
             }
         }
+        let parsed_profile = match profile.as_deref() {
+            None => None,
+            Some("drive-read@1") => Some(permitlayer_core::store::LocalAccessProfile {
+                name: "drive-read".to_owned(),
+                version: 1,
+            }),
+            Some("drive-read-write@1") => Some(permitlayer_core::store::LocalAccessProfile {
+                name: "drive-read-write".to_owned(),
+                version: 1,
+            }),
+            Some("drive-full-control@1") => Some(permitlayer_core::store::LocalAccessProfile {
+                name: "drive-full-control".to_owned(),
+                version: 1,
+            }),
+            Some("hermes-standard@1") => Some(permitlayer_core::store::LocalAccessProfile {
+                name: "hermes-standard".to_owned(),
+                version: 1,
+            }),
+            Some(_) => {
+                return local_access_error(
+                    StatusCode::BAD_REQUEST,
+                    "local_access.invalid_profile",
+                    "profile must be drive-read@1, drive-read-write@1, drive-full-control@1, or hermes-standard@1",
+                );
+            }
+        };
         if permitlayer_core::agent::validate_agent_name(&agent).is_err() {
             return local_access_error(
                 StatusCode::BAD_REQUEST,
                 "local_access.invalid_agent",
                 "agent name is invalid",
+            );
+        }
+        requested_capabilities.sort_unstable();
+        let profile_probe = permitlayer_core::store::LocalPrincipal {
+            schema_version:
+                permitlayer_core::store::local_principal::LOCAL_PRINCIPAL_SCHEMA_VERSION,
+            platform: "macos".to_owned(),
+            uid: 501,
+            username_at_grant: "profile-validation".to_owned(),
+            agent: agent.clone(),
+            capabilities: requested_capabilities.clone(),
+            connection_ids: vec!["profile-validation".to_owned()],
+            profile: parsed_profile.clone(),
+            granted_at: chrono::Utc::now(),
+            granted_by_peer_uid: None,
+        };
+        if !profile_probe.profile_contract_matches() {
+            return local_access_error(
+                StatusCode::BAD_REQUEST,
+                "local_access.profile_capability_mismatch",
+                "the selected profile does not match the exact requested capability set",
             );
         }
         let Some(agent_store) = state.agent_store.as_ref() else {
@@ -6147,6 +6223,120 @@ async fn grant_local_access_handler(
                 );
             }
         }
+        if connections.is_empty() {
+            return local_access_error(
+                StatusCode::BAD_REQUEST,
+                "local_access.connection_required",
+                "new local-access grants require at least one --connection selector",
+            );
+        }
+        let home = state.config_state.load().paths.home.clone();
+        let local_binding_store: Arc<dyn permitlayer_core::store::BindingStore> =
+            match permitlayer_core::store::fs::BindingFsStore::new(home.clone()) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    return local_access_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "local_access.binding_store_unavailable",
+                        error.to_string(),
+                    );
+                }
+            };
+        let local_connection_store: Arc<dyn permitlayer_core::store::ConnectionStore> =
+            match permitlayer_core::store::fs::ConnectionFsStore::new(home) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    return local_access_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "local_access.connection_store_unavailable",
+                        error.to_string(),
+                    );
+                }
+            };
+        let mut requested_connection_ids = Vec::new();
+        let mut requested_connectors = std::collections::BTreeSet::new();
+        for selector in connections {
+            match permitlayer_proxy::middleware::auth::resolve_local_binding(
+                Some(&local_binding_store),
+                Some(&local_connection_store),
+                &agent,
+                &selector,
+            )
+            .await
+            {
+                Ok(Some((connection_id, _))) => {
+                    let Some(parsed_id) =
+                        permitlayer_credential::ConnectionId::from_ulid_str(&connection_id)
+                    else {
+                        return local_access_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "local_access.connection_lookup_failed",
+                            "resolved binding returned an invalid connection ID",
+                        );
+                    };
+                    match local_connection_store.get(parsed_id).await {
+                        Ok(Some(record)) => {
+                            requested_connectors.insert(record.connector_id);
+                        }
+                        Ok(None) => {
+                            return local_access_error(
+                                StatusCode::BAD_REQUEST,
+                                "local_access.connection_not_bound",
+                                "resolved connection no longer exists",
+                            );
+                        }
+                        Err(error) => {
+                            return local_access_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "local_access.connection_lookup_failed",
+                                error.to_string(),
+                            );
+                        }
+                    }
+                    if !requested_connection_ids.contains(&connection_id) {
+                        requested_connection_ids.push(connection_id);
+                    }
+                }
+                Ok(None) => {
+                    return local_access_error(
+                        StatusCode::BAD_REQUEST,
+                        "local_access.connection_not_bound",
+                        format!("connection selector '{selector}' is not bound to agent '{agent}'"),
+                    );
+                }
+                Err(error) => {
+                    return local_access_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "local_access.connection_lookup_failed",
+                        error.to_string(),
+                    );
+                }
+            }
+        }
+        let required_connectors: std::collections::BTreeSet<&str> = requested_capabilities
+            .iter()
+            .map(|capability| match capability {
+                permitlayer_core::store::LocalCapability::McpGmail => "google-gmail",
+                permitlayer_core::store::LocalCapability::McpCalendar => "google-calendar",
+                permitlayer_core::store::LocalCapability::McpDrive
+                | permitlayer_core::store::LocalCapability::DriveUpload
+                | permitlayer_core::store::LocalCapability::DriveDownload
+                | permitlayer_core::store::LocalCapability::DriveReplace => "google-drive",
+            })
+            .collect();
+        if requested_connectors
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            != required_connectors
+        {
+            return local_access_error(
+                StatusCode::BAD_REQUEST,
+                "local_access.connector_capability_mismatch",
+                "requested capabilities must exactly match the connectors selected by --connection",
+            );
+        }
+        requested_connection_ids.sort();
         let (uid, canonical_username) = match resolve_macos_user(&user) {
             Ok(user) => user,
             Err(message) => {
@@ -6164,29 +6354,59 @@ async fn grant_local_access_handler(
                 "local-principal store is unavailable",
             );
         };
+        let _mutation_guard = LOCAL_ACCESS_MUTATION_LOCK.lock().await;
+        let peer_creds = peer.as_ref().map(|extension| extension.0);
         match store.get(uid).await {
             Ok(Some(existing))
                 if existing.agent == agent && existing.username_at_grant == canonical_username =>
             {
-                let mut updated = existing;
-                let before = updated.capabilities.clone();
-                for capability in requested_capabilities {
-                    if !updated.capabilities.contains(&capability) {
-                        updated.capabilities.push(capability);
-                    }
+                let exact_match = existing.capabilities == requested_capabilities
+                    && existing.connection_ids == requested_connection_ids
+                    && existing.profile == parsed_profile;
+                if exact_match {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "status": "ok", "grant": existing })),
+                    )
+                        .into_response();
                 }
-                updated.capabilities.sort_unstable();
-                updated.schema_version =
-                    permitlayer_core::store::local_principal::LOCAL_PRINCIPAL_SCHEMA_VERSION;
-                if updated.capabilities != before
-                    && let Err(error) = store.replace(updated.clone()).await
-                {
+                if !replace {
+                    return local_access_error(
+                        StatusCode::CONFLICT,
+                        "local_access.consent_change_required",
+                        "an existing local-access grant has a different immutable capability or connection set; inspect it and repeat with --replace only after explicit operator consent",
+                    );
+                }
+                let updated = permitlayer_core::store::LocalPrincipal {
+                    schema_version:
+                        permitlayer_core::store::local_principal::LOCAL_PRINCIPAL_SCHEMA_VERSION,
+                    platform: "macos".to_owned(),
+                    uid,
+                    username_at_grant: canonical_username.clone(),
+                    agent: agent.clone(),
+                    capabilities: requested_capabilities,
+                    connection_ids: requested_connection_ids,
+                    profile: parsed_profile,
+                    granted_at: chrono::Utc::now(),
+                    granted_by_peer_uid: peer.as_ref().map(|extension| extension.0.uid),
+                };
+                if let Err(error) = store.replace(updated.clone()).await {
                     return local_access_error(
                         StatusCode::CONFLICT,
                         "local_access.grant_failed",
                         error.to_string(),
                     );
                 }
+                emit_local_access_audit(
+                    &state,
+                    "local-access-replaced",
+                    &updated.agent,
+                    &updated.username_at_grant,
+                    updated.uid,
+                    "ok",
+                    peer_creds,
+                )
+                .await;
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({ "status": "ok", "grant": updated })),
@@ -6219,7 +6439,6 @@ async fn grant_local_access_handler(
                 );
             }
         }
-        let peer_creds = peer.map(|extension| extension.0);
         let grant = permitlayer_core::store::LocalPrincipal {
             schema_version:
                 permitlayer_core::store::local_principal::LOCAL_PRINCIPAL_SCHEMA_VERSION,
@@ -6228,6 +6447,8 @@ async fn grant_local_access_handler(
             username_at_grant: canonical_username.clone(),
             agent: agent.clone(),
             capabilities: requested_capabilities,
+            connection_ids: requested_connection_ids,
+            profile: parsed_profile,
             granted_at: chrono::Utc::now(),
             granted_by_peer_uid: peer_creds.map(|creds| creds.uid),
         };

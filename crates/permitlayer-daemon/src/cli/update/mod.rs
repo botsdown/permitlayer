@@ -19,9 +19,8 @@
 //! 3. the **running daemon**'s `whoami.version` over the control UDS,
 //!
 //! prints the exact remediation, and exits non-zero when any pair
-//! disagrees so scripts and `doctor` can react. `--apply` is now a
-//! hard error that points at the supported upgrade path; it never
-//! mutates the filesystem.
+//! disagrees so scripts and `doctor` can react. `--apply` remains a
+//! non-mutating error for backward compatibility.
 //!
 //! On-disk schema migration (the `migrations/` framework) moved to
 //! the daemon boot path (`cli::start::run`) — see `cli::migrations`.
@@ -60,6 +59,10 @@ impl std::fmt::Display for UpdateExitCode3 {
 
 impl std::error::Error for UpdateExitCode3 {}
 
+fn exit3() -> anyhow::Error {
+    anyhow::Error::new(UpdateExitCode3).context(crate::cli::SilentCliError)
+}
+
 /// Exit-code 4 marker — actionable non-success: version drift was
 /// detected, OR the latest-release query failed. Both mean "this
 /// host is not known-current"; a script/CI gate should treat either
@@ -74,10 +77,6 @@ impl std::fmt::Display for UpdateExitCode4 {
 }
 
 impl std::error::Error for UpdateExitCode4 {}
-
-fn exit3() -> anyhow::Error {
-    anyhow::Error::new(UpdateExitCode3).context(crate::cli::SilentCliError)
-}
 
 fn exit4() -> anyhow::Error {
     anyhow::Error::new(UpdateExitCode4).context(crate::cli::SilentCliError)
@@ -107,9 +106,7 @@ fn glyphs() -> Glyphs {
 /// Arguments for `agentsso update`.
 #[derive(Args, Debug, Default, Clone)]
 pub struct UpdateArgs {
-    /// REMOVED. `agentsso update` no longer swaps the binary in
-    /// place. Passing `--apply` prints the supported upgrade command
-    /// and exits non-zero without changing anything.
+    /// Removed. Prints the supported upgrade command without changing state.
     #[arg(long)]
     pub apply: bool,
 
@@ -135,10 +132,8 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             "{}",
             render::error_block(
                 "update_apply_removed",
-                "`agentsso update --apply` was removed. In-place binary swap is no \
-                 longer how agentsso upgrades — it caused silent stale-daemon and \
-                 broken-prerelease-delivery failures (issue #58).",
-                "brew upgrade agentsso && sudo agentsso setup",
+                "`agentsso update --apply` was removed and does not mutate this host.",
+                "agentsso upgrade",
                 None,
             )
         );
@@ -266,12 +261,9 @@ async fn run_drift_report() -> Result<()> {
     }
     println!();
     println!("{} remediation:", g.arrow);
-    println!("    1. brew upgrade agentsso          # update the CLI/binary");
+    println!("    agentsso upgrade                  # Homebrew + daemon + verification");
     println!(
-        "    2. sudo agentsso setup            # re-stage + restart the daemon, version-verified"
-    );
-    println!(
-        "    (curl|sh install path: re-run the installer from https://github.com/permitlayer/permitlayer, then `sudo agentsso setup`)"
+        "    (non-Homebrew install: update the binary through the original package source, then run `sudo agentsso setup --upgrade`)"
     );
     println!();
 

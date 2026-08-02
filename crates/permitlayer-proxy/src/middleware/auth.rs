@@ -348,7 +348,7 @@ where
                     .await
                     .unwrap_or(false);
 
-            if !verified {
+            if !verified || agent.local_only {
                 warn!(
                     agent_name = %agent.name(),
                     "{}",
@@ -527,6 +527,37 @@ pub async fn resolve_local_policy_binding(
             ),
         }),
     }
+}
+
+/// Resolve the exact live binding addressed by a local peer request. Local
+/// grants use the returned connection id to prevent a caller from switching to
+/// another binding held by the same agent.
+pub async fn resolve_local_binding(
+    binding_store: Option<&Arc<dyn permitlayer_core::store::BindingStore>>,
+    connection_store: Option<&Arc<dyn permitlayer_core::store::ConnectionStore>>,
+    agent_name: &str,
+    selector: &str,
+) -> Result<Option<(String, String)>, ProxyError> {
+    let (Some(binding_store), Some(connection_store)) = (binding_store, connection_store) else {
+        return Ok(None);
+    };
+    crate::binding_resolve::resolve_agent_binding(
+        binding_store,
+        connection_store,
+        agent_name,
+        selector,
+    )
+    .await
+    .map(|resolved| {
+        resolved.map(|(binding, _connection)| {
+            (binding.connection_id.to_string(), binding.policy.unwrap_or_default())
+        })
+    })
+    .map_err(|error| ProxyError::Internal {
+        message: format!(
+            "binding/connection store read failed for local agent '{agent_name}': {error}"
+        ),
+    })
 }
 
 /// Dispatch an `agent-auth-denied` audit event (best-effort, fire-and-track
@@ -744,6 +775,23 @@ mod tests {
         (registry, daemon_key, token_string)
     }
 
+    fn local_only_fixture(name: &str) -> (Arc<AgentRegistry>, [u8; LOOKUP_KEY_BYTES], String) {
+        let plaintext = generate_bearer_token_bytes();
+        let token_string = format!("agt_v2_{}_{}", name, base64_url(&plaintext));
+        let daemon_key = [0x43u8; LOOKUP_KEY_BYTES];
+        let lookup_key = compute_lookup_key(&daemon_key, name.as_bytes());
+        let hash = hash_token(token_string.as_bytes()).unwrap();
+        let agent = AgentIdentity::new_local(
+            name.to_owned(),
+            hash,
+            lookup_key_to_hex(&lookup_key),
+            Utc::now(),
+            None,
+        )
+        .unwrap();
+        (Arc::new(AgentRegistry::new(vec![agent])), daemon_key, token_string)
+    }
+
     /// Tiny URL-safe base64 (no padding) encoder. The agent CLI will
     /// use the `base64` crate; tests use a hand-rolled minimal version
     /// to avoid pulling the dep into the proxy crate's dev-deps.
@@ -865,6 +913,18 @@ mod tests {
         // `ProxyService::handle_inner` (Story 11.10). The handler echoes
         // `{agent_id}|{policy_binding}`, so the policy half is empty.
         assert_eq!(body_str, "email-triage|");
+    }
+
+    #[tokio::test]
+    async fn local_only_identity_rejects_even_its_minted_bearer() {
+        let (registry, daemon_key, token) = local_only_fixture("hermes-angie");
+        let svc = build_layer_only_service(registry, daemon_key, None);
+        let mut req =
+            Request::builder().uri("/v1/tools/gmail/users/me").body(Body::empty()).unwrap();
+        req.headers_mut()
+            .insert("authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        let resp: Response<Body> = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── 401 paths ──────────────────────────────────────────────────

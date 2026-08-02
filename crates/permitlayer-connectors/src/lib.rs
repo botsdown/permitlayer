@@ -311,8 +311,8 @@ mod tests {
     #[test]
     fn tool_metadata_is_self_consistent() {
         // AC #7: every required_scope ∈ [scopes]; every tier scope ∈ [scopes];
-        // tool counts == 26/12/27; spot-check key tools.
-        let expected_counts = [("google-gmail", 26), ("google-calendar", 12), ("google-drive", 27)];
+        // tool counts == 26/12/28; spot-check key tools.
+        let expected_counts = [("google-gmail", 26), ("google-calendar", 12), ("google-drive", 28)];
         for (id, n) in expected_counts {
             let d = def_by_id(id);
             assert_eq!(d.tools.len(), n, "{id}: expected {n} tools");

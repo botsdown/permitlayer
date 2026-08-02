@@ -160,6 +160,29 @@ pub struct ProxyService {
 }
 
 impl ProxyService {
+    /// Record an explicit operator/agent choice to create a zero-byte Drive
+    /// object. The event is separate from the normal upstream-call audit so
+    /// integrity-policy overrides remain directly searchable.
+    pub async fn audit_explicit_empty_override(
+        &self,
+        request_id: &str,
+        agent_id: &str,
+        scope: &str,
+        resource: &str,
+    ) {
+        self.write_audit(
+            request_id,
+            agent_id,
+            "drive",
+            scope,
+            resource,
+            "ok",
+            "drive-empty-override",
+            None,
+        )
+        .await;
+    }
+
     /// Create a new proxy service with all required dependencies.
     ///
     /// `vault_dir` is the filesystem directory where per-connection sealed

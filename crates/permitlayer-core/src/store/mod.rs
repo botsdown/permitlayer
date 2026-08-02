@@ -33,7 +33,9 @@ pub use connection::{
     AccountHint, ConnectionRecord, ConnectionStatus, ConnectionStore, ConnectionTier,
 };
 pub use error::{EnvelopeParseError, StoreError};
-pub use local_principal::{LocalCapability, LocalPrincipal, LocalPrincipalStore};
+pub use local_principal::{
+    LocalAccessProfile, LocalCapability, LocalPrincipal, LocalPrincipalStore,
+};
 pub use validate::validate_service_name;
 
 /// Persist sealed credentials keyed by `(ConnectionId, Slot)` (Story 11.9).

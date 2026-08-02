@@ -89,8 +89,31 @@ pub struct LocalAccessGrantArgs {
     pub user: String,
     /// Fixed-function operation to allow. Repeat to grant multiple. Existing
     /// installations default to upload-only.
-    #[arg(long = "capability", value_parser = ["drive-upload", "drive-download", "drive-replace"])]
+    #[arg(
+        long = "capability",
+        value_parser = [
+            "drive-upload",
+            "drive-download",
+            "drive-replace",
+            "mcp-gmail",
+            "mcp-calendar",
+            "mcp-drive"
+        ]
+    )]
     pub capabilities: Vec<String>,
+    /// Connection selector to authorize. Repeat for multiple connections. New
+    /// grants require at least one; the daemon stores exact connection IDs.
+    #[arg(long = "connection")]
+    pub connections: Vec<String>,
+    /// Optional immutable consent profile (`drive-read@1`,
+    /// `drive-read-write@1`, `drive-full-control@1`, or
+    /// `hermes-standard@1`).
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Replace an existing consent set instead of requiring an exact match.
+    /// Authority is never widened implicitly.
+    #[arg(long)]
+    pub replace: bool,
 }
 
 #[derive(Args)]
@@ -182,6 +205,9 @@ async fn local_access(args: LocalAccessArgs) -> Result<()> {
                 agent: &args.agent,
                 user: &args.user,
                 capabilities: &args.capabilities,
+                connections: &args.connections,
+                profile: args.profile.as_deref(),
+                replace: args.replace,
             };
             match crate::cli::connect_uds::post_grant_local_access(&handle, &request).await? {
                 crate::cli::connect_uds::ControlOutcome::Ok(response) => {
@@ -201,6 +227,7 @@ async fn local_access(args: LocalAccessArgs) -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
+                    println!("  connections: {}", response.grant.connection_ids.join(", "));
                     Ok(())
                 }
                 outcome => local_access_outcome_error("grant", outcome),
@@ -212,10 +239,10 @@ async fn local_access(args: LocalAccessArgs) -> Result<()> {
                     if response.grants.is_empty() {
                         println!("No local access grants.");
                     } else {
-                        println!("USER\tUID\tAGENT\tCAPABILITIES\tGRANTED");
+                        println!("USER\tUID\tAGENT\tCAPABILITIES\tCONNECTIONS\tGRANTED");
                         for grant in response.grants {
                             println!(
-                                "{}\t{}\t{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}\t{}",
                                 grant.username_at_grant,
                                 grant.uid,
                                 grant.agent,
@@ -225,6 +252,7 @@ async fn local_access(args: LocalAccessArgs) -> Result<()> {
                                     .map(|capability| capability.as_str())
                                     .collect::<Vec<_>>()
                                     .join(","),
+                                grant.connection_ids.join(","),
                                 grant.granted_at.to_rfc3339()
                             );
                         }

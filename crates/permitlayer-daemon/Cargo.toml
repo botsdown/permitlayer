@@ -107,6 +107,7 @@ dirs.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tempfile.workspace = true
+fs4.workspace = true
 dialoguer.workspace = true
 console.workspace = true
 indicatif.workspace = true
@@ -127,6 +128,13 @@ urlencoding.workspace = true
 hmac.workspace = true
 zeroize.workspace = true
 reqwest.workspace = true
+rmcp = { version = "=1.4.0", features = [
+    "client",
+    "server",
+    "transport-io",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-client-unix-socket",
+] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
@@ -170,7 +178,6 @@ rustix = { workspace = true }
 serde_json.workspace = true
 
 [dev-dependencies]
-rmcp = { version = "=1.4.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 insta = { workspace = true }
 # Needed by the `FailingAuditStore` test fixture in `server::control::tests`
 # to impl the `AuditStore` trait (which is defined via `#[async_trait]`).

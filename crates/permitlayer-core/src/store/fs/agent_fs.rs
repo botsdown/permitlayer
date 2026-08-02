@@ -439,13 +439,23 @@ impl AgentIdentityStore for AgentIdentityFsStore {
         // `AgentIdentity::new` re-validates `name` (defense in depth
         // — the on-disk file's name should never have been invalid,
         // but checking is cheap).
-        let updated = AgentIdentity::new(
-            current.name().to_owned(),
-            new_token_hash,
-            new_lookup_key_hex,
-            current.created_at,
-            current.last_seen_at,
-        )
+        let updated = if current.local_only {
+            AgentIdentity::new_local(
+                current.name().to_owned(),
+                new_token_hash,
+                new_lookup_key_hex,
+                current.created_at,
+                current.last_seen_at,
+            )
+        } else {
+            AgentIdentity::new(
+                current.name().to_owned(),
+                new_token_hash,
+                new_lookup_key_hex,
+                current.created_at,
+                current.last_seen_at,
+            )
+        }
         .map_err(|e| StoreError::AgentSerializationFailed {
             reason: format!("identity reconstruction failed during rotation: {e}"),
             source: Some(Box::new(e)),

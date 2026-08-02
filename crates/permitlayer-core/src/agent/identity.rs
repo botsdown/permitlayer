@@ -141,6 +141,9 @@ pub struct AgentIdentity {
     /// Most recent successful authentication timestamp. `None` until
     /// the agent's bearer token is first presented.
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// True when this identity may only be asserted by a kernel-authenticated
+    /// local-principal mapping. Bearer authentication always rejects it.
+    pub local_only: bool,
 }
 
 impl AgentIdentity {
@@ -169,7 +172,20 @@ impl AgentIdentity {
         last_seen_at: Option<DateTime<Utc>>,
     ) -> Result<Self, AgentNameError> {
         validate_agent_name(&name)?;
-        Ok(Self { name, token_hash, lookup_key_hex, created_at, last_seen_at })
+        Ok(Self { name, token_hash, lookup_key_hex, created_at, last_seen_at, local_only: false })
+    }
+
+    /// Construct an identity that can never authenticate with a bearer.
+    pub fn new_local(
+        name: String,
+        token_hash: String,
+        lookup_key_hex: String,
+        created_at: DateTime<Utc>,
+        last_seen_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, AgentNameError> {
+        let mut identity = Self::new(name, token_hash, lookup_key_hex, created_at, last_seen_at)?;
+        identity.local_only = true;
+        Ok(identity)
     }
 }
 
@@ -185,6 +201,12 @@ pub struct AgentIdentityRaw {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl AgentIdentityRaw {
@@ -195,13 +217,15 @@ impl AgentIdentityRaw {
     /// Returns [`AgentNameError::Invalid`] if `name` violates the
     /// allowlist.
     pub fn into_validated(self) -> Result<AgentIdentity, AgentNameError> {
-        AgentIdentity::new(
+        let mut identity = AgentIdentity::new(
             self.name,
             self.token_hash,
             self.lookup_key_hex,
             self.created_at,
             self.last_seen_at,
-        )
+        )?;
+        identity.local_only = self.local_only;
+        Ok(identity)
     }
 }
 
@@ -213,6 +237,7 @@ impl From<AgentIdentity> for AgentIdentityRaw {
             lookup_key_hex: v.lookup_key_hex,
             created_at: v.created_at,
             last_seen_at: v.last_seen_at,
+            local_only: v.local_only,
         }
     }
 }

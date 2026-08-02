@@ -73,10 +73,17 @@ struct LocalRequestAudit {
     path: String,
     method: String,
     selector: String,
+    service: String,
+    scope: String,
 }
 
 impl LocalRequestAudit {
     fn capture(request: &Request) -> Self {
+        let route = local_route(request.uri().path());
+        let (service, scope) = route
+            .as_ref()
+            .map(|route| local_audit_labels(route.capability))
+            .unwrap_or(("local-peer", "local-unknown"));
         Self {
             request_id: request
                 .extensions()
@@ -85,10 +92,21 @@ impl LocalRequestAudit {
                 .unwrap_or_else(|| ulid::Ulid::new().to_string()),
             path: request.uri().path().to_owned(),
             method: request.method().as_str().to_owned(),
-            selector: local_route(request.uri().path())
-                .map(|route| route.selector)
-                .unwrap_or_else(|| "-".to_owned()),
+            selector: route.map(|route| route.selector).unwrap_or_else(|| "-".to_owned()),
+            service: service.to_owned(),
+            scope: scope.to_owned(),
         }
+    }
+}
+
+fn local_audit_labels(capability: LocalCapability) -> (&'static str, &'static str) {
+    match capability {
+        LocalCapability::DriveUpload => ("google-drive", "drive.file"),
+        LocalCapability::DriveDownload => ("google-drive", "drive.readonly"),
+        LocalCapability::DriveReplace => ("google-drive", "drive.full"),
+        LocalCapability::McpGmail => ("google-gmail", "mcp-gmail"),
+        LocalCapability::McpCalendar => ("google-calendar", "mcp-calendar"),
+        LocalCapability::McpDrive => ("google-drive", "mcp-drive"),
     }
 }
 
@@ -434,11 +452,31 @@ async fn authenticate_local_peer(
             ));
         }
     };
+    let is_mcp = matches!(
+        route.capability,
+        LocalCapability::McpGmail | LocalCapability::McpCalendar | LocalCapability::McpDrive
+    );
+    if is_mcp && !identity.local_only {
+        return Err(Box::new(
+            local_auth_denied(
+                &state,
+                &audit,
+                peer,
+                Some(&grant.agent),
+                "local_access.local_only_agent_required",
+                "local MCP requires a local-only agent; run `agentsso onboard hermes --user <user>`",
+            )
+            .await,
+        ));
+    }
     if !grant.permits(route.capability) {
         let capability = match route.capability {
             LocalCapability::DriveUpload => "drive-upload",
             LocalCapability::DriveDownload => "drive-download",
             LocalCapability::DriveReplace => "drive-replace",
+            LocalCapability::McpGmail => "mcp-gmail",
+            LocalCapability::McpCalendar => "mcp-calendar",
+            LocalCapability::McpDrive => "mcp-drive",
         };
         return Err(Box::new(
             local_auth_denied(
@@ -448,23 +486,55 @@ async fn authenticate_local_peer(
                 Some(&grant.agent),
                 "local_access.capability_denied",
                 &format!(
-                    "this operation requires: `sudo agentsso agent local-access grant {} --user {} --capability {capability}`",
-                    grant.agent, grant.username_at_grant
+                    "this operation requires explicit connection consent: `sudo agentsso agent local-access grant {} --user {} --capability {capability} --connection {} --replace`",
+                    grant.agent, grant.username_at_grant, route.selector
                 ),
             )
             .await,
         ));
     }
     let selector = route.selector;
-    let policy = match permitlayer_proxy::middleware::auth::resolve_local_policy_binding(
+    if grant.connection_ids.is_empty() {
+        return Err(Box::new(
+            local_auth_denied(
+                &state,
+                &audit,
+                peer,
+                Some(&grant.agent),
+                "local_access.connection_scope_required",
+                &format!(
+                    "legacy unscoped grants cannot access local data routes; re-consent with `sudo agentsso agent local-access grant {} --user {} --capability {} --connection {} --replace`",
+                    grant.agent,
+                    grant.username_at_grant,
+                    route.capability.as_str(),
+                    selector
+                ),
+            )
+            .await,
+        ));
+    }
+    let resolved = permitlayer_proxy::middleware::auth::resolve_local_binding(
         state.binding_store.as_ref(),
         state.connection_store.as_ref(),
         &grant.agent,
         &selector,
     )
-    .await
-    {
-        Ok(policy) => policy,
+    .await;
+    let (connection_id, policy) = match resolved {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return Err(Box::new(
+                local_auth_denied(
+                    &state,
+                    &audit,
+                    peer,
+                    Some(&grant.agent),
+                    "local_access.connection_not_bound",
+                    "the requested connection is not bound to this local agent",
+                )
+                .await,
+            ));
+        }
         Err(error) => {
             emit_local_peer_audit(
                 &state,
@@ -479,13 +549,28 @@ async fn authenticate_local_peer(
             return Err(Box::new(error.into_response()));
         }
     };
-
+    if !grant.connection_ids.is_empty() && !grant.permits_connection(&connection_id) {
+        return Err(Box::new(
+            local_auth_denied(
+                &state,
+                &audit,
+                peer,
+                Some(&grant.agent),
+                "local_access.connection_denied",
+                "the requested connection is outside this local grant",
+            )
+            .await,
+        ));
+    }
     // Never accept caller-declared authority. The listener itself fixes the
     // only available scope, and there is deliberately no bearer fallback.
     let scope = match route.capability {
         LocalCapability::DriveDownload => "drive.readonly",
         LocalCapability::DriveUpload => "drive.file",
         LocalCapability::DriveReplace => "drive.full",
+        LocalCapability::McpGmail | LocalCapability::McpCalendar | LocalCapability::McpDrive => {
+            "mcp"
+        }
     };
     request.headers_mut().insert("x-agentsso-scope", HeaderValue::from_static(scope));
     request.extensions_mut().insert(AgentId(grant.agent.clone()));
@@ -521,6 +606,16 @@ struct LocalRoute {
 }
 
 fn local_route(path: &str) -> Option<LocalRoute> {
+    if let Some(selector) = path.strip_prefix("/mcp/") {
+        let selector = selector.split('/').next().unwrap_or("");
+        let capability = match selector {
+            "gmail" => LocalCapability::McpGmail,
+            "calendar" => LocalCapability::McpCalendar,
+            "drive" => LocalCapability::McpDrive,
+            _ => return None,
+        };
+        return Some(LocalRoute { selector: selector.to_owned(), capability });
+    }
     let rest = path.strip_prefix("/v1/tools/")?;
     let (selector, suffix) = rest.split_once('/')?;
     if selector.is_empty() {
@@ -597,8 +692,8 @@ async fn emit_local_peer_audit(
     let mut event = permitlayer_core::audit::event::AuditEvent::with_request_id(
         audit.request_id.clone(),
         agent.to_owned(),
-        "google-drive".to_owned(),
-        "drive.file".to_owned(),
+        audit.service.clone(),
+        audit.scope.clone(),
         audit.path.clone(),
         outcome.to_owned(),
         event_type.to_owned(),
@@ -721,10 +816,64 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use http_body_util::BodyExt as _;
-    use permitlayer_core::store::StoreError;
+    use permitlayer_core::store::{
+        Binding, BindingStore, ConnectionRecord, ConnectionStatus, ConnectionStore, ConnectionTier,
+        StoreError,
+    };
+    use permitlayer_credential::ConnectionId;
     use tower::ServiceExt as _;
 
     struct MemoryLocalStore(tokio::sync::RwLock<Option<permitlayer_core::store::LocalPrincipal>>);
+
+    struct MemoryBindingStore(Binding);
+
+    #[async_trait::async_trait]
+    impl BindingStore for MemoryBindingStore {
+        async fn put_binding(&self, _agent: &str, _binding: Binding) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, agent: &str) -> Result<Vec<Binding>, StoreError> {
+            Ok(if agent == "angie" { vec![self.0.clone()] } else { Vec::new() })
+        }
+
+        async fn list_agents(&self) -> Result<Vec<String>, StoreError> {
+            Ok(vec!["angie".to_owned()])
+        }
+
+        async fn remove(
+            &self,
+            _agent: &str,
+            _connection_id: ConnectionId,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn remove_agent(&self, _agent: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+
+    struct MemoryConnectionStore(ConnectionRecord);
+
+    #[async_trait::async_trait]
+    impl ConnectionStore for MemoryConnectionStore {
+        async fn put(&self, _record: ConnectionRecord) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get(&self, id: ConnectionId) -> Result<Option<ConnectionRecord>, StoreError> {
+            Ok((id == self.0.id).then(|| self.0.clone()))
+        }
+
+        async fn list(&self) -> Result<Vec<ConnectionRecord>, StoreError> {
+            Ok(vec![self.0.clone()])
+        }
+
+        async fn remove(&self, _id: ConnectionId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
 
     #[async_trait::async_trait]
     impl LocalPrincipalStore for MemoryLocalStore {
@@ -769,6 +918,7 @@ mod tests {
         peer_uid: u32,
         expected_uid: u32,
         store: Arc<MemoryLocalStore>,
+        connection_id: Option<ConnectionId>,
     ) -> (Router, HttpRequest<Body>) {
         let identity = permitlayer_core::agent::AgentIdentity::new(
             "angie".to_owned(),
@@ -778,11 +928,31 @@ mod tests {
             None,
         )
         .unwrap();
+        let binding_store = connection_id.map(|connection_id| {
+            Arc::new(MemoryBindingStore(Binding {
+                connection_id,
+                tier: ConnectionTier::ReadWrite,
+                policy: None,
+                alias: Some("drive".to_owned()),
+            })) as Arc<dyn BindingStore>
+        });
+        let connection_store = connection_id.map(|id| {
+            Arc::new(MemoryConnectionStore(ConnectionRecord {
+                id,
+                connector_id: "google-drive".to_owned(),
+                name: "drive".to_owned(),
+                account_hint: None,
+                granted_scopes: vec!["https://www.googleapis.com/auth/drive.file".to_owned()],
+                tier: ConnectionTier::ReadWrite,
+                created_at: chrono::Utc::now(),
+                status: ConnectionStatus::Active,
+            })) as Arc<dyn ConnectionStore>
+        });
         let state = LocalPeerAuthState {
             expected_uid,
             store,
-            binding_store: None,
-            connection_store: None,
+            binding_store,
+            connection_store,
             agent_store: None,
             agent_registry: Arc::new(AgentRegistry::new(vec![identity])),
             audit_dispatcher: Arc::new(AuditDispatcher::none()),
@@ -827,7 +997,8 @@ mod tests {
         assert_eq!(local_route("/v1/tools/drive/uploads").unwrap().selector, "drive");
         assert_eq!(local_route("/v1/tools/my%20drive/downloads/id").unwrap().selector, "my drive");
         assert!(local_route("/v1/tools/drive/files").is_none());
-        assert!(local_route("/mcp/drive").is_none());
+        assert_eq!(local_route("/mcp/drive").unwrap().capability, LocalCapability::McpDrive);
+        assert!(local_route("/mcp/unknown").is_none());
     }
 
     #[tokio::test]
@@ -836,19 +1007,22 @@ mod tests {
         if uid < 501 {
             return;
         }
+        let connection_id = ConnectionId::generate();
         let store = Arc::new(MemoryLocalStore(tokio::sync::RwLock::new(Some(
             permitlayer_core::store::LocalPrincipal {
-                schema_version: 1,
+                schema_version: 3,
                 platform: "macos".to_owned(),
                 uid,
                 username_at_grant: current_username(),
                 agent: "angie".to_owned(),
                 capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
+                connection_ids: vec![connection_id.to_string()],
+                profile: None,
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },
         ))));
-        let (router, request) = peer_auth_router(uid, uid, store);
+        let (router, request) = peer_auth_router(uid, uid, store, Some(connection_id));
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -864,19 +1038,22 @@ mod tests {
         if uid < 501 {
             return;
         }
+        let connection_id = ConnectionId::generate();
         let store = Arc::new(MemoryLocalStore(tokio::sync::RwLock::new(Some(
             permitlayer_core::store::LocalPrincipal {
-                schema_version: 1,
+                schema_version: 3,
                 platform: "macos".to_owned(),
                 uid,
                 username_at_grant: current_username(),
                 agent: "angie".to_owned(),
                 capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
+                connection_ids: vec![connection_id.to_string()],
+                profile: None,
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },
         ))));
-        let (router, _) = peer_auth_router(uid, uid, store);
+        let (router, _) = peer_auth_router(uid, uid, store, Some(connection_id));
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("agent.sock");
         let listener = bind_local_listener(&path, uid, false).unwrap();
@@ -923,11 +1100,13 @@ mod tests {
                 username_at_grant: current_username(),
                 agent: "angie".to_owned(),
                 capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
+                connection_ids: Vec::new(),
+                profile: None,
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },
         ))));
-        let (router, request) = peer_auth_router(uid.saturating_add(1), uid, store);
+        let (router, request) = peer_auth_router(uid.saturating_add(1), uid, store, None);
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
@@ -939,7 +1118,7 @@ mod tests {
             return;
         }
         let store = Arc::new(MemoryLocalStore(tokio::sync::RwLock::new(None)));
-        let (router, request) = peer_auth_router(u32::MAX, uid, store);
+        let (router, request) = peer_auth_router(u32::MAX, uid, store, None);
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -951,7 +1130,7 @@ mod tests {
             return;
         }
         let store = Arc::new(MemoryLocalStore(tokio::sync::RwLock::new(None)));
-        let (router, request) = peer_auth_router(uid, uid, store);
+        let (router, request) = peer_auth_router(uid, uid, store, None);
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
@@ -970,11 +1149,13 @@ mod tests {
                 username_at_grant: "definitely-not-the-current-user".to_owned(),
                 agent: "angie".to_owned(),
                 capabilities: vec![permitlayer_core::store::LocalCapability::DriveUpload],
+                connection_ids: Vec::new(),
+                profile: None,
                 granted_at: chrono::Utc::now(),
                 granted_by_peer_uid: Some(0),
             },
         ))));
-        let (router, request) = peer_auth_router(uid, uid, store);
+        let (router, request) = peer_auth_router(uid, uid, store, None);
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }

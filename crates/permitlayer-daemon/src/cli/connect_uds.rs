@@ -712,6 +712,9 @@ pub(crate) struct GrantLocalAccessRequest<'a> {
     pub agent: &'a str,
     pub user: &'a str,
     pub capabilities: &'a [String],
+    pub connections: &'a [String],
+    pub profile: Option<&'a str>,
+    pub replace: bool,
 }
 
 #[derive(Debug, Deserialize)]
